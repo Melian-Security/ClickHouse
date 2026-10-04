@@ -19,12 +19,12 @@ for n in base fix; do
     q "$n" "SYSTEM STOP MERGES bench.prof"
     q "$n" "ALTER TABLE bench.prof ATTACH PARTITION tuple() FROM bench.src"
     q "$n" "SYSTEM START MERGES bench.prof"
-    sudo perf record -F 999 -g -p "$pid" -o "$WORK/perf-$n.data" -- sleep "$SECS" >/dev/null 2>&1 &
+    sudo perf record -F 999 -g -a -o "$WORK/perf-$n.data" -- sleep "$SECS" >/dev/null 2>&1 &
     perf_pid=$!
     q "$n" "OPTIMIZE TABLE bench.prof FINAL"
     sudo kill -INT "$perf_pid" 2>/dev/null || true
     wait "$perf_pid" || true
-    sudo perf report -i "$WORK/perf-$n.data" --no-children --sort symbol --stdio 2>/dev/null | grep -v '^#' | grep '%' | head -25 > "$WORK/perf-$n.txt"
+    sudo perf report -i "$WORK/perf-$n.data" --no-children --sort symbol -g none --percent-limit 0.5 --stdio 2>/dev/null | grep -v '^#' | grep '%' | head -25 > "$WORK/perf-$n.txt"
     echo "== $n top self symbols"; cat "$WORK/perf-$n.txt"
     kill "$pid"; wait "$pid" 2>/dev/null || true
 done
