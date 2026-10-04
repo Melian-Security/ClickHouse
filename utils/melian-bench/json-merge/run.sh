@@ -24,7 +24,7 @@ declare -A PORT=([base]=19000 [fix]=29000)
 declare -A HPORT=([base]=18123 [fix]=28123)
 
 start_server() {
-    local name=$1 dir=$WORK/$name
+    local name=$1; local dir=$WORK/$1
     rm -rf "$dir"; mkdir -p "$dir"
     cat > "$dir/config.xml" <<EOF
 <clickhouse>
