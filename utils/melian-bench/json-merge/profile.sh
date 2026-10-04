@@ -24,7 +24,7 @@ for n in base fix; do
     q "$n" "OPTIMIZE TABLE bench.prof FINAL"
     sudo kill -INT "$perf_pid" 2>/dev/null || true
     wait "$perf_pid" || true
-    sudo perf report -i "$WORK/perf-$n.data" --no-children --sort symbol -g none --percent-limit 0.5 --stdio 2>/dev/null | grep -v '^#' | grep '%' | head -25 > "$WORK/perf-$n.txt"
+    sudo perf report -i "$WORK/perf-$n.data" --no-children --sort symbol -g none --percent-limit 0.5 --stdio 2>/dev/null | grep -v '^#' | grep '%' | head -25 > "$WORK/perf-$n.txt" || true
     echo "== $n top self symbols"; cat "$WORK/perf-$n.txt"
     kill "$pid"; wait "$pid" 2>/dev/null || true
 done
