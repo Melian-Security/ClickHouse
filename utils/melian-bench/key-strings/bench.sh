@@ -31,6 +31,7 @@ run_one() {
     echo -e "$round\t$label\t$t" | tr ' ' '\t' >> "$WORK/results.tsv"
 }
 
+if [ "${SKIP_TIMING:-0}" = 0 ]; then
 : > "$WORK/results.tsv"
 # Warm the page cache and both binaries.
 "$BASE" local --query "$QUERY" > /dev/null
@@ -51,6 +52,7 @@ for metric, idx in (("user_s", 2), ("wall_s", 3)):
           f"fix median {mf:.3f} [{min(v['fix']):.3f}, {max(v['fix']):.3f}]  "
           f"change {100 * (mf / mb - 1):+.2f}%  median paired ratio {statistics.median(ratios):.4f}")
 PY
+fi
 
 # Correctness: insert with each binary into a MergeTree table with production-like settings and
 # compare the stored data.
@@ -63,11 +65,16 @@ for label in base fix; do
                      object_shared_data_serialization_version_for_zero_level_parts = 'map_with_buckets',
                      min_bytes_for_wide_part = '512Mi';
         INSERT INTO t SELECT rowNumberInAllBlocks(), event FROM file('$DATA', JSONAsObject, 'event $EVENT_TYPE')
-            SETTINGS optimize_on_insert = 0, max_insert_block_size = 10500;
+            SETTINGS optimize_on_insert = 0, max_insert_block_size = 10500, max_threads = 1, input_format_parallel_parsing = 0;
         SELECT '$label', count(), cityHash64(groupArray(toString(event))) FROM (SELECT event FROM t ORDER BY id);
+        SELECT '$label', groupBitXor(cityHash64(toString(event))), sum(cityHash64(toString(event))) FROM t;
         SELECT '$label', groupArray(p) FROM (SELECT arrayJoin(JSONSharedDataPaths(event)) AS p FROM t GROUP BY p ORDER BY p) FORMAT TSV;
     " > "$WORK/check_$label.txt"
 done
 cut -f2- "$WORK/check_base.txt" | md5sum
 cut -f2- "$WORK/check_fix.txt" | md5sum
 head -c 300 "$WORK/check_base.txt"; echo
+# Byte-level comparison of the written parts.
+for label in base fix; do
+    echo "$label parts: $(cd "$WORK/db_$label" && find . -path '*/all_*' -name data.bin | sort -t/ -k5 | xargs cat | md5sum)"
+done
