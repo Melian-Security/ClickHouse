@@ -1,0 +1,12 @@
+0
+-- typed JSON path
+['activity_id','event.metadata.event_code']
+-- dynamic JSON path
+['activity_id','event.g7.v']
+-- fixed-width columns
+['n','activity_id']
+-- results do not depend on the order
+400
+400
+1000
+1000

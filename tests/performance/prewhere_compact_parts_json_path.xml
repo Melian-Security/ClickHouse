@@ -1,0 +1,38 @@
+<test>
+    <!-- Compact parts publish no per-column sizes, so PREWHERE ordering relies on estimates.
+         `activity_id = 12` rejects every row; evaluating the JSON path first reads the whole column. -->
+    <settings>
+        <allow_reorder_prewhere_conditions>1</allow_reorder_prewhere_conditions>
+        <use_statistics>1</use_statistics>
+    </settings>
+
+    <create_query>
+        CREATE TABLE t_prewhere_json_compact
+        (
+            id UInt64,
+            activity_id Int64,
+            event JSON(max_dynamic_paths = 64, `metadata.event_code` String)
+        )
+        ENGINE = MergeTree ORDER BY id
+        SETTINGS min_bytes_for_wide_part = '100G', auto_statistics_types = 'basic, uniq_v2'
+    </create_query>
+
+    <fill_query>
+        INSERT INTO t_prewhere_json_compact
+        SELECT
+            number,
+            1 + 2 * (number % 10),
+            concat('{"metadata":{"event_code":"c', toString(number % 50), '"},',
+                arrayStringConcat(arrayMap(i -> concat('"g', toString((number * 7 + i * 13) % 300), '":{"v":"', repeat('v', 10 + i % 20), toString(number % 1000), '"}'), range(60)), ','),
+                '}')
+        FROM numbers(2000000)
+        SETTINGS max_insert_threads = 4
+    </fill_query>
+
+    <fill_query>OPTIMIZE TABLE t_prewhere_json_compact FINAL</fill_query>
+
+    <query>SELECT count() FROM t_prewhere_json_compact WHERE activity_id = 12 AND event.metadata.event_code = 'no-such-code'</query>
+    <query>SELECT count() FROM t_prewhere_json_compact WHERE activity_id = 12 AND event.g95.v = 'no-such-value'</query>
+
+    <drop_query>DROP TABLE IF EXISTS t_prewhere_json_compact</drop_query>
+</test>
