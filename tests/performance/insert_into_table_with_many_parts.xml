@@ -1,0 +1,27 @@
+<test>
+    <!-- Every insert checks the number of parts in the largest partition (parts_to_delay_insert / parts_to_throw_insert),
+         once per sink and once per block. The cost of the check should not grow with the number of parts of the table. -->
+    <create_query>
+        CREATE TABLE many_parts (p UInt64, x UInt64)
+        ENGINE = MergeTree PARTITION BY p ORDER BY x
+        SETTINGS parts_to_delay_insert = 0, parts_to_throw_insert = 1000000, max_parts_in_total = 1000000, old_parts_lifetime = 100000
+    </create_query>
+
+    <fill_query>SYSTEM STOP MERGES many_parts</fill_query>
+    <!-- 20 partitions with 1000 parts each. -->
+    <fill_query>
+        INSERT INTO many_parts SELECT number % 20, number FROM numbers(20000)
+        SETTINGS max_block_size = 20, max_insert_block_size = 20, min_insert_block_size_rows = 0, min_insert_block_size_bytes = 0,
+                 max_partitions_per_insert_block = 0, max_insert_threads = 1
+    </fill_query>
+
+    <!-- An insert that writes no parts: only the checks at the start of the insert. -->
+    <query>INSERT INTO many_parts SELECT number % 20, number FROM numbers(1000000) WHERE number > 1000000</query>
+    <!-- An insert of many one-row blocks into a single partition: the check runs before every block. -->
+    <query>
+        INSERT INTO many_parts SELECT 0, number FROM numbers(200)
+        SETTINGS max_block_size = 1, max_insert_block_size = 1, min_insert_block_size_rows = 0, min_insert_block_size_bytes = 0, max_insert_threads = 1
+    </query>
+
+    <drop_query>DROP TABLE IF EXISTS many_parts</drop_query>
+</test>

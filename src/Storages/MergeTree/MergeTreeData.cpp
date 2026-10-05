@@ -2710,6 +2710,8 @@ MergeTreeData::LoadPartResult MergeTreeData::loadDataPart(
         std::lock_guard lock(part_loading_mutex);
         LOG_TEST(log, "loadDataPart: inserting {} into data_parts_indexes", res.part->getNameWithState());
         std::tie(it, inserted) = data_parts_indexes.insert(res.part);
+        if (inserted)
+            updatePartitionPartsStats(*res.part, std::nullopt, to_state);
     }
 
     /// Remove duplicate parts with the same checksum.
@@ -3169,7 +3171,10 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks, std::optional<std::un
                 = !is_static_storage && !is_table_readonly && !p->isStoredOnReadonlyDisk();
             unique_key_dense_index_ops->ensureValidDenseIndex(p, part_storage_is_writable);
             if (const auto bytes_on_disk_after = p->getBytesOnDisk(); bytes_on_disk_after != bytes_on_disk_before)
+            {
                 increaseDataVolume(static_cast<ssize_t>(bytes_on_disk_after - bytes_on_disk_before), 0, 0);
+                updatePartitionPartsBytes(*p, static_cast<ssize_t>(bytes_on_disk_after - bytes_on_disk_before));
+            }
         }
         catch (...)
         {
@@ -4327,6 +4332,7 @@ void MergeTreeData::removePartsFinally(const MergeTreeData::DataPartsVector & pa
             (*it)->assertState({DataPartState::Deleting});
 
             LOG_TEST(log, "removePartsFinally: removing {} from data_parts_indexes", (*it)->getNameWithState());
+            updatePartitionPartsStats(**it, (*it)->getState(), std::nullopt);
             data_parts_indexes.erase(it);
 
             if (removed_parts)
@@ -4876,6 +4882,7 @@ void MergeTreeData::dropAllData()
 
         LOG_TRACE(log, "dropAllData: removing all data parts from memory.");
         data_parts_indexes.clear();
+        clearPartitionPartsStats();
         all_data_dropped = true;
     }
     catch (...)
@@ -4887,7 +4894,10 @@ void MergeTreeData::dropAllData()
         for (const auto & part : all_parts)
         {
             if (!part_names_failed.contains(part->name))
+            {
+                updatePartitionPartsStats(*part, part->getState(), std::nullopt);
                 data_parts_indexes.erase(part->info);
+            }
         }
 
         throw;
@@ -6967,6 +6977,7 @@ void MergeTreeData::preparePartForCommit(MutableDataPartPtr & part, Transaction 
 
     LOG_TEST(log, "preparePartForCommit: inserting {} into data_parts_indexes", part->getNameWithState());
     data_parts_indexes.insert(part);
+    updatePartitionPartsStats(*part, std::nullopt, part->getState());
     if (rename_in_transaction)
         out_transaction.addPart(part, need_rename);
     else
@@ -7175,6 +7186,7 @@ void MergeTreeData::removePartsFromWorkingSetImmediatelyAndSetTemporaryState(con
         modifyPartState(part, MergeTreeDataPartState::Temporary, lock);
         /// Erase immediately
         LOG_TEST(log, "removePartsFromWorkingSetImmediatelyAndSetTemporaryState: removing {} from data_parts_indexes", part->getNameWithState());
+        updatePartitionPartsStats(*part, part->getState(), std::nullopt);
         data_parts_indexes.erase(it_part);
     }
 }
@@ -7508,6 +7520,7 @@ void MergeTreeData::forcefullyMovePartToDetachedAndRemoveFromMemory(const MergeT
     asMutableDeletingPart(part)->renameToDetached(prefix, /*ignore_error=*/ replicated);
 
     LOG_TEST(log, "forcefullyMovePartToDetachedAndRemoveFromMemory: removing {} from data_parts_indexes", part->getNameWithState());
+    updatePartitionPartsStats(*part, part->getState(), std::nullopt);
     data_parts_indexes.erase(it_part);
 }
 
@@ -7755,14 +7768,94 @@ size_t MergeTreeData::getNumberOfOutdatedPartsWithExpiredRemovalTime() const
     return res;
 }
 
+std::optional<size_t> MergeTreeData::getPartitionPartsStatsIndex(DataPartState state)
+{
+    if (state == DataPartState::Active)
+        return 0;
+    if (state == DataPartState::Outdated)
+        return 1;
+    return std::nullopt;
+}
+
+void MergeTreeData::updatePartitionPartsStats(
+    const IMergeTreeDataPart & part, std::optional<DataPartState> old_state, std::optional<DataPartState> new_state)
+{
+    const auto old_index = old_state ? getPartitionPartsStatsIndex(*old_state) : std::nullopt;
+    const auto new_index = new_state ? getPartitionPartsStatsIndex(*new_state) : std::nullopt;
+    if (old_index == new_index)
+        return;
+
+    const size_t bytes_on_disk = part.getBytesOnDisk();
+    PartitionPartsStats::key_type key{part.info.getKind(), part.info.getPartitionId()};
+
+    std::lock_guard lock(partition_parts_stats_mutex);
+
+    if (old_index)
+    {
+        auto & stats = partition_parts_stats[*old_index];
+        auto it = stats.find(key);
+        chassert(it != stats.end() && it->second.count > 0);
+        if (it != stats.end())
+        {
+            --it->second.count;
+            it->second.bytes_on_disk -= std::min(it->second.bytes_on_disk, bytes_on_disk);
+            if (it->second.count == 0)
+                stats.erase(it);
+        }
+    }
+
+    if (new_index)
+    {
+        auto & stat = partition_parts_stats[*new_index][std::move(key)];
+        ++stat.count;
+        stat.bytes_on_disk += bytes_on_disk;
+    }
+}
+
+void MergeTreeData::updatePartitionPartsBytes(const IMergeTreeDataPart & part, ssize_t diff_bytes)
+{
+    const auto index = getPartitionPartsStatsIndex(part.getState());
+    if (!index)
+        return;
+
+    std::lock_guard lock(partition_parts_stats_mutex);
+    auto & stats = partition_parts_stats[*index];
+    auto it = stats.find({part.info.getKind(), part.info.getPartitionId()});
+    chassert(it != stats.end());
+    if (it != stats.end())
+        it->second.bytes_on_disk = static_cast<size_t>(std::max<ssize_t>(0, static_cast<ssize_t>(it->second.bytes_on_disk) + diff_bytes));
+}
+
+void MergeTreeData::clearPartitionPartsStats()
+{
+    std::lock_guard lock(partition_parts_stats_mutex);
+    for (auto & stats : partition_parts_stats)
+        stats.clear();
+}
+
 std::pair<size_t, size_t> MergeTreeData::getMaxPartsCountAndSizeForPartitionWithState(DataPartState state) const
 {
+    size_t max_parts_count = 0;
+    size_t argmax_parts_size = 0;
+
+    if (const auto index = getPartitionPartsStatsIndex(state))
+    {
+        std::lock_guard lock(partition_parts_stats_mutex);
+        for (const auto & [_, stat] : partition_parts_stats[*index])
+        {
+            if (stat.count > max_parts_count)
+            {
+                max_parts_count = stat.count;
+                argmax_parts_size = stat.bytes_on_disk;
+            }
+        }
+        return {max_parts_count, argmax_parts_size};
+    }
+
     auto lock = readLockParts();
 
     size_t cur_parts_count = 0;
     size_t cur_parts_size = 0;
-    size_t max_parts_count = 0;
-    size_t argmax_parts_size = 0;
 
     const String * cur_partition_id = nullptr;
 
@@ -8308,10 +8401,12 @@ void MergeTreeData::swapActivePart(MergeTreeData::DataPartPtr part_copy, DataPar
 
             modifyPartState(original_active_part, DataPartState::DeleteOnDestroy, lock);
             LOG_TEST(log, "swapActivePart: removing {} from data_parts_indexes", (*active_part_it)->getNameWithState());
+            updatePartitionPartsStats(**active_part_it, (*active_part_it)->getState(), std::nullopt);
             data_parts_indexes.erase(active_part_it);
 
             LOG_TEST(log, "swapActivePart: inserting {} into data_parts_indexes", part_copy->getNameWithState());
             auto part_it = data_parts_indexes.insert(part_copy).first;
+            updatePartitionPartsStats(*part_copy, std::nullopt, part_copy->getState());
             modifyPartState(part_it, DataPartState::Active, lock);
 
             ssize_t diff_bytes = part_copy->getBytesOnDisk() - original_active_part->getBytesOnDisk();
