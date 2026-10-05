@@ -4,7 +4,7 @@ import statistics
 import sys
 from collections import defaultdict
 
-METRICS = ["prefill_wall", "prefill_cpu", "inserts", "rows_per_s", "p50_ms", "p95_ms", "p99_ms", "max_ms", "load_cpu", "parts_after"]
+METRICS = ["prefill_wall", "prefill_cpu", "inserts", "inserts_per_s", "rows_per_s", "p50_ms", "p95_ms", "p99_ms", "max_ms", "load_cpu", "zk_txn", "zk_create", "zk_remove", "zk_exists", "parts_after"]
 
 runs = defaultdict(list)
 for line in open(sys.argv[1]):

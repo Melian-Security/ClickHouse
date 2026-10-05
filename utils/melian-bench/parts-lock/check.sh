@@ -14,7 +14,7 @@ WORK=$(mktemp -d /home/ssm-user/plc.XXXX)
 mkdir -p "$WORK/data" "$WORK/log"
 PORT=39200; KPORT=39281; RPORT=39334; HTTP_PORT=$((PORT + 23))
 sed -e "s#@WORK@#$WORK#g" -e "s#@PORT@#$PORT#g" -e "s#@KEEPER_PORT@#$KPORT#g" -e "s#@RAFT_PORT@#$RPORT#g" -e "s#@IS_PORT@#$((PORT + 9))#g" -e "s#@HTTP_PORT@#$((PORT + 23))#g" "$K/server.xml" > "$WORK/config.xml"
-"$BIN" server --config-file="$WORK/config.xml" > "$WORK/log/stdout.log" 2>&1 &
+CLICKHOUSE_WATCHDOG_ENABLE=0 "$BIN" server --config-file="$WORK/config.xml" > "$WORK/log/stdout.log" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$WORK"' EXIT
 c() { "$BIN" client --port $PORT "$@"; }
