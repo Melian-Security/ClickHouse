@@ -1,0 +1,42 @@
+<test>
+    <!-- Merge of parts whose JSON column keeps most paths in shared data: 300 distinct paths,
+         30 per row, 8 dynamic paths. Zero-level parts use `map_with_buckets`, the merged part
+         uses `advanced` shared data, written in 8 buckets for Compact and 32 for Wide parts. -->
+    <substitutions>
+        <substitution>
+            <name>part_type</name>
+            <values>
+                <value>compact</value>
+                <value>wide</value>
+            </values>
+        </substitution>
+    </substitutions>
+
+    <create_query>
+        CREATE TABLE t_json_shared_data_merge_compact (json JSON(max_dynamic_paths = 8))
+        ENGINE = MergeTree ORDER BY tuple()
+        SETTINGS min_bytes_for_wide_part = 1000000000000, min_rows_for_wide_part = 1000000000,
+            object_serialization_version = 'v3',
+            object_shared_data_serialization_version = 'advanced',
+            object_shared_data_serialization_version_for_zero_level_parts = 'map_with_buckets'
+    </create_query>
+    <create_query>
+        CREATE TABLE t_json_shared_data_merge_wide (json JSON(max_dynamic_paths = 8))
+        ENGINE = MergeTree ORDER BY tuple()
+        SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0,
+            object_serialization_version = 'v3',
+            object_shared_data_serialization_version = 'advanced',
+            object_shared_data_serialization_version_for_zero_level_parts = 'map_with_buckets'
+    </create_query>
+
+    <fill_query>SYSTEM STOP MERGES t_json_shared_data_merge_{part_type}</fill_query>
+
+    <fill_query>INSERT INTO t_json_shared_data_merge_{part_type} SELECT arrayMap(i -> tuple('key' || ((number % 10) * 30 + i), number + i), range(30))::Map(String, UInt64) FROM numbers(0, 25000)</fill_query>
+    <fill_query>INSERT INTO t_json_shared_data_merge_{part_type} SELECT arrayMap(i -> tuple('key' || ((number % 10) * 30 + i), number + i), range(30))::Map(String, UInt64) FROM numbers(25000, 25000)</fill_query>
+    <fill_query>INSERT INTO t_json_shared_data_merge_{part_type} SELECT arrayMap(i -> tuple('key' || ((number % 10) * 30 + i), number + i), range(30))::Map(String, UInt64) FROM numbers(50000, 25000)</fill_query>
+    <fill_query>INSERT INTO t_json_shared_data_merge_{part_type} SELECT arrayMap(i -> tuple('key' || ((number % 10) * 30 + i), number + i), range(30))::Map(String, UInt64) FROM numbers(75000, 25000)</fill_query>
+
+    <query>OPTIMIZE TABLE t_json_shared_data_merge_{part_type} DRY RUN PARTS 'all_1_1_0', 'all_2_2_0', 'all_3_3_0', 'all_4_4_0'</query>
+
+    <drop_query>DROP TABLE IF EXISTS t_json_shared_data_merge_{part_type}</drop_query>
+</test>

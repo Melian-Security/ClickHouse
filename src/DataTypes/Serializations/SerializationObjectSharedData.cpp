@@ -670,10 +670,11 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
 
         /// Process each bucket separately to limit peak memory —
         /// only one bucket's ColumnDynamic columns are alive at a time.
+        /// The splitter hashes each distinct path once instead of once per bucket.
+        SharedDataBucketsSplitter buckets_splitter(column, offset, end, buckets);
         for (size_t bucket = 0; bucket != buckets; ++bucket)
         {
-            auto flattened_paths = flattenSharedDataPathsForBucket(
-                column, offset, end, dynamic_type, bucket, buckets);
+            auto flattened_paths = buckets_splitter.flattenBucket(bucket, dynamic_type);
 
             /// Save path names for the copy section.
             bucket_path_names[bucket].reserve(flattened_paths.size());
@@ -754,6 +755,15 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
             /// chunk_bucket_path_names[chunk][bucket] = vector of path names.
             std::vector<std::vector<std::vector<std::string_view>>> chunk_bucket_path_names(num_chunks, std::vector<std::vector<std::string_view>>(buckets));
 
+            /// One splitter per chunk, shared by all buckets, so each distinct path is hashed once per chunk.
+            std::vector<std::unique_ptr<SharedDataBucketsSplitter>> chunk_splitters;
+            chunk_splitters.reserve(num_chunks);
+            for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
+            {
+                auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
+                chunk_splitters.push_back(std::make_unique<SharedDataBucketsSplitter>(column, chunk_start, chunk_end, buckets));
+            }
+
             for (size_t bucket = 0; bucket != buckets; ++bucket)
             {
                 settings.path.push_back(Substream::Bucket);
@@ -772,7 +782,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                 for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
                 {
                     auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
-                    auto path_names = scanPathNamesForBucket(column, chunk_start, chunk_end, bucket, buckets);
+                    auto path_names = chunk_splitters[chunk_idx]->getBucketPathNames(bucket);
 
                     writeVarUInt(chunk_end - chunk_start, *structure_stream);
                     writeVarUInt(path_names.size(), *structure_stream);
@@ -789,9 +799,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                 auto & data_stream = getDataStream(settings);
                 for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
                 {
-                    auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
-                    auto flattened_paths = flattenSharedDataPathsForBucket(
-                        column, chunk_start, chunk_end, dynamic_type, bucket, buckets);
+                    auto flattened_paths = chunk_splitters[chunk_idx]->flattenBucket(bucket, dynamic_type);
 
                     chunk_metadata.push_back(serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_type, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED));
                     /// flattened_paths goes out of scope here, freeing ColumnDynamic memory.
@@ -892,11 +900,11 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
             {
                 auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
                 std::vector<std::vector<std::string_view>> bucket_path_names(buckets);
+                SharedDataBucketsSplitter buckets_splitter(column, chunk_start, chunk_end, buckets);
 
                 for (size_t bucket = 0; bucket != buckets; ++bucket)
                 {
-                    auto flattened_paths = flattenSharedDataPathsForBucket(
-                        column, chunk_start, chunk_end, dynamic_type, bucket, buckets);
+                    auto flattened_paths = buckets_splitter.flattenBucket(bucket, dynamic_type);
 
                     /// Save path names for the copy section.
                     bucket_path_names[bucket].reserve(flattened_paths.size());
