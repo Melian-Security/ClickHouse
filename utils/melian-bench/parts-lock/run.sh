@@ -39,7 +39,7 @@ for n in 9000 6000 4000 3000 2500 2000 1500 1000 800 600 400 200; do
   c -q "INSERT INTO bench.t (ts, id, p, event) SELECT number, number + $p * 1000000000, $p, '{\"action\":\"prefill\",\"severity_id\":1}'
         FROM numbers($n)
         SETTINGS max_block_size = 1, max_insert_block_size = 1, min_insert_block_size_rows = 0, min_insert_block_size_bytes = 0,
-                 max_insert_threads = 1, insert_deduplicate = 0" || exit 1
+                 max_insert_threads = 1, deduplicate_insert = 'disable'" || exit 1
   p=$((p + 1))
 done
 C1=$(cpu); T1=$(date +%s.%N)
@@ -56,7 +56,7 @@ client_loop() {
     local f=${FILES[$(( (i * 7 + n) % NF ))]}
     # Over HTTP, so that the server parses the JSON (as with the production inserts), one block per insert.
     curl -sS --data-binary @"$f" -o /dev/null -w '%{http_code}\n' \
-      "http://localhost:$HTTP_PORT/?log_comment=pl-load&query_profiler_real_time_period_ns=10000000&query_profiler_cpu_time_period_ns=0&optimize_on_insert=0&input_format_parallel_parsing=0&max_insert_block_size=10000000&min_insert_block_size_rows=0&min_insert_block_size_bytes=0&insert_deduplicate=0&query=INSERT%20INTO%20bench.t%20FORMAT%20JSONEachRow" \
+      "http://localhost:$HTTP_PORT/?log_comment=pl-load&query_profiler_real_time_period_ns=10000000&query_profiler_cpu_time_period_ns=0&optimize_on_insert=0&input_format_parallel_parsing=0&max_insert_block_size=10000000&min_insert_block_size_rows=0&min_insert_block_size_bytes=0&deduplicate_insert=disable&query=INSERT%20INTO%20bench.t%20FORMAT%20JSONEachRow" \
       2>> "$OUT/client_errors.log" | grep -v '^200$' >> "$OUT/client_errors.log"
     n=$((n + 1))
   done
