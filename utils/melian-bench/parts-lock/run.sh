@@ -6,7 +6,7 @@
 #    ReplicatedReplacingMergeTree table of schema.sql (no merges are assigned).
 # 2. Prefill: one INSERT ... SELECT per partition, one row per part, PREFILL_SCALE x
 #    [9000 6000 4000 3000 2500 2000 1500 1000 800 600 400 200] parts (about 31k at scale 1).
-# 3. Load: CLIENTS concurrent clients insert the files of DATA_DIR (one part each) for SECONDS.
+# 3. Load: CLIENTS concurrent HTTP clients insert the files of DATA_DIR (one part each) for SECONDS.
 #    Every 5 s it samples the replication queue, the fetches pool and the stacks of all threads.
 # Appends one result line to RESULTS and leaves the samples in $OUT_DIR (default /home/ssm-user/pl-out/LABEL-<time>):
 # queue.tsv (time, queue size, GET_PART entries, entries postponed for "fetches already executing", executing
@@ -18,8 +18,8 @@ K=$(cd "$(dirname "$0")" && pwd)
 WORK=$(mktemp -d /home/ssm-user/pl.XXXX)
 OUT=${OUT_DIR:-/home/ssm-user/pl-out/$LABEL-$(date +%H%M%S)}
 mkdir -p "$WORK/data" "$WORK/log" "$OUT"
-PORT=39100; KPORT=39181; RPORT=39234
-sed -e "s#@WORK@#$WORK#g" -e "s#@PORT@#$PORT#g" -e "s#@KEEPER_PORT@#$KPORT#g" -e "s#@RAFT_PORT@#$RPORT#g" -e "s#@IS_PORT@#$((PORT + 9))#g" "$K/server.xml" > "$WORK/config.xml"
+PORT=39100; KPORT=39181; RPORT=39234; HTTP_PORT=$((PORT + 23))
+sed -e "s#@WORK@#$WORK#g" -e "s#@PORT@#$PORT#g" -e "s#@KEEPER_PORT@#$KPORT#g" -e "s#@RAFT_PORT@#$RPORT#g" -e "s#@IS_PORT@#$((PORT + 9))#g" -e "s#@HTTP_PORT@#$((PORT + 23))#g" "$K/server.xml" > "$WORK/config.xml"
 "$BIN" server --config-file="$WORK/config.xml" > "$WORK/log/stdout.log" 2>&1 &
 PID=$!
 cleanup() { kill $PID 2>/dev/null; wait $PID 2>/dev/null; cp "$WORK/log/server.err.log" "$OUT/" 2>/dev/null; rm -rf "$WORK"; }
@@ -54,9 +54,10 @@ client_loop() {
   local i=$1 n=0
   while [ "$(date +%s)" -lt $END ]; do
     local f=${FILES[$(( (i * 7 + n) % NF ))]}
-    c --log_comment "pl-load" --query_profiler_real_time_period_ns 10000000 --query_profiler_cpu_time_period_ns 0 \
-      --query "INSERT INTO bench.t SETTINGS optimize_on_insert = 0, max_insert_block_size = 10000000, min_insert_block_size_rows = 0, min_insert_block_size_bytes = 0, insert_deduplicate = 0 FORMAT JSONEachRow" \
-      < "$f" > /dev/null 2>> "$OUT/client_errors.log"
+    # Over HTTP, so that the server parses the JSON (as with the production inserts), one block per insert.
+    curl -sS --data-binary @"$f" -o /dev/null -w '%{http_code}\n' \
+      "http://localhost:$HTTP_PORT/?log_comment=pl-load&query_profiler_real_time_period_ns=10000000&query_profiler_cpu_time_period_ns=0&optimize_on_insert=0&input_format_parallel_parsing=0&max_insert_block_size=10000000&min_insert_block_size_rows=0&min_insert_block_size_bytes=0&insert_deduplicate=0&query=INSERT%20INTO%20bench.t%20FORMAT%20JSONEachRow" \
+      2>> "$OUT/client_errors.log" | grep -v '^200$' >> "$OUT/client_errors.log"
     n=$((n + 1))
   done
 }
