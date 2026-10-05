@@ -92,7 +92,9 @@ for engine in "MergeTree" "ReplicatedMergeTree('/clickhouse/tables/$CLICKHOUSE_T
     check_active t_05383
     check_outdated t_05383
 
+    $CLICKHOUSE_CLIENT -q "SYSTEM START MERGES t_05383"
     $CLICKHOUSE_CLIENT -q "ALTER TABLE t_05383 DELETE WHERE x = 1 SETTINGS mutations_sync = 2"
+    $CLICKHOUSE_CLIENT -q "SYSTEM STOP MERGES t_05383"
     check_active t_05383
     check_outdated t_05383
 
