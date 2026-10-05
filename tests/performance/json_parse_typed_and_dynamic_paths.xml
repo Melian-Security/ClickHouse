@@ -1,20 +1,22 @@
 <test>
+    <!-- Parsing JSON text into a JSON column with typed paths and 64 dynamic paths. Rows come from
+         40 key templates, about 300 distinct paths overall, so dynamic paths overflow into shared data. -->
     <create_query>
         CREATE TABLE json_src (s String) ENGINE = Memory
     </create_query>
     <fill_query>
         INSERT INTO json_src SELECT concat(
-            '{"metadata":{"uid":"', toString(generateUUIDv4()), '","product":{"name":"p', toString(number % 40), '","vendor_name":"v', toString(number % 40), '"}},',
-            '"class_uid":', toString(number % 7), ',"severity_id":', toString(number % 5), ',"message":"m', toString(number), '",',
-            '"src_endpoint":{"ip":"10.0.', toString(number % 256), '.1","port":', toString(number % 65536), '},',
-            '"unmapped":{"f', toString(number % 320), '":1},',
-            '"raw":{', arrayStringConcat(arrayMap(i -> concat('"k', toString((number % 40) * 30 + i), '":"x', toString(i), '"'), range(30)), ','), '}}')
-        FROM numbers(300000)
+            '{"header":{"id":"', toString(generateUUIDv4()), '","source":{"name":"p', toString(number % 40), '","group":"v', toString(number % 40), '"}},',
+            '"kind":', toString(number % 7), ',"level":', toString(number % 5), ',"message":"m', toString(number), '",',
+            '"endpoint":{"ip":"10.0.', toString(number % 256), '.1","port":', toString(number % 65536), '},',
+            '"extra":{"f', toString(number % 320), '":1},',
+            '"payload":{', arrayStringConcat(arrayMap(i -> concat('"k', toString((number % 40) * 30 + i), '":"x', toString(i), '"'), range(30)), ','), '}}')
+        FROM numbers(100000)
     </fill_query>
 
     <query>
-        SELECT s::JSON(max_dynamic_paths=64, `metadata.uid` UUID, `metadata.product.name` String, `metadata.product.vendor_name` String,
-            class_uid Int64, severity_id Int64, message String, `src_endpoint.ip` Nullable(String), `src_endpoint.port` Int64)
+        SELECT s::JSON(max_dynamic_paths=64, `header.id` UUID, `header.source.name` String, `header.source.group` String,
+            kind Int64, level Int64, message String, `endpoint.ip` Nullable(String), `endpoint.port` Int64)
         FROM json_src FORMAT Null
     </query>
 
