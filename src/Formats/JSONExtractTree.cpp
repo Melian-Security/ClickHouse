@@ -1980,9 +1980,12 @@ public:
         /// Paths in shared data should be sorted, so we cannot insert paths there during traverse.
         /// Instead we collect all paths and values that should go to shared data, sort them and insert later.
         /// It's not optimal, but it's a price we pay for faster reading of subcolumns.
-        std::vector<std::pair<String, typename JSONParser::Element>> paths_and_values_for_shared_data;
-        /// Temporary Dynamic column that will be used to create and serialize values in shared data.
-        if (!traverseAndInsert(column_object, element, "", insert_settings, format_settings, paths_and_values_for_shared_data, prev_size, error, true))
+        /// Shared data paths are copied into one buffer, so collecting them does not allocate per path.
+        SharedDataPathsAndValues paths_and_values_for_shared_data;
+        /// The path of the element being visited. Each object level appends its key and truncates back, so
+        /// building child paths does not allocate per key.
+        String path_buffer;
+        if (!traverseAndInsert(column_object, element, path_buffer, insert_settings, format_settings, paths_and_values_for_shared_data, prev_size, error, true))
         {
             /// If there was an error, restore previous state.
             SerializationObject::restoreColumnObject(column_object, prev_size);
@@ -1990,24 +1993,28 @@ public:
         }
 
         /// Fill shared data.
-        std::sort(paths_and_values_for_shared_data.begin(), paths_and_values_for_shared_data.end(), [](const auto & left, const auto & right){ return left.first < right.first; });
+        auto & shared_data_entries = paths_and_values_for_shared_data.entries;
+        const String & shared_data_paths_buffer = paths_and_values_for_shared_data.paths_buffer;
+        auto get_entry_path = [&](const auto & entry) { return std::string_view(shared_data_paths_buffer).substr(entry.path_offset, entry.path_size); };
+        std::sort(shared_data_entries.begin(), shared_data_entries.end(), [&](const auto & left, const auto & right){ return get_entry_path(left) < get_entry_path(right); });
 
         size_t new_paths_total_size = 0;
-        for (const auto & [path, _] : paths_and_values_for_shared_data)
-            new_paths_total_size += path.size();
+        for (const auto & entry : shared_data_entries)
+            new_paths_total_size += entry.path_size;
 
         auto [shared_data_paths, shared_data_values] = column_object.getSharedDataPathsAndValues();
         reserveCharsWithGrowthCap(shared_data_paths->getChars(), shared_data_paths->getChars().size() + new_paths_total_size, format_settings.json_max_string_column_growth_step);
-        shared_data_paths->getOffsets().reserve(shared_data_paths->getOffsets().size() + paths_and_values_for_shared_data.size());
+        shared_data_paths->getOffsets().reserve(shared_data_paths->getOffsets().size() + shared_data_entries.size());
         auto & shared_data_values_chars = shared_data_values->getChars();
         auto & shared_data_values_offsets = shared_data_values->getOffsets();
-        shared_data_values_offsets.reserve(shared_data_values_offsets.size() + paths_and_values_for_shared_data.size());
+        shared_data_values_offsets.reserve(shared_data_values_offsets.size() + shared_data_entries.size());
         MutableColumnPtr tmp_dynamic_column;
-        for (size_t i = 0; i != paths_and_values_for_shared_data.size(); ++i)
+        for (size_t i = 0; i != shared_data_entries.size(); ++i)
         {
-            const auto & [path, value] = paths_and_values_for_shared_data[i];
+            const std::string_view path = get_entry_path(shared_data_entries[i]);
+            const auto & value = shared_data_entries[i].value;
             /// Check if we duplicated paths.
-            if (i != 0 && path == paths_and_values_for_shared_data[i - 1].first)
+            if (i != 0 && path == get_entry_path(shared_data_entries[i - 1]))
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2061,13 +2068,34 @@ public:
     }
 
 private:
+    struct SharedDataEntry
+    {
+        size_t path_offset;
+        size_t path_size;
+        typename JSONParser::Element value;
+    };
+
+    struct SharedDataPathsAndValues
+    {
+        String paths_buffer;
+        std::vector<SharedDataEntry> entries;
+
+        void add(const String & path, const typename JSONParser::Element & value)
+        {
+            entries.push_back({paths_buffer.size(), path.size(), value});
+            paths_buffer.append(path);
+        }
+    };
+
+    /// `current_path` holds the path of `element` on entry and on successful return; it is used as a scratch
+    /// buffer for child paths in between.
     bool traverseAndInsert(
         ColumnObject & column_object,
         const typename JSONParser::Element & element,
-        const String & current_path,
+        String & current_path,
         const JSONExtractInsertSettings & insert_settings,
         const FormatSettings & format_settings,
-        std::vector<std::pair<String, typename JSONParser::Element>> & paths_and_values_for_shared_data,
+        SharedDataPathsAndValues & paths_and_values_for_shared_data,
         size_t current_size,
         String & error,
         bool is_root,
@@ -2136,9 +2164,12 @@ private:
             /// Second pass: process each key-value pair in original order.
             /// All invalid duplicates have already been rejected in the first pass,
             /// so here we only need to skip already-processed (key, type) combinations.
+            const size_t current_path_size = current_path.size();
             for (auto [key, value] : element.getObject())
             {
-                String path = buildChildPath(current_path, key, insert_settings, is_root);
+                current_path.resize(current_path_size);
+                appendChildPath(current_path, key, insert_settings, is_root);
+                const String & path = current_path;
                 auto value_element_type = getJSONElementType(value);
                 auto & types = key_element_types[key];
                 if (!types.emittedEmpty())
@@ -2169,10 +2200,11 @@ private:
                     && typed_path_nodes.contains(path)
                     && !canParseObjectValue(typed_paths_types.at(path));
 
-                if (!traverseAndInsert(column_object, value, path, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false, skip_typed))
+                if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false, skip_typed))
                     return false;
             }
 
+            current_path.resize(current_path_size);
             return true;
         }
 
@@ -2208,7 +2240,7 @@ private:
         /// Don't check for dynamic paths if max_dynamic_paths=0 and add this path and value to shared data.
         else if (column_object.getMaxDynamicPaths() == 0)
         {
-            paths_and_values_for_shared_data.emplace_back(current_path, element);
+            paths_and_values_for_shared_data.add(current_path, element);
         }
         /// Check if we have this path in dynamic paths.
         else if (auto dynamic_it = dynamic_paths_ptrs.find(current_path); dynamic_it != dynamic_paths_ptrs.end())
@@ -2240,7 +2272,7 @@ private:
         /// Otherwise this path should go to the shared data.
         else
         {
-            paths_and_values_for_shared_data.emplace_back(current_path, element);
+            paths_and_values_for_shared_data.add(current_path, element);
         }
 
         return true;
@@ -2250,13 +2282,30 @@ private:
     String buildChildPath(const String & current_path, std::string_view key, const JSONExtractInsertSettings & insert_settings, bool is_root) const
     {
         String path = current_path;
-        if (!is_root)
-            path.append(".");
-        if (insert_settings.escape_dots_in_json_keys)
-            path += escapeDotInJSONKey(String(key));
-        else
-            path += key;
+        appendChildPath(path, key, insert_settings, is_root);
         return path;
+    }
+
+    static void appendChildPath(String & path, std::string_view key, const JSONExtractInsertSettings & insert_settings, bool is_root)
+    {
+        if (!is_root)
+            path.push_back('.');
+        if (insert_settings.escape_dots_in_json_keys)
+        {
+            /// Same escaping as escapeDotInJSONKey, without temporary strings.
+            size_t pos = 0;
+            for (size_t dot = key.find('.'); dot != std::string_view::npos; dot = key.find('.', pos))
+            {
+                path.append(key.substr(pos, dot - pos));
+                path.append("%2E");
+                pos = dot + 1;
+            }
+            path.append(key.substr(pos));
+        }
+        else
+        {
+            path.append(key);
+        }
     }
 
     bool shouldSkipPath(const String & path, const JSONExtractInsertSettings & insert_settings) const
