@@ -9,6 +9,7 @@
 #    With SNAPSHOT=dir, the prefilled data and Keeper state are copied from dir (made by a previous run with the
 #    same SNAPSHOT if dir does not exist yet) instead, which takes the prefill out of the timed runs.
 # 3. Load: CLIENTS concurrent HTTP clients insert the files of DATA_DIR (one part each) for SECONDS.
+#    FETCH_POOL sets background_fetches_pool_size (default 64).
 #    DATA_DIR=empty sends inserts without rows: only the checks done at the start of every insert.
 #    Every 5 s it samples the replication queue, the fetches pool and the stacks of all threads.
 # Appends one result line to RESULTS and leaves the samples in $OUT_DIR (default /home/ssm-user/pl-out/LABEL-<time>):
@@ -22,7 +23,7 @@ WORK=$(mktemp -d /home/ssm-user/pl.XXXX)
 OUT=${OUT_DIR:-/home/ssm-user/pl-out/$LABEL-$(date +%H%M%S)}
 mkdir -p "$WORK/data" "$WORK/log" "$OUT"
 PORT=39100; KPORT=39181; RPORT=39234; HTTP_PORT=$((PORT + 23))
-sed -e "s#@WORK@#$WORK#g" -e "s#@PORT@#$PORT#g" -e "s#@KEEPER_PORT@#$KPORT#g" -e "s#@RAFT_PORT@#$RPORT#g" -e "s#@IS_PORT@#$((PORT + 9))#g" -e "s#@HTTP_PORT@#$((PORT + 23))#g" "$K/server.xml" > "$WORK/config.xml"
+sed -e "s#@WORK@#$WORK#g" -e "s#@PORT@#$PORT#g" -e "s#@KEEPER_PORT@#$KPORT#g" -e "s#@RAFT_PORT@#$RPORT#g" -e "s#@IS_PORT@#$((PORT + 9))#g" -e "s#@HTTP_PORT@#$((PORT + 23))#g" -e "s#@FETCH_POOL@#${FETCH_POOL:-64}#g" "$K/server.xml" > "$WORK/config.xml"
 SNAPSHOT=${SNAPSHOT:-}
 PID=
 start_server() {

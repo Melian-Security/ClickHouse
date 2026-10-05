@@ -13,7 +13,7 @@
     <user_files_path>@WORK@/user_files/</user_files_path>
     <mark_cache_size>5368709120</mark_cache_size>
     <max_concurrent_queries>500</max_concurrent_queries>
-    <background_fetches_pool_size>64</background_fetches_pool_size>
+    <background_fetches_pool_size>@FETCH_POOL@</background_fetches_pool_size>
 
     <!-- Single-node embedded Keeper. -->
     <keeper_server>
