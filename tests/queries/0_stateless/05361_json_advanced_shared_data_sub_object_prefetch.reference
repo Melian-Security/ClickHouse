@@ -1,0 +1,11 @@
+t_sub_object_local	Wide	2
+t_sub_object_map	Wide	2
+t_sub_object_s3	Wide	2
+prefetch
+1	1
+1	1
+1	1
+1	1
+no prefetch
+1	1
+1	1
