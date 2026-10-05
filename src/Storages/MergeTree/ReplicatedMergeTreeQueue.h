@@ -198,18 +198,19 @@ private:
 
     Strings broken_parts_to_enqueue_fetches_on_loading;
 
-    /// Log entries created by this replica when it committed a part of its own insert: log znode name -> part name.
-    /// The part was added to ZooKeeper in the same transaction as the entry, and is in the working set of this
-    /// replica, so processing the entry here would only find out that the part already exists. Such entries are
-    /// applied when they are pulled instead of being copied to the queue, where they would wait for a slot in the
-    /// fetches pool and take the parts lock.
-    std::mutex own_committed_log_entries_mutex;
-    std::map<String, String> own_committed_log_entries TSA_GUARDED_BY(own_committed_log_entries_mutex);
+    /// Parts of inserts into this replica that are being committed or have been committed to ZooKeeper, with the time
+    /// they were added. Such a part is added to ZooKeeper in the same transaction as its GET_PART (or ATTACH_PART) log
+    /// entry and is in the working set of this replica, so processing that entry here would only find out that the
+    /// part already exists. The entry is applied when it is pulled instead of being copied to the queue, where it would
+    /// wait for a slot in the fetches pool and take the parts lock.
+    std::mutex own_inserted_parts_mutex;
+    std::unordered_map<String, time_t> own_inserted_parts TSA_GUARDED_BY(own_inserted_parts_mutex);
 
-    /// Removes `log_entry_name` from `own_committed_log_entries` and returns true if it is there for the part of `entry`.
-    bool takeOwnCommittedLogEntry(const String & log_entry_name, const LogEntry & entry);
-    /// Forgets the entries before `min_log_entry_name`, which have been pulled already.
-    void removeOwnCommittedLogEntriesBefore(const String & min_log_entry_name);
+    /// Returns true and forgets the part if `entry` is the log entry of a part in `own_inserted_parts`.
+    bool takeOwnInsertedPart(const LogEntry & entry);
+    /// Forgets the parts that were added long ago: their entries were pulled before they were added, or will be
+    /// processed in the queue as usual.
+    void removeOldOwnInsertedParts();
 
     /// Updates the state as if `entry` was inserted into the queue and then successfully processed.
     void applyEntryWithoutQueueUnlocked(const LogEntry & entry, std::lock_guard<SharedMutex> & state_lock);
@@ -381,9 +382,11 @@ public:
     /// Get set of parts from zookeeper
     void initialize(zkutil::ZooKeeperPtr zookeeper);
 
-    /// Called after a part of an insert into this replica has been committed to ZooKeeper together with the log entry
-    /// `log_entry_name` (the name of the znode in `/log`). The entry will not be added to the queue of this replica.
-    void addOwnCommittedLogEntry(const String & log_entry_name, const String & part_name);
+    /// Called before a part of an insert into this replica is committed to ZooKeeper together with its log entry.
+    /// If the commit succeeds, the entry will not be added to the queue of this replica.
+    void addOwnInsertedPart(const String & part_name);
+    /// Called if the commit has failed and the log entry has not been created.
+    void removeOwnInsertedPart(const String & part_name);
 
     /** Inserts an action to the end of the queue.
       * To restore broken parts during operation.

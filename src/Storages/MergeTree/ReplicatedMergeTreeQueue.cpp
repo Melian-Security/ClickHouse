@@ -114,30 +114,34 @@ void ReplicatedMergeTreeQueue::initialize(zkutil::ZooKeeperPtr zookeeper)
     LOG_TRACE(log, "Queue initialized");
 }
 
-void ReplicatedMergeTreeQueue::addOwnCommittedLogEntry(const String & log_entry_name, const String & part_name)
+void ReplicatedMergeTreeQueue::addOwnInsertedPart(const String & part_name)
 {
-    std::lock_guard lock(own_committed_log_entries_mutex);
-    own_committed_log_entries.emplace(log_entry_name, part_name);
+    std::lock_guard lock(own_inserted_parts_mutex);
+    own_inserted_parts[part_name] = time(nullptr);
 }
 
-bool ReplicatedMergeTreeQueue::takeOwnCommittedLogEntry(const String & log_entry_name, const LogEntry & entry)
+void ReplicatedMergeTreeQueue::removeOwnInsertedPart(const String & part_name)
+{
+    std::lock_guard lock(own_inserted_parts_mutex);
+    own_inserted_parts.erase(part_name);
+}
+
+bool ReplicatedMergeTreeQueue::takeOwnInsertedPart(const LogEntry & entry)
 {
     if ((entry.type != LogEntry::GET_PART && entry.type != LogEntry::ATTACH_PART) || entry.source_replica != storage.replica_name)
         return false;
 
-    std::lock_guard lock(own_committed_log_entries_mutex);
-    auto it = own_committed_log_entries.find(log_entry_name);
-    if (it == own_committed_log_entries.end() || it->second != entry.new_part_name)
-        return false;
-
-    own_committed_log_entries.erase(it);
-    return true;
+    std::lock_guard lock(own_inserted_parts_mutex);
+    return own_inserted_parts.erase(entry.new_part_name) > 0;
 }
 
-void ReplicatedMergeTreeQueue::removeOwnCommittedLogEntriesBefore(const String & min_log_entry_name)
+void ReplicatedMergeTreeQueue::removeOldOwnInsertedParts()
 {
-    std::lock_guard lock(own_committed_log_entries_mutex);
-    own_committed_log_entries.erase(own_committed_log_entries.begin(), own_committed_log_entries.lower_bound(min_log_entry_name));
+    constexpr time_t max_age_seconds = 3600;
+    const time_t now = time(nullptr);
+
+    std::lock_guard lock(own_inserted_parts_mutex);
+    std::erase_if(own_inserted_parts, [&](const auto & part) { return part.second + max_age_seconds < now; });
 }
 
 void ReplicatedMergeTreeQueue::applyEntryWithoutQueueUnlocked(const LogEntry & entry, std::lock_guard<SharedMutex> & /* state_lock */)
@@ -911,7 +915,7 @@ std::pair<int32_t, int32_t> ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::Zo
     }
 
     String min_log_entry = "log-" + padIndex(index);
-    removeOwnCommittedLogEntriesBefore(min_log_entry);
+    removeOldOwnInsertedParts();
 
     /// Multiple log entries that must be copied to the queue.
 
@@ -971,7 +975,7 @@ std::pair<int32_t, int32_t> ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::Zo
 
                 auto parsed_entry = LogEntry::parse(res.data, res.stat, format_version);
 
-                if (takeOwnCommittedLogEntry(*(begin + i), *parsed_entry))
+                if (takeOwnInsertedPart(*parsed_entry))
                 {
                     parsed_entry->znode_name = *(begin + i);
                     max_create_time_of_entries_without_queue = std::max(max_create_time_of_entries_without_queue, parsed_entry->create_time);

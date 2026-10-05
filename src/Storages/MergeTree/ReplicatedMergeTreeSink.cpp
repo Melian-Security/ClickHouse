@@ -967,7 +967,6 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
         /// It will simultaneously add information about the part to all the necessary places in ZooKeeper and remove block_number_lock.
         Coordination::Requests ops;
 
-        const size_t log_entry_op_idx = ops.size();
         get_logs_ops(ops);
 
         /// Deletes the information that the block number is used for writing.
@@ -1012,13 +1011,21 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
 
         fiu_do_on(FailPoints::rmt_delay_commit_part, { sleepForSeconds(5); });
 
+        /// The part is registered while the request is in flight, because the log entry can be pulled before the
+        /// response arrives. It stays registered unless the request is known to have failed.
+        const String committing_part_name = part->name;
+        bool log_entry_may_exist = false;
+        storage.queue.addOwnInsertedPart(committing_part_name);
+        SCOPE_EXIT({
+            if (!log_entry_may_exist)
+                storage.queue.removeOwnInsertedPart(committing_part_name);
+        });
+
         Coordination::Responses responses;
         Coordination::Error multi_code = zookeeper->tryMultiNoThrow(ops, responses, /* check_session_valid */ true); /// 1 RTT
         if (multi_code == Coordination::Error::ZOK)
         {
-            const String & log_entry_path = dynamic_cast<const Coordination::CreateResponse &>(*responses[log_entry_op_idx]).path_created;
-            storage.queue.addOwnCommittedLogEntry(fs::path(log_entry_path).filename().string(), part->name);
-
+            log_entry_may_exist = true;
             sleep_before_commit_for_tests();
             transaction.commit();
             part->new_part_was_committed_to_zookeeper_after_rename_on_disk = true;
@@ -1047,6 +1054,7 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
             /// lose data that Keeper has committed.
             auto preserve_part_and_throw_unknown_status = [&](const String & recovery_failure)
             {
+                log_entry_may_exist = true;
                 {
                     /// While we could not verify in keeper whether the part was committed, the failed-quorum
                     /// cleanup (ReplicatedMergeTreeRestartingThread::removeFailedQuorumParts) could have concurrently
@@ -1115,6 +1123,7 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
 
             if (node_exists)
             {
+                log_entry_may_exist = true;
                 LOG_DEBUG(log, "Insert of part {} recovered from keeper successfully. It will be committed", part->name);
                 sleep_before_commit_for_tests();
                 transaction.commit();
