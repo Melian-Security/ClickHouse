@@ -160,8 +160,9 @@ private:
 
     UInt64 getColumnsSize(const NameSet & columns) const;
 
-    double approximateBytesPerRow(const NameSet & columns) const;
-    double approximateBytesPerRowAndColumn(const String & column) const;
+    /// `sizes_measured` is false when no queried column has a measured size (only compact parts).
+    double approximateBytesPerRow(const NameSet & columns, bool sizes_measured) const;
+    double approximateBytesPerRowAndColumn(const String & column, bool sizes_measured) const;
 
     bool columnsSupportPrewhere(const NameSet & columns) const;
 

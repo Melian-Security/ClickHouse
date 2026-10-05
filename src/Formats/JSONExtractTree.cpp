@@ -1,6 +1,7 @@
 #include "config.h"
 
 #include <algorithm>
+#include <bit>
 #include <Formats/JSONExtractTree.h>
 #include <Formats/SchemaInferenceUtils.h>
 
@@ -21,6 +22,7 @@
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <Common/StringHashForHeterogeneousLookup.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVariant.h>
 #include <Columns/ColumnVector.h>
@@ -1942,6 +1944,17 @@ public:
         all_typed_paths_have_trivial_defaults = std::all_of(
             typed_paths_types_.begin(), typed_paths_types_.end(),
             [](const auto & pair) { return pair.second->isDefaultInsertTrivial(); });
+
+        /// ColumnObject keeps typed path columns sorted by path, so a typed path's position
+        /// in the sorted list addresses its column in getSortedTypedPathColumns().
+        std::vector<String> sorted_typed_paths;
+        sorted_typed_paths.reserve(typed_path_nodes.size());
+        for (const auto & [path, _] : typed_path_nodes)
+            sorted_typed_paths.push_back(path);
+        std::sort(sorted_typed_paths.begin(), sorted_typed_paths.end());
+        typed_path_infos.reserve(sorted_typed_paths.size());
+        for (size_t i = 0; i != sorted_typed_paths.size(); ++i)
+            typed_path_infos.emplace(sorted_typed_paths[i], TypedPathInfo{typed_path_nodes.at(sorted_typed_paths[i]).get(), i});
     }
 
     bool insertResultToColumn(IColumn & column, const typename JSONParser::Element & element, const JSONExtractInsertSettings & insert_settings, const FormatSettings & format_settings, String & error) const override
@@ -1979,9 +1992,12 @@ public:
         /// Paths in shared data should be sorted, so we cannot insert paths there during traverse.
         /// Instead we collect all paths and values that should go to shared data, sort them and insert later.
         /// It's not optimal, but it's a price we pay for faster reading of subcolumns.
-        std::vector<std::pair<String, typename JSONParser::Element>> paths_and_values_for_shared_data;
-        /// Temporary Dynamic column that will be used to create and serialize values in shared data.
-        if (!traverseAndInsert(column_object, element, "", insert_settings, format_settings, paths_and_values_for_shared_data, prev_size, error, true))
+        /// Shared data paths are copied into one buffer, so collecting them does not allocate per path.
+        SharedDataPathsAndValues paths_and_values_for_shared_data;
+        /// The path of the element being visited. Each object level appends its key and truncates back, so
+        /// building child paths does not allocate per key.
+        String path_buffer;
+        if (!traverseAndInsert(column_object, element, path_buffer, insert_settings, format_settings, paths_and_values_for_shared_data, prev_size, error, true))
         {
             /// If there was an error, restore previous state.
             SerializationObject::restoreColumnObject(column_object, prev_size);
@@ -1989,24 +2005,28 @@ public:
         }
 
         /// Fill shared data.
-        std::sort(paths_and_values_for_shared_data.begin(), paths_and_values_for_shared_data.end(), [](const auto & left, const auto & right){ return left.first < right.first; });
+        auto & shared_data_entries = paths_and_values_for_shared_data.entries;
+        const String & shared_data_paths_buffer = paths_and_values_for_shared_data.paths_buffer;
+        auto get_entry_path = [&](const auto & entry) { return std::string_view(shared_data_paths_buffer).substr(entry.path_offset, entry.path_size); };
+        std::sort(shared_data_entries.begin(), shared_data_entries.end(), [&](const auto & left, const auto & right){ return get_entry_path(left) < get_entry_path(right); });
 
         size_t new_paths_total_size = 0;
-        for (const auto & [path, _] : paths_and_values_for_shared_data)
-            new_paths_total_size += path.size();
+        for (const auto & entry : shared_data_entries)
+            new_paths_total_size += entry.path_size;
 
         auto [shared_data_paths, shared_data_values] = column_object.getSharedDataPathsAndValues();
         reserveCharsWithGrowthCap(shared_data_paths->getChars(), shared_data_paths->getChars().size() + new_paths_total_size, format_settings.json_max_string_column_growth_step);
-        shared_data_paths->getOffsets().reserve(shared_data_paths->getOffsets().size() + paths_and_values_for_shared_data.size());
+        shared_data_paths->getOffsets().reserve(shared_data_paths->getOffsets().size() + shared_data_entries.size());
         auto & shared_data_values_chars = shared_data_values->getChars();
         auto & shared_data_values_offsets = shared_data_values->getOffsets();
-        shared_data_values_offsets.reserve(shared_data_values_offsets.size() + paths_and_values_for_shared_data.size());
+        shared_data_values_offsets.reserve(shared_data_values_offsets.size() + shared_data_entries.size());
         MutableColumnPtr tmp_dynamic_column;
-        for (size_t i = 0; i != paths_and_values_for_shared_data.size(); ++i)
+        for (size_t i = 0; i != shared_data_entries.size(); ++i)
         {
-            const auto & [path, value] = paths_and_values_for_shared_data[i];
+            const std::string_view path = get_entry_path(shared_data_entries[i]);
+            const auto & value = shared_data_entries[i].value;
             /// Check if we duplicated paths.
-            if (i != 0 && path == paths_and_values_for_shared_data[i - 1].first)
+            if (i != 0 && path == get_entry_path(shared_data_entries[i - 1]))
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2060,13 +2080,34 @@ public:
     }
 
 private:
+    struct SharedDataEntry
+    {
+        size_t path_offset;
+        size_t path_size;
+        typename JSONParser::Element value;
+    };
+
+    struct SharedDataPathsAndValues
+    {
+        String paths_buffer;
+        std::vector<SharedDataEntry> entries;
+
+        void add(const String & path, const typename JSONParser::Element & value)
+        {
+            entries.push_back({paths_buffer.size(), path.size(), value});
+            paths_buffer.append(path);
+        }
+    };
+
+    /// `current_path` holds the path of `element` on entry and on successful return; it is used as a scratch
+    /// buffer for child paths in between.
     bool traverseAndInsert(
         ColumnObject & column_object,
         const typename JSONParser::Element & element,
-        const String & current_path,
+        String & current_path,
         const JSONExtractInsertSettings & insert_settings,
         const FormatSettings & format_settings,
-        std::vector<std::pair<String, typename JSONParser::Element>> & paths_and_values_for_shared_data,
+        SharedDataPathsAndValues & paths_and_values_for_shared_data,
         size_t current_size,
         String & error,
         bool is_root,
@@ -2075,28 +2116,32 @@ private:
         if (shouldSkipPath(current_path, insert_settings))
             return true;
 
-        if (element.isObject() && (skip_typed_path_check || !typed_path_nodes.contains(current_path) || (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object && hasTypedPathWithPrefix(current_path + "."))))
+        /// The path is hashed once here and the hash is reused for the typed and dynamic path lookups below.
+        const PrehashedStringView prehashed_path(current_path);
+        const auto typed_path_it = typed_path_infos.find(prehashed_path);
+
+        if (element.isObject() && (skip_typed_path_check || typed_path_it == typed_path_infos.end() || (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object && hasTypedPathWithPrefix(current_path + "."))))
         {
             /// First pass: collect the set of distinct element types (LITERAL/OBJECT) per key.
             /// This lets us detect all duplicates upfront so we can:
             ///  - throw errors immediately for invalid duplicates (before any data is inserted),
             ///  - handle both orderings of literal+object duplicates in the main loop
             ///    (e.g. {"a":42,"a":{"b":42}} and {"a":{"b":42},"a":42} are both valid).
-            std::unordered_map<std::string_view, std::unordered_set<JSONElementType>> key_element_types;
+            std::unordered_map<std::string_view, KeyTypes> key_element_types;
             for (auto [key, value] : element.getObject())
             {
                 auto value_element_type = getJSONElementType(value);
                 auto & types = key_element_types[key];
 
-                if (types.empty())
+                if (types.acceptedEmpty())
                 {
                     /// First occurrence of this key — just record its type.
-                    types.insert(value_element_type);
+                    types.accept(value_element_type);
                     continue;
                 }
 
                 /// Duplicate key detected. Decide whether to allow or reject.
-                if (types.contains(value_element_type))
+                if (types.accepted(value_element_type))
                 {
                     /// Same-type duplicate (e.g. two literals or two objects for the same key).
                     /// This is never allowed by type_json_allow_duplicated_key_with_literal_and_nested_object
@@ -2114,7 +2159,7 @@ private:
                 if (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object)
                 {
                     /// Setting enabled — record the second type so the main loop processes both.
-                    types.insert(value_element_type);
+                    types.accept(value_element_type);
                 }
                 else
                 {
@@ -2135,13 +2180,15 @@ private:
             /// Second pass: process each key-value pair in original order.
             /// All invalid duplicates have already been rejected in the first pass,
             /// so here we only need to skip already-processed (key, type) combinations.
-            std::unordered_map<std::string_view, std::unordered_set<JSONElementType>> visited_keys;
+            const size_t current_path_size = current_path.size();
             for (auto [key, value] : element.getObject())
             {
-                String path = buildChildPath(current_path, key, insert_settings, is_root);
+                current_path.resize(current_path_size);
+                appendChildPath(current_path, key, insert_settings, is_root);
+                const String & path = current_path;
                 auto value_element_type = getJSONElementType(value);
-                auto it = visited_keys.find(key);
-                if (it != visited_keys.end())
+                auto & types = key_element_types[key];
+                if (!types.emittedEmpty())
                 {
                     /// We have seen this key before. Skip if:
                     ///  - we already processed a value with this element type for this key
@@ -2149,13 +2196,13 @@ private:
                     ///  - the first pass rejected this type for this key (different-type duplicate
                     ///    that was skipped because type_json_allow_duplicated_key_with_literal_and_nested_object
                     ///    is disabled but type_json_skip_duplicated_paths is enabled).
-                    if (it->second.contains(value_element_type) || !key_element_types[key].contains(value_element_type))
+                    if (types.emitted(value_element_type) || !types.accepted(value_element_type))
                         continue;
-                    it->second.insert(value_element_type);
+                    types.emit(value_element_type);
                 }
                 else
                 {
-                    visited_keys[key].insert(value_element_type);
+                    types.emit(value_element_type);
                 }
 
                 /// When a key has both literal and object values (key_element_types has 2 types),
@@ -2164,25 +2211,28 @@ private:
                 /// inserted into the typed path. Instead, pass skip_typed_path_check=true so the
                 /// recursive call enters object traversal and sends the object's children to
                 /// dynamic/shared data. The literal value will fill the typed path via normal recursion.
-                bool skip_typed = key_element_types[key].size() > 1
+                bool skip_typed = types.acceptedMoreThanOne()
                     && value_element_type == JSONElementType::OBJECT
                     && typed_path_nodes.contains(path)
                     && !canParseObjectValue(typed_paths_types.at(path));
 
-                if (!traverseAndInsert(column_object, value, path, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false, skip_typed))
+                if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false, skip_typed))
                     return false;
             }
 
+            current_path.resize(current_path_size);
             return true;
         }
 
-        auto & typed_paths = column_object.getTypedPaths();
         auto & dynamic_paths_ptrs = column_object.getDynamicPathsPtrs();
+        /// The column is created from the same type as this node, so it has exactly the node's typed paths.
+        chassert(column_object.getSortedTypedPathColumns().size() == typed_path_infos.size());
         /// Check if we have this path in typed paths.
-        if (auto typed_it = typed_paths.find(current_path); typed_it != typed_paths.end())
+        if (typed_path_it != typed_path_infos.end())
         {
+            IColumn & typed_column = *column_object.getSortedTypedPathColumns()[typed_path_it->second.sorted_index];
             /// Check if we already had this path.
-            if (typed_it->second->size() > current_size)
+            if (typed_column.size() > current_size)
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2190,7 +2240,7 @@ private:
                     return false;
                 }
             }
-            else if (!typed_path_nodes.at(current_path)->insertResultToColumn(*typed_it->second, element, insert_settings, format_settings, error))
+            else if (!typed_path_it->second.node->insertResultToColumn(typed_column, element, insert_settings, format_settings, error))
             {
                 if (!insert_settings.skip_invalid_typed_paths)
                 {
@@ -2208,10 +2258,10 @@ private:
         /// Don't check for dynamic paths if max_dynamic_paths=0 and add this path and value to shared data.
         else if (column_object.getMaxDynamicPaths() == 0)
         {
-            paths_and_values_for_shared_data.emplace_back(current_path, element);
+            paths_and_values_for_shared_data.add(current_path, element);
         }
         /// Check if we have this path in dynamic paths.
-        else if (auto dynamic_it = dynamic_paths_ptrs.find(current_path); dynamic_it != dynamic_paths_ptrs.end())
+        else if (auto dynamic_it = dynamic_paths_ptrs.find(prehashed_path); dynamic_it != dynamic_paths_ptrs.end())
         {
             /// Check if we already had this path.
             if (dynamic_it->second->size() > current_size)
@@ -2240,7 +2290,7 @@ private:
         /// Otherwise this path should go to the shared data.
         else
         {
-            paths_and_values_for_shared_data.emplace_back(current_path, element);
+            paths_and_values_for_shared_data.add(current_path, element);
         }
 
         return true;
@@ -2250,17 +2300,37 @@ private:
     String buildChildPath(const String & current_path, std::string_view key, const JSONExtractInsertSettings & insert_settings, bool is_root) const
     {
         String path = current_path;
-        if (!is_root)
-            path.append(".");
-        if (insert_settings.escape_dots_in_json_keys)
-            path += escapeDotInJSONKey(String(key));
-        else
-            path += key;
+        appendChildPath(path, key, insert_settings, is_root);
         return path;
+    }
+
+    static void appendChildPath(String & path, std::string_view key, const JSONExtractInsertSettings & insert_settings, bool is_root)
+    {
+        if (!is_root)
+            path.push_back('.');
+        if (insert_settings.escape_dots_in_json_keys)
+        {
+            /// Same escaping as escapeDotInJSONKey, without temporary strings.
+            size_t pos = 0;
+            for (size_t dot = key.find('.'); dot != std::string_view::npos; dot = key.find('.', pos))
+            {
+                path.append(key.substr(pos, dot - pos));
+                path.append("%2E");
+                pos = dot + 1;
+            }
+            path.append(key.substr(pos));
+        }
+        else
+        {
+            path.append(key);
+        }
     }
 
     bool shouldSkipPath(const String & path, const JSONExtractInsertSettings & insert_settings) const
     {
+        if (paths_to_skip.empty() && path_regexps_to_skip.empty())
+            return false;
+
         if (paths_to_skip.contains(path))
             return true;
 
@@ -2545,6 +2615,14 @@ private:
 
     std::unordered_map<String, DataTypePtr> typed_paths_types;
     std::unordered_map<String, std::unique_ptr<JSONExtractTreeNode<JSONParser>>> typed_path_nodes;
+
+    struct TypedPathInfo
+    {
+        const JSONExtractTreeNode<JSONParser> * node;
+        /// Index of the path's column in ColumnObject::getSortedTypedPathColumns().
+        size_t sorted_index;
+    };
+    std::unordered_map<String, TypedPathInfo, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> typed_path_infos;
     bool all_typed_paths_have_trivial_defaults = true;
     std::unordered_set<String> paths_to_skip;
     std::vector<String> sorted_paths_to_skip;
@@ -2558,6 +2636,28 @@ private:
     {
         LITERAL = 0,
         OBJECT = 1,
+    };
+
+    /// Per-key state of the two object traversal passes, one entry per key of the object being
+    /// traversed. `accepted` is the set of element types the first pass admitted for the key,
+    /// `emitted` the set the second pass has already sent down the recursion. Both sets range over
+    /// `JSONElementType`, which has two enumerators, so each is a two-bit mask.
+    struct KeyTypes
+    {
+        static unsigned bit(JSONElementType type) { return 1U << static_cast<unsigned>(type); }
+
+        bool acceptedEmpty() const { return accepted_mask == 0; }
+        bool accepted(JSONElementType type) const { return accepted_mask & bit(type); }
+        bool acceptedMoreThanOne() const { return std::popcount(accepted_mask) > 1; }
+        void accept(JSONElementType type) { accepted_mask |= bit(type); }
+
+        bool emittedEmpty() const { return emitted_mask == 0; }
+        bool emitted(JSONElementType type) const { return emitted_mask & bit(type); }
+        void emit(JSONElementType type) { emitted_mask |= bit(type); }
+
+    private:
+        unsigned accepted_mask = 0;
+        unsigned emitted_mask = 0;
     };
 
     JSONElementType getJSONElementType(const typename JSONParser::Element & element) const

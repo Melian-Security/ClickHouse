@@ -1,0 +1,26 @@
+<test>
+    <!-- Reading a sub-object (json.^prefix) from JSON advanced shared data of a Wide part reads every bucket.
+         With prefetches enabled, the reads of all buckets are started before any of them is deserialized. -->
+    <settings>
+        <local_filesystem_read_method>pread_threadpool</local_filesystem_read_method>
+        <local_filesystem_read_prefetch>1</local_filesystem_read_prefetch>
+    </settings>
+
+    <create_query>
+        create table json_advanced_shared_data_sub_object (id UInt64, json JSON(max_dynamic_paths=0))
+        engine=MergeTree order by id
+        settings min_bytes_for_wide_part=0, min_rows_for_wide_part=0,
+                 object_shared_data_serialization_version='advanced',
+                 object_shared_data_serialization_version_for_zero_level_parts='advanced',
+                 object_shared_data_buckets_for_wide_part=32
+    </create_query>
+
+    <!-- 30 paths per row out of 3000, under 10 top-level prefixes. Braces are doubled for perf.py's string formatter. -->
+    <fill_query>insert into json_advanced_shared_data_sub_object select number, '{{' || arrayStringConcat(arrayMap(i -> '"g' || toString(i % 10) || '.p' || toString((number + i * 7) % 300) || '":"' || toString(number * i) || '"', range(30)), ',') || '}}' from numbers(1000000)</fill_query>
+    <fill_query>optimize table json_advanced_shared_data_sub_object final</fill_query>
+
+    <query>select json.^g3 from json_advanced_shared_data_sub_object format Null</query>
+    <query>select json.^g3 from json_advanced_shared_data_sub_object where id % 100000 &lt; 100 format Null</query>
+
+    <drop_query>drop table if exists json_advanced_shared_data_sub_object</drop_query>
+</test>

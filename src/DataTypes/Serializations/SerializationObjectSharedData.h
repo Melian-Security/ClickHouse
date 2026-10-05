@@ -278,6 +278,23 @@ private:
         DeserializeBinaryBulkSettings & settings,
         SubstreamsCache * cache);
 
+    /// Start reading, at the marks of the first chunk to read, the streams that deserializePathsInfos and
+    /// deserializePathsData read first. Does nothing if settings.prefetch_stream_at_mark_callback is not set.
+    /// The marks come from other streams, so a caller that reads several buckets prefetches all
+    /// buckets before deserializing any of them, and the reads of the buckets overlap.
+    static void prefetchPathsInfos(
+        const SerializationObjectSharedData::ChunkStructures & chunk_structures,
+        const SerializationObjectSharedData::DeserializeBinaryBulkStateObjectSharedDataStructure & structure_state,
+        DeserializeBinaryBulkSettings & settings,
+        SubstreamsCache * cache);
+
+    static void prefetchPathsData(
+        const SerializationObjectSharedData::ChunkStructures & chunk_structures,
+        const PathsInfosChunks & paths_infos_chunks,
+        const SerializationObjectSharedData::DeserializeBinaryBulkStateObjectSharedDataStructure & structure_state,
+        DeserializeBinaryBulkSettings & settings,
+        SubstreamsCache * cache);
+
     /// Struct that contains actual data from ObjectSharedDataData stream
     /// for specific paths and their subcolumns.
     struct PathsData

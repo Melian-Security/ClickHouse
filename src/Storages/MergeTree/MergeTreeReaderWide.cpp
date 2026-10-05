@@ -104,6 +104,13 @@ void MergeTreeReaderWide::prefetchBeginOfRange(Priority priority)
     }
 }
 
+bool MergeTreeReaderWide::arePrefetchesEnabled() const
+{
+    return data_part_info_for_read->getDataPartStorage()->isStoredOnRemoteDisk()
+        ? settings.read_settings.remote_fs_settings.prefetch
+        : settings.read_settings.local_fs_settings.prefetch;
+}
+
 void MergeTreeReaderWide::prefetchForAllColumns(
     Priority priority,
     size_t num_columns,
@@ -111,11 +118,7 @@ void MergeTreeReaderWide::prefetchForAllColumns(
     bool continue_reading,
     bool deserialize_prefixes)
 {
-    bool do_prefetch = data_part_info_for_read->getDataPartStorage()->isStoredOnRemoteDisk()
-        ? settings.read_settings.remote_fs_settings.prefetch
-        : settings.read_settings.local_fs_settings.prefetch;
-
-    if (!do_prefetch || all_mark_ranges.getNumberOfMarks() == 0)
+    if (!arePrefetchesEnabled() || all_mark_ranges.getNumberOfMarks() == 0)
         return;
     if (settings.filesystem_prefetches_limit && num_columns > settings.filesystem_prefetches_limit)
         return;
@@ -567,6 +570,7 @@ void MergeTreeReaderWide::prefetchForColumn(
     ISerialization::SubstreamsCache & cache)
 {
     const bool prefix_deserialized = deserialize_binary_bulk_state_map.contains(name_and_type.name);
+    std::vector<std::pair<ISerialization::SubstreamPath, String>> streams_to_prefetch;
 
     auto callback = [&](const ISerialization::SubstreamPath & substream_path)
     {
@@ -595,12 +599,7 @@ void MergeTreeReaderWide::prefetchForColumn(
             if (data_part_info_for_read->getFileSizeOrZero(*stream_name + DATA_FILE_EXTENSION) == 0)
                 return;
 
-            bool seek_to_mark = !continue_reading && !read_without_marks;
-            if (ReadBuffer * buf = getStream(false, substream_path, data_part_info_for_read->getChecksums(), name_and_type, from_mark, seek_to_mark, cache))
-            {
-                buf->prefetch(priority);
-                prefetched_streams.insert(*stream_name);
-            }
+            streams_to_prefetch.emplace_back(substream_path, std::move(*stream_name));
         }
     };
 
@@ -614,6 +613,28 @@ void MergeTreeReaderWide::prefetchForColumn(
     else
     {
         serialization->enumerateStreams(callback);
+    }
+
+    /// Seeking a stream to a mark waits for its marks. Create all missing streams first: each one starts loading its
+    /// marks asynchronously, so the marks of all streams are loaded in parallel instead of one after another.
+    /// It matters for columns with many streams that are known only after the prefix is deserialized, like JSON.
+    for (const auto & [substream_path, stream_name] : streams_to_prefetch)
+    {
+        if (!streams.contains(stream_name) && !cache.contains(ISerialization::getSubstreamsCacheKeyForStream(substream_path)))
+            addStream(substream_path, stream_name);
+    }
+
+    bool seek_to_mark = !continue_reading && !read_without_marks;
+    for (const auto & [substream_path, stream_name] : streams_to_prefetch)
+    {
+        if (prefetched_streams.contains(stream_name))
+            continue;
+
+        if (ReadBuffer * buf = getStream(false, substream_path, data_part_info_for_read->getChecksums(), name_and_type, from_mark, seek_to_mark, cache))
+        {
+            buf->prefetch(priority);
+            prefetched_streams.insert(stream_name);
+        }
     }
 }
 
@@ -656,6 +677,27 @@ void MergeTreeReaderWide::readData(
 
         streams[*stream_name]->seekToMark(mark);
     };
+
+    if (arePrefetchesEnabled() && !read_without_marks)
+    {
+        deserialize_settings.prefetch_stream_at_mark_callback = [&](const ISerialization::SubstreamPath & substream_path, const MarkInCompressedFile & mark)
+        {
+            auto stream_name = IMergeTreeDataPart::getStreamNameForColumn(name_and_type, substream_path, ".bin", data_part_info_for_read->getChecksums(), storage_settings);
+            if (!stream_name)
+                return;
+
+            auto it = streams.find(*stream_name);
+            if (it == streams.end())
+                return;
+
+            /// The read range must be set before the prefetch, changing it later cancels the prefetch.
+            it->second->adjustRightMark(last_mark_to_read);
+            it->second->seekToMark(mark);
+            it->second->getDataBuffer()->prefetch(Priority{});
+            /// The getter must not move the stream back to the current mark: the serialization reads it from this mark.
+            prefetched_streams.insert(*stream_name);
+        };
+    }
 
     /// Seek a substream's stream to the current granule's mark. Needed by serializations that read a
     /// value not implied by the ongoing range position (e.g. a per-part value broadcast to every

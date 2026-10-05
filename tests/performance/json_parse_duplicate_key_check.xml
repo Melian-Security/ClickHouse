@@ -1,0 +1,27 @@
+<test>
+    <!-- Parsing JSON text into the JSON type checks every object for duplicate keys. Each row has
+         80 top-level keys and 4 nested objects of 5 keys, from about 300 distinct paths. -->
+    <substitutions>
+        <substitution>
+            <name>json_type</name>
+            <values>
+                <value>JSON</value>
+                <value>JSON(max_dynamic_paths = 64)</value>
+            </values>
+        </substitution>
+    </substitutions>
+
+    <create_query>CREATE TABLE t_json_duplicate_key_check_src (s String) ENGINE = Memory</create_query>
+    <fill_query>
+        INSERT INTO t_json_duplicate_key_check_src SELECT concat('{',
+            arrayStringConcat(arrayMap(i -> concat('"key_', toString((number % 3) * 80 + i), '":', toString(number + i)), range(80)), ','), ',',
+            arrayStringConcat(arrayMap(g -> concat('"object_', toString((number % 10) + g), '":{',
+                arrayStringConcat(arrayMap(i -> concat('"field_', toString(i), '":"v', toString(i), '"'), range(5)), ','), '}'), range(4)), ','),
+            '}')
+        FROM numbers(100000)
+    </fill_query>
+
+    <query>SELECT s::{json_type} FROM t_json_duplicate_key_check_src FORMAT Null</query>
+
+    <drop_query>DROP TABLE IF EXISTS t_json_duplicate_key_check_src</drop_query>
+</test>
