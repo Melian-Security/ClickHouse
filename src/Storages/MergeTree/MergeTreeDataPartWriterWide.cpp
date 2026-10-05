@@ -256,7 +256,7 @@ void MergeTreeDataPartWriterWide::addStreams(
             throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure in Wide part writer addStreams");
         });
 
-        column_streams.emplace(stream_name, std::make_unique<MergeTreeWriterStream>(
+        auto stream_it = column_streams.emplace(stream_name, std::make_unique<MergeTreeWriterStream>(
             stream_name,
             data_part_storage,
             stream_name,
@@ -267,12 +267,13 @@ void MergeTreeDataPartWriterWide::addStreams(
             max_compress_block_size,
             marks_compression_codec,
             settings.marks_compress_block_size,
-            query_write_settings));
+            query_write_settings)).first;
 
+        MarksInCompressedFile::PlainArray * stream_cached_marks = nullptr;
         if (columns_to_load_marks.contains(name_and_type.name))
-            cached_marks.emplace(stream_name, std::make_unique<MarksInCompressedFile::PlainArray>());
+            stream_cached_marks = cached_marks.emplace(stream_name, std::make_unique<MarksInCompressedFile::PlainArray>()).first->second.get();
 
-        full_name_to_stream_name.emplace(full_stream_name, stream_name);
+        full_name_to_stream.emplace(full_stream_name, StreamEntry{&stream_it->first, stream_it->second.get(), stream_cached_marks});
         stream_name_to_full_name.emplace(stream_name, full_stream_name);
     };
 
@@ -282,26 +283,40 @@ void MergeTreeDataPartWriterWide::addStreams(
     serialization->enumerateStreams(enumerate_settings, callback, data);
 }
 
-const String & MergeTreeDataPartWriterWide::getStreamName(
+const MergeTreeDataPartWriterWide::StreamEntry * MergeTreeDataPartWriterWide::getStream(
     const NameAndTypePair & column,
     const ISerialization::SubstreamPath & substream_path) const
 {
     auto full_stream_name = ISerialization::getFileNameForStream(column, substream_path, ISerialization::StreamFileNameSettings(*storage_settings));
-    String stream_name = replaceFileNameToHashIfNeeded(full_stream_name, *storage_settings, data_part_storage.get());
+    bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
 
-    if (written_offset_substreams)
+    auto it = full_name_to_stream.find(full_stream_name);
+    if (it != full_name_to_stream.end())
     {
-        bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
-        /// If it has been written already return an empty string placeholder, to avoid writing it again.
-        if (is_offsets && written_offset_substreams->contains(stream_name))
-            return already_written_stream_holder;
+        /// If it has been written already return nullptr, to avoid writing it again.
+        if (is_offsets && written_offset_substreams && written_offset_substreams->contains(*it->second.stream_name))
+            return nullptr;
+        return &it->second;
     }
 
-    auto it = full_name_to_stream_name.find(full_stream_name);
-    if (it == full_name_to_stream_name.end())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Stream {} not found", full_stream_name);
+    /// Offsets streams that have been written before are not created in addStreams.
+    if (is_offsets && written_offset_substreams)
+    {
+        String stream_name = replaceFileNameToHashIfNeeded(full_stream_name, *storage_settings, data_part_storage.get());
+        if (written_offset_substreams->contains(stream_name))
+            return nullptr;
+    }
 
-    return it->second;
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Stream {} not found", full_stream_name);
+}
+
+const String & MergeTreeDataPartWriterWide::getStreamName(
+    const NameAndTypePair & column,
+    const ISerialization::SubstreamPath & substream_path) const
+{
+    const auto * stream = getStream(column, substream_path);
+    /// If it has been written already return an empty string placeholder, to avoid writing it again.
+    return stream ? *stream->stream_name : already_written_stream_holder;
 }
 
 ISerialization::OutputStreamGetter MergeTreeDataPartWriterWide::createStreamGetter(const NameAndTypePair & column,
@@ -313,17 +328,16 @@ ISerialization::OutputStreamGetter MergeTreeDataPartWriterWide::createStreamGett
         if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
             return nullptr;
 
-        auto stream_name = getStreamName(column, substream_path);
-        if (stream_name.empty())
+        const auto * stream = getStream(column, substream_path);
+        if (!stream)
             return nullptr;
 
         /// Don't write offsets more than one time for Nested type.
         bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
-        if (is_offsets && offset_substreams.contains(stream_name))
+        if (is_offsets && offset_substreams.contains(*stream->stream_name))
             return nullptr;
 
-
-        return &column_streams.at(stream_name)->compressed_hashing;
+        return &stream->stream->compressed_hashing;
     };
 }
 
@@ -465,7 +479,7 @@ void MergeTreeDataPartWriterWide::writeSingleMark(const NameAndTypePair & name_a
 
 void MergeTreeDataPartWriterWide::flushMarkToFile(const StreamNameAndMark & stream_with_mark, size_t rows_in_mark)
 {
-    auto & stream = *column_streams.at(stream_with_mark.stream_name);
+    auto & stream = *stream_with_mark.stream;
     WriteBuffer & marks_out = stream.compress_marks ? stream.marks_compressed_hashing : stream.marks_hashing;
 
     writeBinaryLittleEndian(stream_with_mark.mark.offset_in_compressed_file, marks_out);
@@ -474,8 +488,8 @@ void MergeTreeDataPartWriterWide::flushMarkToFile(const StreamNameAndMark & stre
     if (settings.can_use_adaptive_granularity)
         writeBinaryLittleEndian(rows_in_mark, marks_out);
 
-    if (auto it = cached_marks.find(stream_with_mark.stream_name); it != cached_marks.end())
-        it->second->push_back(stream_with_mark.mark);
+    if (stream_with_mark.cached_marks)
+        stream_with_mark.cached_marks->push_back(stream_with_mark.mark);
 }
 
 StreamsWithMarks MergeTreeDataPartWriterWide::getCurrentMarksForColumn(const NameAndTypePair & name_and_type,
@@ -490,23 +504,24 @@ StreamsWithMarks MergeTreeDataPartWriterWide::getCurrentMarksForColumn(const Nam
         if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
            return;
 
-        auto stream_name = getStreamName(name_and_type, substream_path);
-        if (stream_name.empty())
+        const auto * stream_entry = getStream(name_and_type, substream_path);
+        if (!stream_entry)
             return;
 
         /// Don't write offsets more than one time for Nested type.
         bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
-        if (is_offsets && offset_substreams.contains(stream_name))
+        if (is_offsets && offset_substreams.contains(*stream_entry->stream_name))
             return;
 
-        auto & stream = *column_streams.at(stream_name);
+        auto & stream = *stream_entry->stream;
 
         /// There could already be enough data to compress into the new block.
         if (stream.compressed_hashing.offset() >= min_compress_block_size)
             stream.compressed_hashing.next();
 
         StreamNameAndMark stream_with_mark;
-        stream_with_mark.stream_name = stream_name;
+        stream_with_mark.stream = stream_entry->stream;
+        stream_with_mark.cached_marks = stream_entry->cached_marks;
         stream_with_mark.mark.offset_in_compressed_file = stream.plain_hashing.count();
         stream_with_mark.mark.offset_in_decompressed_block = stream.compressed_hashing.offset();
 
@@ -542,16 +557,16 @@ void MergeTreeDataPartWriterWide::writeSingleGranule(
         if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
             return;
 
-        auto stream_name = getStreamName(name_and_type, substream_path);
-        if (stream_name.empty())
+        const auto * stream = getStream(name_and_type, substream_path);
+        if (!stream)
             return;
 
         /// Don't write offsets more than one time for Nested type.
         bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
-        if (is_offsets && offset_substreams.contains(stream_name))
+        if (is_offsets && offset_substreams.contains(*stream->stream_name))
             return;
 
-        column_streams.at(stream_name)->compressed_hashing.nextIfAtEnd();
+        stream->stream->compressed_hashing.nextIfAtEnd();
     };
 
     serialization->enumerateStreams(enumerate_settings, callback, data);
@@ -611,9 +626,11 @@ void MergeTreeDataPartWriterWide::writeColumn(
     serialize_settings.min_compress_block_size = getEffectiveMinCompressBlockSize(name_and_type);
     serialize_settings.stream_mark_getter = [&](const ISerialization::SubstreamPath & substream_path) -> MarkInCompressedFile
     {
-        auto stream_name = getStreamName(name_and_type, substream_path);
-        auto & stream = column_streams.at(stream_name);
-        return {stream->plain_hashing.count(), stream->compressed_hashing.offset()};
+        const auto * stream_entry = getStream(name_and_type, substream_path);
+        if (!stream_entry)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Stream {} has been written before", ISerialization::getFileNameForStream(name_and_type, substream_path, ISerialization::StreamFileNameSettings(*storage_settings)));
+        const auto & stream = *stream_entry->stream;
+        return {stream.plain_hashing.count(), stream.compressed_hashing.offset()};
     };
 
     /// Some vector codecs (e.g., SZ3) used for compressing arrays like Array<Float> require the array
@@ -630,15 +647,15 @@ void MergeTreeDataPartWriterWide::writeColumn(
             if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
                 return;
 
-            auto stream_name = getStreamName(name_and_type, substream_path);
-            if (stream_name.empty())
+            const auto * stream = getStream(name_and_type, substream_path);
+            if (!stream)
                 return;
 
             bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
-            if (is_offsets && offset_substreams.contains(stream_name))
+            if (is_offsets && offset_substreams.contains(*stream->stream_name))
                 return;
 
-            auto compression_codec = column_streams.at(stream_name)->compressor.getCodec();
+            auto compression_codec = stream->stream->compressor.getCodec();
             setVectorDimensionsIfNeeded(compression_codec, &column);
         }, vector_dim_data);
     }
@@ -897,6 +914,7 @@ void MergeTreeDataPartWriterWide::finishDataSerialization(bool sync)
         parallelSyncFiles(streams_to_sync);
     }
 
+    full_name_to_stream.clear();
     column_streams.clear();
     serialization_states.clear();
 
@@ -946,6 +964,7 @@ void MergeTreeDataPartWriterWide::cancel() noexcept
         if (stream.second)
             stream.second->cancel();
 
+    full_name_to_stream.clear();
     column_streams.clear();
     serialization_states.clear();
 
