@@ -1,6 +1,7 @@
 <test>
     <!-- Parsing JSON text into a JSON column with typed paths and 64 dynamic paths. Rows come from
-         40 key templates, about 300 distinct paths overall, so dynamic paths overflow into shared data. -->
+         40 key templates with 39 leaves per row and about 1500 distinct paths overall, so dynamic
+         paths overflow into shared data. -->
     <create_query>
         CREATE TABLE json_src (s String) ENGINE = Memory
     </create_query>
