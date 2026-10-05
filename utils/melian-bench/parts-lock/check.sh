@@ -34,10 +34,10 @@ echo "queue $(c -q "SELECT count() FROM system.replication_queue WHERE database 
 
 MAX=$(c -q "SELECT max(c) FROM (SELECT count() c FROM system.parts WHERE database = 'bench' AND table = 't' AND active GROUP BY partition_id)")
 # The probes insert into partition 11, which has no parts, so they do not change the maximum.
-probe() { c -q "INSERT INTO bench.t (ts, id, p, event) SETTINGS deduplicate_insert = 'disable'${1:+, $1} VALUES (1, 1, 11, '{}')" 2>&1 | grep -o 'Too many [a-z ]*parts ([^)]*)' | head -n1; }
+probe() { c -q "INSERT INTO bench.t (ts, id, p, event) SETTINGS async_insert = 0, deduplicate_insert = 'disable'${1:+, $1} VALUES (1, 1, 11, '{}')" 2>&1 | grep -o 'Too many [a-z ]*parts ([^)]*)' | head -n1; }
 echo "throw_at_max: $(probe "parts_to_throw_insert = $MAX")"
 echo "throw_at_max_plus_1: $(probe "parts_to_throw_insert = $((MAX + 1))")"
-c -q "INSERT INTO bench.t (ts, id, p, event) SETTINGS deduplicate_insert = 'disable', log_comment = 'delay-probe', parts_to_delay_insert = $((MAX - 10)), parts_to_throw_insert = $((MAX + 100)) VALUES (2, 2, 11, '{}')"
+c -q "INSERT INTO bench.t (ts, id, p, event) SETTINGS async_insert = 0, deduplicate_insert = 'disable', log_comment = 'delay-probe', parts_to_delay_insert = $((MAX - 10)), parts_to_throw_insert = $((MAX + 100)) VALUES (2, 2, 11, '{}')"
 c -q "SYSTEM FLUSH LOGS"
 echo "delay_ms: $(c -q "SELECT ProfileEvents['DelayedInsertsMilliseconds'] FROM system.query_log WHERE type = 'QueryFinish' AND log_comment = 'delay-probe'")"
 
