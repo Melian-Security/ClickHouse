@@ -16,7 +16,7 @@ function check_active()
 {
     local table=$1
     local actual expected
-    actual=$($CLICKHOUSE_CLIENT -q "INSERT INTO $table SETTINGS parts_to_throw_insert = 1 VALUES (0, 0)" 2>&1 \
+    actual=$($CLICKHOUSE_CLIENT -q "INSERT INTO $table SETTINGS async_insert = 0, parts_to_throw_insert = 1 VALUES (0, 0)" 2>&1 \
         | grep -o 'Too many parts ([0-9]* with average size of [^)]*)' | head -n1)
     expected=$($CLICKHOUSE_CLIENT -q "
         SELECT format('Too many parts ({} with average size of {})', c, formatReadableSize(intDiv(b, c)))
@@ -42,7 +42,7 @@ function check_outdated()
     local table=$1
     local actual expected
     $CLICKHOUSE_CLIENT -q "ALTER TABLE $table MODIFY SETTING inactive_parts_to_throw_insert = 1"
-    actual=$($CLICKHOUSE_CLIENT -q "INSERT INTO $table VALUES (0, 0)" 2>&1 | grep -o 'Too many inactive parts ([0-9]*)' | head -n1)
+    actual=$($CLICKHOUSE_CLIENT -q "INSERT INTO $table SETTINGS async_insert = 0 VALUES (0, 0)" 2>&1 | grep -o 'Too many inactive parts ([0-9]*)' | head -n1)
     $CLICKHOUSE_CLIENT -q "ALTER TABLE $table RESET SETTING inactive_parts_to_throw_insert"
     expected=$($CLICKHOUSE_CLIENT -q "
         SELECT format('Too many inactive parts ({})', count()) AS c
