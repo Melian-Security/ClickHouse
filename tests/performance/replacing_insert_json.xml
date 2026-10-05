@@ -1,0 +1,29 @@
+<test>
+    <!-- Insert into ReplacingMergeTree with optimize_on_insert = 1 runs the merging algorithm over
+         every inserted block. The JSON column has 16 dynamic paths taken by rare paths of the first
+         rows, while 60 frequent paths live in shared data. Unique keys and 10% duplicate keys. -->
+    <settings>
+        <optimize_on_insert>1</optimize_on_insert>
+        <insert_deduplicate>0</insert_deduplicate>
+        <max_insert_threads>1</max_insert_threads>
+    </settings>
+
+    <create_query>CREATE TABLE t_replacing_insert_json_src (id UInt64, j JSON(max_dynamic_paths = 16)) ENGINE = Memory</create_query>
+    <create_query>CREATE TABLE t_replacing_insert_json_unique (id UInt64, j JSON(max_dynamic_paths = 16)) ENGINE = ReplacingMergeTree ORDER BY id</create_query>
+    <create_query>CREATE TABLE t_replacing_insert_json_duplicate (id UInt64, j JSON(max_dynamic_paths = 16)) ENGINE = ReplacingMergeTree ORDER BY id</create_query>
+
+    <fill_query>
+        INSERT INTO t_replacing_insert_json_src SELECT number,
+            if(number &lt; 16,
+                concat('{"rare_', toString(number), '":', toString(number), '}'),
+                concat('{', arrayStringConcat(arrayMap(k -> concat('"field_', toString(k), '":', toString(number + k)), range(60)), ','), '}'))
+        FROM numbers(50000)
+    </fill_query>
+
+    <query>INSERT INTO t_replacing_insert_json_unique SELECT id, j FROM t_replacing_insert_json_src</query>
+    <query>INSERT INTO t_replacing_insert_json_duplicate SELECT id % 45000, j FROM t_replacing_insert_json_src</query>
+
+    <drop_query>DROP TABLE IF EXISTS t_replacing_insert_json_src</drop_query>
+    <drop_query>DROP TABLE IF EXISTS t_replacing_insert_json_unique</drop_query>
+    <drop_query>DROP TABLE IF EXISTS t_replacing_insert_json_duplicate</drop_query>
+</test>

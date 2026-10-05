@@ -49,6 +49,7 @@
 #include <Processors/Merges/Algorithms/AggregatingSortedAlgorithm.h>
 #include <Processors/Merges/Algorithms/VersionedCollapsingAlgorithm.h>
 #include <Processors/Merges/Algorithms/GraphiteRollupSortedAlgorithm.h>
+#include <Processors/Merges/Algorithms/RowRef.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <Processors/Transforms/DeduplicationTokenTransforms.h>
 
@@ -63,6 +64,7 @@ namespace ProfileEvents
     extern const Event MergeTreeDataWriterCompressedBytes;
     extern const Event MergeTreeDataWriterSortingBlocksMicroseconds;
     extern const Event MergeTreeDataWriterMergingBlocksMicroseconds;
+    extern const Event MergeTreeDataWriterMergeSkippedUniqueKeys;
     extern const Event MergeTreeDataWriterProjectionsCalculationMicroseconds;
     extern const Event MergeTreeDataProjectionWriterBlocks;
     extern const Event MergeTreeDataProjectionWriterBlocksAlreadySorted;
@@ -579,6 +581,61 @@ BlocksWithPartition MergeTreeDataWriter::splitBlockIntoParts(
     return result;
 }
 
+namespace
+{
+
+/// Whether `ReplacingSortedAlgorithm` run over this single block (as in `mergeBlock`) would keep
+/// every row: no two rows have equal sorting keys under the comparison the merge uses
+/// (`RowRef::checkEquals`), and no `is_deleted` value would make the merge throw.
+bool replacingMergeKeepsAllRows(
+    const Block & block,
+    const SortDescription & sort_description,
+    const IColumn::Permutation * permutation,
+    const MergeTreeData::MergingParams & merging_params)
+{
+    const size_t rows = block.rows();
+    if (rows <= 1)
+        return true;
+
+    /// Without a sorting key all rows have the same key.
+    if (sort_description.empty())
+        return false;
+
+    if (!merging_params.is_deleted_column.empty())
+    {
+        const auto is_deleted_column = block.getByName(merging_params.is_deleted_column).column->convertToFullColumnIfConst()->convertToFullColumnIfSparse();
+        const auto * is_deleted = typeid_cast<const ColumnUInt8 *>(is_deleted_column.get());
+        if (!is_deleted)
+            return false;
+        for (UInt8 value : is_deleted->getData())
+            if (value > 1)
+                return false;
+    }
+
+    std::vector<const IColumn *> sort_columns;
+    sort_columns.reserve(sort_description.size());
+    for (const auto & column_description : sort_description)
+    {
+        if (column_description.collator)
+            return false;
+        sort_columns.push_back(block.getByName(column_description.column_name).column.get());
+    }
+
+    const size_t num_sort_columns = sort_columns.size();
+    const IColumn ** sort_columns_data = sort_columns.data();
+    for (size_t i = 1; i < rows; ++i)
+    {
+        const size_t prev_row = permutation ? (*permutation)[i - 1] : i - 1;
+        const size_t row = permutation ? (*permutation)[i] : i;
+        if (detail::RowRef::checkEquals(num_sort_columns, sort_columns_data, prev_row, sort_columns_data, row))
+            return false;
+    }
+
+    return true;
+}
+
+}
+
 Block MergeTreeDataWriter::mergeBlock(
     Block && block,
     const StorageMetadataPtr & metadata_snapshot,
@@ -652,6 +709,16 @@ Block MergeTreeDataWriter::mergeBlock(
         }
     };
 
+    /// A Replacing merge of a single block only drops rows that share a sorting key with
+    /// another row. When every key is unique it keeps every row, so the merge is skipped and
+    /// the block is only sorted by the caller with `permutation`, as without `optimize_on_insert`.
+    if (merging_params.mode == MergeTreeData::MergingParams::Replacing
+        && replacingMergeKeepsAllRows(*header, sort_description, permutation, merging_params))
+    {
+        ProfileEvents::increment(ProfileEvents::MergeTreeDataWriterMergeSkippedUniqueKeys);
+        return *header;
+    }
+
     auto merging_algorithm = get_merging_algorithm();
     if (!merging_algorithm)
         return *header;
@@ -663,6 +730,7 @@ Block MergeTreeDataWriter::mergeBlock(
     IMergingAlgorithm::Input input;
     input.set(std::move(chunk));
     input.permutation = permutation;
+    input.keep_dynamic_structure = true;
 
     IMergingAlgorithm::Inputs inputs;
     inputs.push_back(std::move(input));
