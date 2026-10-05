@@ -42,6 +42,11 @@ public:
 
         IColumnPermutation * permutation = nullptr;
 
+        /// The merge result is built only from this chunk's rows, so columns with dynamic
+        /// structure (JSON/Dynamic) keep the chunk's structure as is instead of re-selecting it
+        /// from statistics. Honored only when this is the single non-empty input of the merge.
+        bool keep_dynamic_structure = false;
+
         void swap(Input & other) noexcept
         {
             chunk.swap(other.chunk);
