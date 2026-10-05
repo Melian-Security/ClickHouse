@@ -1,0 +1,67 @@
+<clickhouse>
+    <logger>
+        <level>information</level>
+        <log>@WORK@/log/server.log</log>
+        <errorlog>@WORK@/log/server.err.log</errorlog>
+    </logger>
+    <tcp_port>@PORT@</tcp_port>
+    <path>@WORK@/data/</path>
+    <tmp_path>@WORK@/tmp/</tmp_path>
+    <user_files_path>@WORK@/user_files/</user_files_path>
+    <mark_cache_size>5368709120</mark_cache_size>
+    <max_concurrent_queries>500</max_concurrent_queries>
+    <background_fetches_pool_size>64</background_fetches_pool_size>
+
+    <!-- Single-node embedded Keeper. -->
+    <keeper_server>
+        <tcp_port>@KEEPER_PORT@</tcp_port>
+        <server_id>1</server_id>
+        <log_storage_path>@WORK@/coordination/log</log_storage_path>
+        <snapshot_storage_path>@WORK@/coordination/snapshots</snapshot_storage_path>
+        <coordination_settings>
+            <operation_timeout_ms>10000</operation_timeout_ms>
+            <session_timeout_ms>30000</session_timeout_ms>
+        </coordination_settings>
+        <raft_configuration>
+            <server><id>1</id><hostname>localhost</hostname><port>@RAFT_PORT@</port></server>
+        </raft_configuration>
+    </keeper_server>
+    <zookeeper>
+        <node><host>localhost</host><port>@KEEPER_PORT@</port></node>
+    </zookeeper>
+    <macros>
+        <shard>s1</shard>
+        <replica>r1</replica>
+    </macros>
+    <default_replica_path>/clickhouse/tables/{uuid}/{shard}</default_replica_path>
+    <default_replica_name>{replica}</default_replica_name>
+
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <flush_interval_milliseconds>1000</flush_interval_milliseconds>
+    </query_log>
+    <trace_log>
+        <database>system</database>
+        <table>trace_log</table>
+        <flush_interval_milliseconds>1000</flush_interval_milliseconds>
+    </trace_log>
+    <metric_log>
+        <database>system</database>
+        <table>metric_log</table>
+        <flush_interval_milliseconds>1000</flush_interval_milliseconds>
+        <collect_interval_milliseconds>1000</collect_interval_milliseconds>
+    </metric_log>
+
+    <users>
+        <default>
+            <password></password>
+            <networks><ip>::1</ip><ip>127.0.0.1</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+    <profiles><default/></profiles>
+    <quotas><default/></quotas>
+</clickhouse>
