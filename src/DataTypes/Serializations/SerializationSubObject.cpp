@@ -192,6 +192,37 @@ void SerializationSubObject::deserializeBinaryBulkStatePrefix(
         settings.path.pop_back();
     }
 
+    /// Same as in SerializationObject, but only for the dynamic paths with requested prefix: first announce their streams
+    /// (it lets the reader start loading their marks), then start prefetches of the streams with their prefixes, so the
+    /// prefixes deserialized one by one below don't wait for the reads one after another.
+    auto enumerate_dynamic_paths_streams = [&](const StreamCallback & callback)
+    {
+        EnumerateStreamsSettings enumerate_settings;
+        enumerate_settings.path = settings.path;
+        for (const auto & dynamic_path : *structure_state_concrete->sorted_dynamic_paths)
+        {
+            if (!dynamic_path.starts_with(paths_prefix))
+                continue;
+
+            enumerate_settings.path.push_back(Substream::ObjectDynamicPath);
+            enumerate_settings.path.back().object_path_name = dynamic_path;
+            dynamic_serialization->enumerateStreams(enumerate_settings, callback, SubstreamData(dynamic_serialization));
+            enumerate_settings.path.pop_back();
+        }
+    };
+
+    if (settings.dynamic_subcolumns_callback)
+        enumerate_dynamic_paths_streams(settings.dynamic_subcolumns_callback);
+
+    if (settings.prefixes_prefetch_callback)
+    {
+        enumerate_dynamic_paths_streams([&](const SubstreamPath & path)
+        {
+            if (hasPrefix(path))
+                settings.prefixes_prefetch_callback(path);
+        });
+    }
+
     for (const auto & dynamic_path : *structure_state_concrete->sorted_dynamic_paths)
     {
         /// Save only dynamic paths with requested prefix.
