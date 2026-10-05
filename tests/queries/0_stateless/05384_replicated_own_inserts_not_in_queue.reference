@@ -1,0 +1,13 @@
+queue	r1	GET_PART	r2	2
+queue	r2	GET_PART	r1	3
+replicas	r1	2	2	1
+replicas	r2	3	3	1
+parts	t_05384_r1	5	5
+parts	t_05384_r2	5	5
+mutations	t_05384_r1	1	0
+mutations	t_05384_r2	1	0
+r1	[10,20,30,40,50]
+r2	[10,20,30,40,50]
+active parts	t_05384_r1	1
+active parts	t_05384_r2	1
+dedup	1

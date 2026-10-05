@@ -967,6 +967,7 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
         /// It will simultaneously add information about the part to all the necessary places in ZooKeeper and remove block_number_lock.
         Coordination::Requests ops;
 
+        const size_t log_entry_op_idx = ops.size();
         get_logs_ops(ops);
 
         /// Deletes the information that the block number is used for writing.
@@ -1015,6 +1016,9 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
         Coordination::Error multi_code = zookeeper->tryMultiNoThrow(ops, responses, /* check_session_valid */ true); /// 1 RTT
         if (multi_code == Coordination::Error::ZOK)
         {
+            const String & log_entry_path = dynamic_cast<const Coordination::CreateResponse &>(*responses[log_entry_op_idx]).path_created;
+            storage.queue.addOwnCommittedLogEntry(fs::path(log_entry_path).filename().string(), part->name);
+
             sleep_before_commit_for_tests();
             transaction.commit();
             part->new_part_was_committed_to_zookeeper_after_rename_on_disk = true;

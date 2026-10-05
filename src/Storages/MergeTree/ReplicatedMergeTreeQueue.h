@@ -198,6 +198,22 @@ private:
 
     Strings broken_parts_to_enqueue_fetches_on_loading;
 
+    /// Log entries created by this replica when it committed a part of its own insert: log znode name -> part name.
+    /// The part was added to ZooKeeper in the same transaction as the entry, and is in the working set of this
+    /// replica, so processing the entry here would only find out that the part already exists. Such entries are
+    /// applied when they are pulled instead of being copied to the queue, where they would wait for a slot in the
+    /// fetches pool and take the parts lock.
+    std::mutex own_committed_log_entries_mutex;
+    std::map<String, String> own_committed_log_entries TSA_GUARDED_BY(own_committed_log_entries_mutex);
+
+    /// Removes `log_entry_name` from `own_committed_log_entries` and returns true if it is there for the part of `entry`.
+    bool takeOwnCommittedLogEntry(const String & log_entry_name, const LogEntry & entry);
+    /// Forgets the entries before `min_log_entry_name`, which have been pulled already.
+    void removeOwnCommittedLogEntriesBefore(const String & min_log_entry_name);
+
+    /// Updates the state as if `entry` was inserted into the queue and then successfully processed.
+    void applyEntryWithoutQueueUnlocked(const LogEntry & entry, std::lock_guard<SharedMutex> & state_lock);
+
     /// List of subscribers
     /// A subscriber callback is called when an entry queue is deleted
     mutable std::mutex subscribers_mutex;
@@ -364,6 +380,10 @@ public:
 
     /// Get set of parts from zookeeper
     void initialize(zkutil::ZooKeeperPtr zookeeper);
+
+    /// Called after a part of an insert into this replica has been committed to ZooKeeper together with the log entry
+    /// `log_entry_name` (the name of the znode in `/log`). The entry will not be added to the queue of this replica.
+    void addOwnCommittedLogEntry(const String & log_entry_name, const String & part_name);
 
     /** Inserts an action to the end of the queue.
       * To restore broken parts during operation.

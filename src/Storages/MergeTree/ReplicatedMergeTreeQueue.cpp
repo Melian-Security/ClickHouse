@@ -114,6 +114,47 @@ void ReplicatedMergeTreeQueue::initialize(zkutil::ZooKeeperPtr zookeeper)
     LOG_TRACE(log, "Queue initialized");
 }
 
+void ReplicatedMergeTreeQueue::addOwnCommittedLogEntry(const String & log_entry_name, const String & part_name)
+{
+    std::lock_guard lock(own_committed_log_entries_mutex);
+    own_committed_log_entries.emplace(log_entry_name, part_name);
+}
+
+bool ReplicatedMergeTreeQueue::takeOwnCommittedLogEntry(const String & log_entry_name, const LogEntry & entry)
+{
+    if ((entry.type != LogEntry::GET_PART && entry.type != LogEntry::ATTACH_PART) || entry.source_replica != storage.replica_name)
+        return false;
+
+    std::lock_guard lock(own_committed_log_entries_mutex);
+    auto it = own_committed_log_entries.find(log_entry_name);
+    if (it == own_committed_log_entries.end() || it->second != entry.new_part_name)
+        return false;
+
+    own_committed_log_entries.erase(it);
+    return true;
+}
+
+void ReplicatedMergeTreeQueue::removeOwnCommittedLogEntriesBefore(const String & min_log_entry_name)
+{
+    std::lock_guard lock(own_committed_log_entries_mutex);
+    own_committed_log_entries.erase(own_committed_log_entries.begin(), own_committed_log_entries.lower_bound(min_log_entry_name));
+}
+
+void ReplicatedMergeTreeQueue::applyEntryWithoutQueueUnlocked(const LogEntry & entry, std::lock_guard<SharedMutex> & /* state_lock */)
+{
+    LOG_TEST(log, "Applying entry {} without adding it to the queue: {}", entry.znode_name, entry.getDescriptionForLogs(format_version));
+
+    /// The same as `insertUnlocked` followed by a successful `updateStateOnQueueEntryRemoval` for a GET_PART entry.
+    for (const String & virtual_part_name : entry.getVirtualPartNames(format_version))
+    {
+        virtual_parts.add(virtual_part_name, nullptr);
+        addPartToMutations(virtual_part_name, MergeTreePartInfo::fromPartName(virtual_part_name, format_version));
+
+        bool added = current_parts.add(virtual_part_name, nullptr);
+        removeCoveredPartsFromMutations(virtual_part_name, /*remove_part = */ !added, /*remove_covered_parts = */ true);
+    }
+}
+
 bool ReplicatedMergeTreeQueue::isVirtualPart(const MergeTreeData::DataPartPtr & data_part) const
 {
     std::lock_guard lock(state_mutex);
@@ -870,6 +911,7 @@ std::pair<int32_t, int32_t> ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::Zo
     }
 
     String min_log_entry = "log-" + padIndex(index);
+    removeOwnCommittedLogEntriesBefore(min_log_entry);
 
     /// Multiple log entries that must be copied to the queue.
 
@@ -914,8 +956,12 @@ std::pair<int32_t, int32_t> ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::Zo
             Coordination::Requests ops;
             std::vector<LogEntryPtr> copied_entries;
             copied_entries.reserve(end - begin);
+            /// All pulled entries in the order of the log, and whether each is applied without being copied to the queue.
+            std::vector<std::pair<LogEntryPtr, bool>> pulled_entries;
+            pulled_entries.reserve(end - begin);
 
             std::optional<time_t> min_unprocessed_insert_time_changed;
+            time_t max_create_time_of_entries_without_queue = 0;
 
             auto get_results = zookeeper->get(get_paths);
             auto get_num = get_results.size();
@@ -923,7 +969,18 @@ std::pair<int32_t, int32_t> ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::Zo
             {
                 auto res = get_results[i];
 
-                copied_entries.emplace_back(LogEntry::parse(res.data, res.stat, format_version));
+                auto parsed_entry = LogEntry::parse(res.data, res.stat, format_version);
+
+                if (takeOwnCommittedLogEntry(*(begin + i), *parsed_entry))
+                {
+                    parsed_entry->znode_name = *(begin + i);
+                    max_create_time_of_entries_without_queue = std::max(max_create_time_of_entries_without_queue, parsed_entry->create_time);
+                    pulled_entries.emplace_back(std::move(parsed_entry), true);
+                    continue;
+                }
+
+                copied_entries.emplace_back(parsed_entry);
+                pulled_entries.emplace_back(std::move(parsed_entry), false);
 
                 ops.emplace_back(zkutil::makeCreateRequest(
                     fs::path(replica_path) / "queue/queue-", res.data, zkutil::CreateMode::PersistentSequential));
@@ -947,6 +1004,12 @@ std::pair<int32_t, int32_t> ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::Zo
                 ops.emplace_back(zkutil::makeSetRequest(
                     fs::path(replica_path) / "min_unprocessed_insert_time", toString(*min_unprocessed_insert_time_changed), -1));
 
+            /// The entries applied without the queue count as processed inserts.
+            const bool max_processed_insert_time_changed = max_create_time_of_entries_without_queue > max_processed_insert_time;
+            if (max_processed_insert_time_changed)
+                ops.emplace_back(zkutil::makeSetRequest(
+                    fs::path(replica_path) / "max_processed_insert_time", toString(max_create_time_of_entries_without_queue), -1));
+
             auto responses = zookeeper->multi(ops, /* check_session_valid */ true);
 
             /// Now we have successfully updated the queue in ZooKeeper. Update it in RAM.
@@ -959,10 +1022,24 @@ std::pair<int32_t, int32_t> ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::Zo
                 {
                     String path_created = dynamic_cast<const Coordination::CreateResponse &>(*responses[copied_entry_idx]).path_created;
                     copied_entries[copied_entry_idx]->znode_name = path_created.substr(path_created.find_last_of('/') + 1);
-
-                    std::optional<time_t> unused = false;
-                    insertUnlocked(copied_entries[copied_entry_idx], unused, state_lock);
                 }
+
+                /// In the order of the log, because e.g. a DROP_PART entry removes the parts it covers from the virtual parts.
+                for (const auto & [pulled_entry, without_queue] : pulled_entries)
+                {
+                    if (without_queue)
+                    {
+                        applyEntryWithoutQueueUnlocked(*pulled_entry, state_lock);
+                    }
+                    else
+                    {
+                        std::optional<time_t> unused = false;
+                        insertUnlocked(pulled_entry, unused, state_lock);
+                    }
+                }
+
+                if (max_processed_insert_time_changed)
+                    max_processed_insert_time.store(max_create_time_of_entries_without_queue, std::memory_order_relaxed);
 
                 last_queue_update = time(nullptr);
             }
@@ -974,9 +1051,10 @@ std::pair<int32_t, int32_t> ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::Zo
                 std::terminate();
             }
 
-            if (!copied_entries.empty())
+            if (!pulled_entries.empty())
             {
-                LOG_DEBUG(log, "Pulled {} entries to queue.", copied_entries.size());
+                LOG_DEBUG(log, "Pulled {} entries to queue, applied {} entries of own inserts without the queue.",
+                    copied_entries.size(), pulled_entries.size() - copied_entries.size());
                 merge_strategy_picker.refreshState();
             }
         }
