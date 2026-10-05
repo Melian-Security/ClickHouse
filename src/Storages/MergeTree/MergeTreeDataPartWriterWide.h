@@ -143,6 +143,22 @@ private:
     /// hash lookup by the full stream name, and does not need the disk to decide whether the name is replaced to a hash.
     const StreamEntry * getStream(const NameAndTypePair & column, const ISerialization::SubstreamPath & substream_path) const;
 
+    /// A non-ephemeral substream of a column, in the order the serialization enumerates them.
+    struct ColumnSubstream
+    {
+        /// nullptr if it is an offsets stream that has been written before (not using this object).
+        const StreamEntry * stream = nullptr;
+        bool is_offsets = false;
+    };
+    using ColumnSubstreams = std::vector<ColumnSubstream>;
+
+    /// The streams are enumerated with the column from block_sample, which does not change after the first block,
+    /// so the list of substreams of a column and their streams are resolved once and reused for every granule.
+    const ColumnSubstreams & getColumnSubstreams(const NameAndTypePair & name_and_type);
+
+    /// Whether an offsets substream is not written by this column, because it has been written already.
+    bool isOffsetsWrittenBefore(const ColumnSubstream & substream, const WrittenOffsetSubstreams & offset_substreams) const;
+
     using SerializationState = ISerialization::SerializeBinaryBulkStatePtr;
     using SerializationStates = std::unordered_map<String, SerializationState>;
 
@@ -156,6 +172,8 @@ private:
     /// stream (whose name is probably the hash of the original name) and from actual stream name to original stream name.
     std::unordered_map<String, StreamEntry> full_name_to_stream;
     std::unordered_map<String, String> stream_name_to_full_name;
+
+    std::unordered_map<String, ColumnSubstreams> column_substreams_cache;
 
     /// Non written marks to disk (for each column). Waiting until all rows for
     /// this marks will be written to disk.
