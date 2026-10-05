@@ -23,7 +23,7 @@ c --multiquery < "$K/schema.sql" || exit 1
 
 c -q "INSERT INTO bench.t (ts, id, p, event) SELECT number, number + 1000000000 * (number % 3), number % 3, '{\"action\":\"prefill\"}'
       FROM numbers(1500) SETTINGS max_block_size = 1, max_insert_block_size = 1, min_insert_block_size_rows = 0, min_insert_block_size_bytes = 0, max_insert_threads = 1, deduplicate_insert = 'disable'"
-ls "$DATA"/*.jsonl | xargs -P 16 -I{} curl -sS --data-binary @{} "http://localhost:$HTTP_PORT/?optimize_on_insert=0&input_format_parallel_parsing=0&max_insert_block_size=10000000&min_insert_block_size_rows=0&min_insert_block_size_bytes=0&deduplicate_insert=disable&query=INSERT%20INTO%20bench.t%20FORMAT%20JSONEachRow"
+ls "$DATA"/*.jsonl | xargs -P 16 -I{} curl -sS --data-binary @{} "http://localhost:$HTTP_PORT/?optimize_on_insert=0&input_format_parallel_parsing=0&max_insert_block_size=10000000&min_insert_block_size_rows=0&min_insert_block_size_bytes=0&deduplicate_insert=disable&async_insert=0&query=INSERT%20INTO%20bench.t%20FORMAT%20JSONEachRow"
 c -q "SYSTEM SYNC REPLICA bench.t"
 
 echo "rows $(c -q 'SELECT count() FROM bench.t')"
