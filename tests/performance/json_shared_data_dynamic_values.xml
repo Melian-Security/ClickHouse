@@ -1,0 +1,16 @@
+<test>
+    <!-- Parsing JSON whose paths go to shared data. Values that are not of a simple type (here
+         arrays of objects and of strings) are written into shared data through the row-by-row binary
+         serialization of `Dynamic`, which runs once per value, nested values included, on every
+         parsing thread. -->
+    <create_query>CREATE TABLE json_shared_data_dynamic_values_src (s String) ENGINE = Memory</create_query>
+    <create_query>CREATE TABLE json_shared_data_dynamic_values_dst (j JSON(max_dynamic_paths = 2)) ENGINE = Null</create_query>
+
+    <fill_query>INSERT INTO json_shared_data_dynamic_values_src SELECT concat('{"id":', toString(number), ',"tags":["a","b","c"],"items":[', arrayStringConcat(arrayMap(i -> concat('{"k":', toString(number + i), ',"s":"v', toString(i), '","f":1.5,"b":true}'), range(5)), ','), ']}') FROM numbers(300000)</fill_query>
+
+    <query>INSERT INTO json_shared_data_dynamic_values_dst SELECT s FROM json_shared_data_dynamic_values_src</query>
+    <query>SELECT count() FROM json_shared_data_dynamic_values_src WHERE NOT ignore(s::JSON(max_dynamic_paths = 0))</query>
+
+    <drop_query>DROP TABLE IF EXISTS json_shared_data_dynamic_values_src</drop_query>
+    <drop_query>DROP TABLE IF EXISTS json_shared_data_dynamic_values_dst</drop_query>
+</test>
