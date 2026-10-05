@@ -11,6 +11,7 @@ synthetic data generator (`gen.py`) and an A/B driver that alternates a base and
 | `surrogates/` | melian/fix-surrogates | Parse and MergeTree insert throughput on clean data (checks the surrogate fallback costs nothing); `repro.sh` reproduces the unpaired-surrogate parse error. |
 | `key-strings/` | melian/fix-key-strings | Single-threaded `JSONAsObject` parse into a JSON column, user CPU of `clickhouse local`; then compares the MergeTree parts written by both binaries byte for byte. |
 | `dupkey/` | melian/fix-dupkey | JSON-type parsing (parallel and single-thread) and MergeTree insert, wall and CPU time. |
+| `issue-93976/` | melian/fix-issue-93976 | PREWHERE ordering of `activity_id = 12 AND <JSON path> = ...` on compact and wide parts: `repro.sh` prints the chosen order and ReadCompressedBytes per binary, `ab.sh` / `ab_server.sh` alternate base and fix (`ab_server.sh` reads `query_duration_ms` from `query_log`), `minimal.sql` is the upstream-issue reproducer, `alter_repro.sh` checks the ALTER-to-v3-serialization report from the same issue. |
 | `insert-collapse/` | melian/fix-insert-collapse | Server CPU of inserts into `ReplacingMergeTree` with a wide JSON column, `optimize_on_insert` 0 and 1, unique and duplicate keys; `run_all.sh` drives the matrix and `summarize.py` prints medians. |
 
 Usage of each driver is in the header comment of its script.
