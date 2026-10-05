@@ -4,6 +4,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnObject.h>
 #include <Common/SipHash.h>
+#include <Common/HashTable/HashMap.h>
 #include <IO/ReadHelpers.h>
 
 
@@ -158,22 +159,40 @@ SharedDataBucketsSplitter::SharedDataBucketsSplitter(const IColumn & shared_data
     , bucket_num_paths(num_buckets_, 0)
     , bucket_paths_chars_size(num_buckets_, 0)
     , bucket_values_chars_size(num_buckets_, 0)
+    , bucket_unique_paths(num_buckets_)
 {
     const auto [shared_data_paths, shared_data_values, shared_data_offsets] = ColumnObject::getSharedDataPathsValuesAndOffsets(shared_data_column);
     const auto & paths_offsets = shared_data_paths->getOffsets();
     const auto & values_offsets = shared_data_values->getOffsets();
 
-    /// Compute the bucket for every path once and accumulate per-bucket sizes, so `extractBucket` can
-    /// pre-allocate each bucket exactly and does not recompute the path hashes.
-    path_buckets.reserve((*shared_data_offsets)[ssize_t(end) - 1] - (*shared_data_offsets)[ssize_t(start) - 1]);
+    /// A block holds few distinct paths repeated across many rows, so every distinct path gets a
+    /// dense id on first sight and its bucket hash is computed once per block instead of once per
+    /// occurrence. The per-occurrence id lets `flattenBucket` address its path column by index.
+    HashMapWithSavedHash<std::string_view, UInt32> path_to_id;
+    path_ids.reserve((*shared_data_offsets)[ssize_t(end) - 1] - (*shared_data_offsets)[ssize_t(start) - 1]);
     for (size_t i = start; i != end; ++i)
     {
         size_t offset_start = (*shared_data_offsets)[ssize_t(i) - 1];
         size_t offset_end = (*shared_data_offsets)[ssize_t(i)];
         for (size_t j = offset_start; j != offset_end; ++j)
         {
-            size_t bucket = getSharedDataPathBucket(shared_data_paths->getDataAt(j), num_buckets);
-            path_buckets.push_back(static_cast<UInt8>(bucket));
+            std::string_view path = shared_data_paths->getDataAt(j);
+            HashMapWithSavedHash<std::string_view, UInt32>::LookupResult it;
+            bool inserted;
+            path_to_id.emplace(path, it, inserted);
+            if (inserted)
+            {
+                UInt32 new_id = static_cast<UInt32>(id_to_path.size());
+                it->getMapped() = new_id;
+                size_t path_bucket = getSharedDataPathBucket(path, num_buckets);
+                id_to_path.push_back(path);
+                id_to_bucket.push_back(static_cast<UInt8>(path_bucket));
+                bucket_unique_paths[path_bucket].push_back(new_id);
+            }
+
+            UInt32 id = it->getMapped();
+            path_ids.push_back(id);
+            size_t bucket = id_to_bucket[id];
             ++bucket_num_paths[bucket];
             /// The number of chars occupied by value `j` (exactly what `insertFrom` appends) is the
             /// difference of consecutive string offsets.
@@ -204,7 +223,7 @@ ColumnPtr SharedDataBucketsSplitter::extractBucket(size_t bucket) const
         size_t offset_end = (*shared_data_offsets)[ssize_t(i)];
         for (size_t j = offset_start; j != offset_end; ++j, ++path_index)
         {
-            if (path_buckets[path_index] == bucket)
+            if (id_to_bucket[path_ids[path_index]] == bucket)
             {
                 bucket_paths->insertFrom(*shared_data_paths, j);
                 bucket_values->insertFrom(*shared_data_values, j);
@@ -217,17 +236,38 @@ ColumnPtr SharedDataBucketsSplitter::extractBucket(size_t bucket) const
     return bucket_column;
 }
 
+std::vector<std::string_view> SharedDataBucketsSplitter::getBucketPathNames(size_t bucket) const
+{
+    std::vector<std::string_view> result;
+    result.reserve(bucket_unique_paths[bucket].size());
+    for (UInt32 id : bucket_unique_paths[bucket])
+        result.push_back(id_to_path[id]);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
 std::vector<std::pair<std::string_view, ColumnPtr>> SharedDataBucketsSplitter::flattenBucket(size_t bucket, const DataTypePtr & dynamic_type) const
 {
     const auto [shared_data_paths, shared_data_values, shared_data_offsets] = ColumnObject::getSharedDataPathsValuesAndOffsets(shared_data_column);
 
     /// Collect values of the paths belonging to this bucket into separate columns. Each column is
     /// densified to have a value for every row (a default where the path is absent). Gaps are backfilled
-    /// with a single bulk insertManyDefaults right before storing a real value (and once at the end),
-    /// which removes the per-row scan over every accumulated path column. The number of defaults
-    /// materialized is unchanged; only the scan is removed.
-    /// Keys are string_views referencing shared_data_paths to avoid copying path strings.
-    std::unordered_map<std::string_view, MutableColumnPtr> flattened_shared_data_paths;
+    /// with a single bulk insertManyDefaults right before storing a real value (and once at the end).
+    /// Columns are addressed by the dense path id assigned in the constructor, so no path is hashed here.
+    const auto & unique_ids = bucket_unique_paths[bucket];
+    if (unique_ids.empty())
+        return {};
+
+    /// Map a global path id to its position among this bucket's paths.
+    PODArray<UInt32> id_to_local(id_to_path.size(), std::numeric_limits<UInt32>::max());
+    MutableColumns columns;
+    columns.reserve(unique_ids.size());
+    for (size_t local = 0; local != unique_ids.size(); ++local)
+    {
+        id_to_local[unique_ids[local]] = static_cast<UInt32>(local);
+        columns.push_back(dynamic_type->createColumn());
+    }
+
     size_t path_index = 0;
     for (size_t i = start; i != end; ++i)
     {
@@ -236,37 +276,32 @@ std::vector<std::pair<std::string_view, ColumnPtr>> SharedDataBucketsSplitter::f
         size_t row = i - start;
         for (size_t j = offset_start; j != offset_end; ++j, ++path_index)
         {
-            /// Skip paths not belonging to this bucket (bucket assignment precomputed in the constructor).
-            if (path_buckets[path_index] != bucket)
+            UInt32 id = path_ids[path_index];
+            if (id_to_bucket[id] != bucket)
                 continue;
 
-            std::string_view path = shared_data_paths->getDataAt(j);
-            auto it = flattened_shared_data_paths.find(path);
-            /// If we see this path for the first time, add it to the list and create a column for it.
-            if (it == flattened_shared_data_paths.end())
-                it = flattened_shared_data_paths.emplace(path, dynamic_type->createColumn()).first;
-
+            auto & column = columns[id_to_local[id]];
             /// Backfill defaults for the rows where this path was absent, up to the current row.
-            if (it->second->size() < row)
-                it->second->insertManyDefaults(row - it->second->size());
+            if (column->size() < row)
+                column->insertManyDefaults(row - column->size());
 
-            ColumnObject::deserializeValueFromSharedData(shared_data_values, j, *it->second);
+            ColumnObject::deserializeValueFromSharedData(shared_data_values, j, *column);
         }
     }
 
     /// Backfill defaults for the trailing rows where each path was absent.
     size_t num_rows = end - start;
-    for (const auto & [_, column] : flattened_shared_data_paths)
+    std::vector<std::pair<std::string_view, ColumnPtr>> result;
+    result.reserve(unique_ids.size());
+    for (size_t local = 0; local != unique_ids.size(); ++local)
     {
+        auto & column = columns[local];
         if (column->size() < num_rows)
             column->insertManyDefaults(num_rows - column->size());
+        result.emplace_back(id_to_path[unique_ids[local]], std::move(column));
     }
 
     /// Keep paths sorted for consistency.
-    std::vector<std::pair<std::string_view, ColumnPtr>> result;
-    result.reserve(flattened_shared_data_paths.size());
-    for (const auto & [path, column] : flattened_shared_data_paths)
-        result.emplace_back(path, column->getPtr());
     std::sort(result.begin(), result.end());
     return result;
 }
@@ -293,12 +328,14 @@ void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn &
                 num_rows);
     }
 
+    /// Reused across rows to avoid an allocation per row.
+    std::vector<std::tuple<std::string_view, size_t, size_t>> all_paths;
     for (size_t i = 0; i != num_rows; ++i)
     {
         /// Shared data contains paths in sorted order in each row.
         /// Collect all paths from all buckets in this row and sort them.
         /// Save each path bucket and index to be able find corresponding value later.
-        std::vector<std::tuple<std::string_view, size_t, size_t>> all_paths;
+        all_paths.clear();
         for (size_t bucket = 0; bucket != shared_data_buckets.size(); ++bucket)
         {
             size_t offset_start = (*shared_data_offsets_buckets[bucket])[ssize_t(i) - 1];

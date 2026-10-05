@@ -39,11 +39,15 @@ void MergedData::initialize(const Block & header, const IMergingAlgorithm::Input
     columns = header.cloneEmptyColumns();
     std::vector<VectorWithMemoryTracking<ColumnPtr>> source_columns(columns.size());
     std::vector<bool> is_replicated(columns.size());
+    size_t num_non_empty_inputs = 0;
+    bool keep_dynamic_structure = false;
     for (const auto & input : inputs)
     {
         if (!input.chunk)
             continue;
 
+        ++num_non_empty_inputs;
+        keep_dynamic_structure = input.keep_dynamic_structure;
         const auto & input_columns = input.chunk.getColumns();
         for (size_t i = 0; i != input_columns.size(); ++i)
         {
@@ -51,6 +55,11 @@ void MergedData::initialize(const Block & header, const IMergingAlgorithm::Input
             is_replicated[i] = is_replicated[i] || input_columns[i]->isReplicated();
         }
     }
+
+    /// Every merged row comes from the single source, whose dynamic structure is already valid
+    /// for it, so re-selecting paths and types from statistics would only move values between
+    /// dynamic subcolumns and shared data row by row.
+    const bool take_exact_dynamic_structure = num_non_empty_inputs == 1 && keep_dynamic_structure && !max_dynamic_subcolumns;
 
     for (size_t i = 0; i != columns.size(); ++i)
     {
@@ -61,7 +70,12 @@ void MergedData::initialize(const Block & header, const IMergingAlgorithm::Input
         /// Columns with dynamic structure (like JSON/Dynamic) need their structure to be
         /// merged from all source columns before the merge starts.
         if (columns[i]->hasDynamicStructure())
-            columns[i]->chooseDynamicStructureForMerge(source_columns[i], max_dynamic_subcolumns);
+        {
+            if (take_exact_dynamic_structure)
+                columns[i]->takeExactDynamicStructureFrom(*source_columns[i].front());
+            else
+                columns[i]->chooseDynamicStructureForMerge(source_columns[i], max_dynamic_subcolumns);
+        }
         /// Columns with statistics (like Map with adaptive buckets) need their statistics to be
         /// merged from all source columns before the merge starts.
         /// Must be called after `chooseDynamicStructureForMerge` for columns that have both.

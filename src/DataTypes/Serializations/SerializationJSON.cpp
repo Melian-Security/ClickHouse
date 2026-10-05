@@ -2,6 +2,8 @@
 #include <DataTypes/Serializations/SerializationJSON.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
+#include <base/find_symbols.h>
+#include <base/hex.h>
 
 #if USE_SIMDJSON
 #include <Common/JSONParsers/SimdJSONParser.h>
@@ -275,12 +277,104 @@ void SerializationJSON<Parser>::serializeTextImpl(const IColumn & column, size_t
     }
 }
 
+namespace
+{
+
+/// Returns -1 if `p` does not point to 4 hex digits, otherwise their value.
+int readHex4(const char * p, const char * end)
+{
+    if (end - p < 4)
+        return -1;
+    int value = 0;
+    for (size_t i = 0; i != 4; ++i)
+    {
+        UInt8 digit = unhex(p[i]);
+        if (digit == 0xFF)
+            return -1;
+        value = (value << 4) | digit;
+    }
+    return value;
+}
+
+/// Copies `object` into `result`, replacing every backslash-u escape that encodes an unpaired UTF-16
+/// surrogate (a high surrogate not immediately followed by a low-surrogate escape, or a lone low
+/// surrogate) with the raw UTF-8 bytes of U+FFFD, as WHATWG and most JSON decoders do.
+/// Valid surrogate pairs and every other byte are copied unchanged. Returns false and leaves
+/// `result` unspecified when `object` contains no unpaired surrogate escape.
+/// Every backslash starts a two-character escape, so an escaped backslash followed by the text
+/// "uD800" is never mistaken for a surrogate escape.
+bool replaceUnpairedSurrogateEscapes(std::string_view object, String & result)
+{
+    static constexpr std::string_view replacement_character = "\xEF\xBF\xBD";
+
+    const char * begin = object.data();
+    const char * end = begin + object.size();
+    const char * copied_until = begin;
+    bool replaced = false;
+
+    const char * pos = begin;
+    while (true)
+    {
+        pos = find_first_symbols<'\\'>(pos, end);
+        if (end - pos < 2)
+            break;
+
+        if (pos[1] != 'u')
+        {
+            pos += 2;
+            continue;
+        }
+
+        int code_unit = readHex4(pos + 2, end);
+        if (code_unit < 0xD800 || code_unit > 0xDFFF)
+        {
+            pos += 2;
+            continue;
+        }
+
+        if (code_unit <= 0xDBFF && end - pos >= 12 && pos[6] == '\\' && pos[7] == 'u')
+        {
+            int next_code_unit = readHex4(pos + 8, end);
+            if (next_code_unit >= 0xDC00 && next_code_unit <= 0xDFFF)
+            {
+                pos += 12;
+                continue;
+            }
+        }
+
+        if (!replaced)
+        {
+            result.clear();
+            result.reserve(object.size());
+            replaced = true;
+        }
+        result.append(copied_until, pos);
+        result.append(replacement_character);
+        pos += 6;
+        copied_until = pos;
+    }
+
+    if (replaced)
+        result.append(copied_until, end);
+    return replaced;
+}
+
+}
+
 template <typename Parser>
 void SerializationJSON<Parser>::deserializeObject(IColumn & column, std::string_view object, const FormatSettings & settings) const
 {
     typename Parser::Element document;
     auto parser = parsers_pool.get([] { return new Parser; });
-    if (!parser->parse(object, document))
+    /// Holds the rewritten object while `document` may still reference it.
+    String object_without_unpaired_surrogates;
+    /// Clean data pays nothing: the surrogate rewrite runs only after a failed parse, and only
+    /// when bad escape sequences are allowed.
+    bool parsed = parser->parse(object, document);
+    if (!parsed && !settings.json.throw_on_bad_escape_sequence
+        && replaceUnpairedSurrogateEscapes(object, object_without_unpaired_surrogates))
+        parsed = parser->parse(object_without_unpaired_surrogates, document);
+    if (!parsed)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Cannot parse JSON object here: {}{}", object.substr(0, std::min(object.size(), 1000uz)), object.size() > 1000 ? "... (JSON object is too long to display as a whole)" : "");
 
     String error;

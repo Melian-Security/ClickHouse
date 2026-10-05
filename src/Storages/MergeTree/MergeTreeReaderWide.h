@@ -49,6 +49,9 @@ public:
 private:
     FileStreams streams;
 
+    /// Whether the settings allow prefetches for the disk of this part.
+    bool arePrefetchesEnabled() const;
+
     void prefetchForAllColumns(
         Priority priority,
         size_t num_columns,

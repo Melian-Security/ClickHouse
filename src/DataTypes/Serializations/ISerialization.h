@@ -540,6 +540,12 @@ public:
         /// Callback to seek specific stream to a specific mark.
         /// Used only in MergeTree for Object shared data deserialization.
         std::function<void(const SubstreamPath &, const MarkInCompressedFile &)> seek_stream_to_mark_callback;
+        /// Callback to seek specific stream to a specific mark and start reading it asynchronously.
+        /// The stream keeps this position until the next seek_stream_to_mark_callback call.
+        /// Set only by readers that prefetch (Wide parts on a disk with prefetches enabled), so it may be empty.
+        /// Used for Object shared data deserialization, where a stream is read at a mark that is
+        /// stored in another stream, to issue the reads of independent streams before waiting for any of them.
+        std::function<void(const SubstreamPath &, const MarkInCompressedFile &)> prefetch_stream_at_mark_callback;
         /// Callback to seek specific stream to a current mark that we read from.
         /// Used only in MergeTree and Compact part for Object shared data deserialization.
         std::function<void(const SubstreamPath &)> seek_stream_to_current_mark_callback;

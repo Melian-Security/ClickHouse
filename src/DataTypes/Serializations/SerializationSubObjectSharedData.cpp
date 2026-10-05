@@ -313,32 +313,63 @@ void SerializationSubObjectSharedData::deserializeBinaryBulkWithMultipleStreams(
         std::vector<std::shared_ptr<SerializationObjectSharedData::PathsDataChunks>> bucket_paths_data_chunks(buckets);
         /// We need to remember offset and limit from each chunk to know which rows to insert in the result.
         std::vector<std::pair<size_t, size_t>> chunks_offset_and_limit;
-        std::shared_ptr<SerializationObjectSharedData::ChunkStructures> first_bucket_chunk_structures;
-        for (size_t bucket = 0; bucket != buckets; ++bucket)
-        {
-            settings.path.push_back(Substream::Bucket);
-            settings.path.back().bucket = bucket;
+        std::vector<std::shared_ptr<SerializationObjectSharedData::ChunkStructures>> bucket_chunk_structures(buckets);
+        std::vector<std::shared_ptr<SerializationObjectSharedData::PathsInfosChunks>> bucket_paths_infos_chunks(buckets);
+        std::vector<SerializationObjectSharedData::DeserializeBinaryBulkStateObjectSharedDataStructure *> bucket_structure_states(buckets);
 
-            auto * shared_data_structure_state = checkAndGetState<SerializationObjectSharedData::DeserializeBinaryBulkStateObjectSharedDataStructure>(sub_object_shared_data_state->bucket_structure_states[bucket]);
-            auto chunk_structures = SerializationObjectSharedData::deserializeStructure(limit, settings, *shared_data_structure_state, cache);
-            auto paths_infos_chunks = SerializationObjectSharedData::deserializePathsInfos(*chunk_structures, *shared_data_structure_state, settings, cache);
-            bucket_paths_data_chunks[bucket] = SerializationObjectSharedData::deserializePathsData(*chunk_structures, *paths_infos_chunks, *shared_data_structure_state, settings, dynamic_type, dynamic_serialization, cache);
+        auto for_each_bucket = [&](auto && func)
+        {
+            for (size_t bucket = 0; bucket != buckets; ++bucket)
+            {
+                settings.path.push_back(Substream::Bucket);
+                settings.path.back().bucket = bucket;
+                func(bucket);
+                settings.path.pop_back();
+            }
+        };
+
+        /// Each bucket is read in several dependent steps: the structure gives the marks of the paths infos, and the paths
+        /// infos give the marks of the paths data. Do every step for all buckets before the next one, prefetching the
+        /// streams of all buckets before reading any of them, so the reads of different buckets overlap instead of
+        /// waiting for each other.
+        for_each_bucket([&](size_t bucket)
+        {
+            bucket_structure_states[bucket] = checkAndGetState<SerializationObjectSharedData::DeserializeBinaryBulkStateObjectSharedDataStructure>(sub_object_shared_data_state->bucket_structure_states[bucket]);
+            bucket_chunk_structures[bucket] = SerializationObjectSharedData::deserializeStructure(limit, settings, *bucket_structure_states[bucket], cache);
 
             /// Init offset and limit for each chunk.
             if (bucket == 0)
             {
-                first_bucket_chunk_structures = chunk_structures;
-                chunks_offset_and_limit.reserve(chunk_structures->size());
-                for (size_t chunk_idx = 0; chunk_idx != chunk_structures->size(); ++chunk_idx)
-                    chunks_offset_and_limit.emplace_back((*chunk_structures)[chunk_idx].offset, (*chunk_structures)[chunk_idx].limit);
+                const auto & chunk_structures = *bucket_chunk_structures[0];
+                chunks_offset_and_limit.reserve(chunk_structures.size());
+                for (const auto & chunk_structure : chunk_structures)
+                    chunks_offset_and_limit.emplace_back(chunk_structure.offset, chunk_structure.limit);
             }
             else
             {
-                SerializationObjectSharedData::checkChunksMatchFirstBucket(*chunk_structures, *first_bucket_chunk_structures, bucket);
+                SerializationObjectSharedData::checkChunksMatchFirstBucket(*bucket_chunk_structures[bucket], *bucket_chunk_structures[0], bucket);
             }
+        });
 
-            settings.path.pop_back();
-        }
+        for_each_bucket([&](size_t bucket)
+        {
+            SerializationObjectSharedData::prefetchPathsInfos(*bucket_chunk_structures[bucket], *bucket_structure_states[bucket], settings, cache);
+        });
+
+        for_each_bucket([&](size_t bucket)
+        {
+            bucket_paths_infos_chunks[bucket] = SerializationObjectSharedData::deserializePathsInfos(*bucket_chunk_structures[bucket], *bucket_structure_states[bucket], settings, cache);
+        });
+
+        for_each_bucket([&](size_t bucket)
+        {
+            SerializationObjectSharedData::prefetchPathsData(*bucket_chunk_structures[bucket], *bucket_paths_infos_chunks[bucket], *bucket_structure_states[bucket], settings, cache);
+        });
+
+        for_each_bucket([&](size_t bucket)
+        {
+            bucket_paths_data_chunks[bucket] = SerializationObjectSharedData::deserializePathsData(*bucket_chunk_structures[bucket], *bucket_paths_infos_chunks[bucket], *bucket_structure_states[bucket], settings, dynamic_type, dynamic_serialization, cache);
+        });
 
         auto [shared_data_paths, shared_data_values, shared_data_offsets] = ColumnObject::getSharedDataPathsValuesAndOffsets(column);
         for (size_t chunk_idx = 0; chunk_idx != bucket_paths_data_chunks[0]->size(); ++chunk_idx)

@@ -1,0 +1,36 @@
+<test>
+    <!-- Parsing JSON text with nested objects into the JSON type: every leaf path is built from its
+         parent path and key. About 240 distinct paths, 48 leaves per row, some keys contain dots. -->
+    <substitutions>
+        <substitution>
+            <name>json_type</name>
+            <values>
+                <value>JSON</value>
+                <value>JSON(max_dynamic_paths = 0)</value>
+            </values>
+        </substitution>
+        <substitution>
+            <name>escape_dots</name>
+            <values>
+                <value>0</value>
+                <value>1</value>
+            </values>
+        </substitution>
+    </substitutions>
+
+    <create_query>CREATE TABLE t_json_nested_paths_src (s String) ENGINE = Memory</create_query>
+    <fill_query>
+        INSERT INTO t_json_nested_paths_src SELECT concat('{',
+            arrayStringConcat(arrayMap(g -> concat(
+                '"group_name_', toString((number % 5) * 8 + g), '":{',
+                    '"attributes":{', arrayStringConcat(arrayMap(i -> concat('"attribute.key_', toString(i), '":', toString(number + i)), range(3)), ','), '},',
+                    '"details":{"nested_level":{', arrayStringConcat(arrayMap(i -> concat('"detail_value_', toString(i), '":"v', toString(i), '"'), range(3)), ','), '}}',
+                '}'), range(8)), ','),
+            '}')
+        FROM numbers(100000)
+    </fill_query>
+
+    <query>SELECT s::{json_type} FROM t_json_nested_paths_src FORMAT Null SETTINGS json_type_escape_dots_in_keys = {escape_dots}</query>
+
+    <drop_query>DROP TABLE IF EXISTS t_json_nested_paths_src</drop_query>
+</test>

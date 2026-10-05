@@ -49,9 +49,9 @@ size_t getSharedDataPathBucket(std::string_view path, size_t num_buckets);
 /// bucket assignment:
 ///   - `extractBucket` returns a shared data column for one bucket (used by MAP_WITH_BUCKETS);
 ///   - `flattenBucket` returns the flattened per-path columns for one bucket (used by ADVANCED).
-/// The bucket assignment for every path is computed once in the constructor (avoiding repeated hashing
-/// on each call), and per-bucket sizes are precomputed so each `extractBucket` column is allocated
-/// exactly (avoiding power-of-two over-allocation).
+/// Every distinct path gets a dense id and its bucket is hashed once per distinct path in the constructor,
+/// so no call hashes a path again, and per-bucket sizes are precomputed so each `extractBucket` column is
+/// allocated exactly (avoiding power-of-two over-allocation).
 class SharedDataBucketsSplitter
 {
 public:
@@ -66,16 +66,26 @@ public:
     /// stay alive while the result is used.
     std::vector<std::pair<std::string_view, ColumnPtr>> flattenBucket(size_t bucket, const DataTypePtr & dynamic_type) const;
 
+    /// Sorted unique path names of a single bucket, without materializing any value column. Returns the
+    /// same list as the paths of `flattenBucket`.
+    /// IMPORTANT: returned string_views reference path data inside the shared data column.
+    std::vector<std::string_view> getBucketPathNames(size_t bucket) const;
+
 private:
     const IColumn & shared_data_column;
     size_t start;
     size_t end;
     size_t num_buckets;
-    /// Bucket index for each path, in the order paths are traversed (rows [start, end), paths within a row).
-    PODArray<UInt8> path_buckets;
+    /// Dense path id for each path occurrence, in the order paths are traversed (rows [start, end), paths within a row).
+    PODArray<UInt32> path_ids;
+    /// Indexed by path id.
+    std::vector<std::string_view> id_to_path;
+    PODArray<UInt8> id_to_bucket;
     std::vector<size_t> bucket_num_paths;
     std::vector<size_t> bucket_paths_chars_size;
     std::vector<size_t> bucket_values_chars_size;
+    /// Ids of the distinct paths of each bucket, in first-seen order.
+    std::vector<std::vector<UInt32>> bucket_unique_paths;
 };
 /// Collect paths from bucket columns into a single shared data column.
 /// If paths_prefix != nullptr collect only paths that matches this prefix

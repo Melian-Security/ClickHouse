@@ -65,6 +65,20 @@ double approximateBytesPerValueForType(const IDataType & type)
     return default_bytes_per_complex_value;
 }
 
+constexpr double default_bytes_per_fixed_width_value = 8;
+
+/// Used when no column size was measured (compact parts). A type estimate is too coarse to rank
+/// fixed-width values against each other (`Nullable(Int64)` would lose to `Int64` on the null byte),
+/// so they all cost the same and selectivity orders them. Variable-width values (strings, arrays,
+/// `JSON` paths) keep their larger estimate: otherwise the default selectivity given to a column
+/// without statistics makes a predicate over a large column look like the cheapest one.
+double approximateUnmeasuredBytesPerValueForType(const IDataType & type)
+{
+    if (type.haveMaximumSizeOfValue() || type.lowCardinality())
+        return default_bytes_per_fixed_width_value;
+    return approximateBytesPerValueForType(type);
+}
+
 /// Find minimal position of any of the column in primary key.
 Int64 findMinPosition(const NameSet & condition_table_columns, const NameToIndexMap & primary_key_positions)
 {
@@ -542,12 +556,11 @@ void MergeTreeWhereOptimizer::analyzeImpl(Conditions & res, const RPNBuilderTree
             else if (rejected_rows <= 0)
                 /// Rejects no rows, so it is useless in PREWHERE regardless of its cost: schedule it last.
                 cond.bytes_per_rejected_row = std::numeric_limits<double>::infinity();
-            else if (total_size_of_queried_columns == 0)
-                /// Nothing measured (compact parts): the type estimate is too coarse to outrank
-                /// selectivity, e.g. `Nullable(Int64)` would beat `Int64` on the null byte.
-                cond.bytes_per_rejected_row = static_cast<double>(cond.estimated_row_count);
             else
-                cond.bytes_per_rejected_row = approximateBytesPerRow(cond.table_columns) * static_cast<double>(total_rows) / rejected_rows;
+                /// With nothing measured (compact parts) the estimate comes from types alone, see
+                /// `approximateUnmeasuredBytesPerValueForType`.
+                cond.bytes_per_rejected_row = approximateBytesPerRow(cond.table_columns, total_size_of_queried_columns != 0)
+                    * static_cast<double>(total_rows) / rejected_rows;
 
             res.emplace_back(std::move(cond));
         }
@@ -734,17 +747,17 @@ UInt64 MergeTreeWhereOptimizer::getColumnsSize(const NameSet & columns) const
     return size;
 }
 
-double MergeTreeWhereOptimizer::approximateBytesPerRow(const NameSet & columns) const
+double MergeTreeWhereOptimizer::approximateBytesPerRow(const NameSet & columns, bool sizes_measured) const
 {
     double bytes_per_row = 0;
 
     for (const auto & column : columns)
-        bytes_per_row += approximateBytesPerRowAndColumn(column);
+        bytes_per_row += approximateBytesPerRowAndColumn(column, sizes_measured);
 
     return bytes_per_row;
 }
 
-double MergeTreeWhereOptimizer::approximateBytesPerRowAndColumn(const String & column) const
+double MergeTreeWhereOptimizer::approximateBytesPerRowAndColumn(const String & column, bool sizes_measured) const
 {
     chassert(total_rows > 0);
 
@@ -759,11 +772,13 @@ double MergeTreeWhereOptimizer::approximateBytesPerRowAndColumn(const String & c
     if (virtual_column && virtual_column->isEphemeral() && !virtual_column->default_desc.expression)
         return 0;
 
+    const auto estimate_for_type = sizes_measured ? approximateBytesPerValueForType : approximateUnmeasuredBytesPerValueForType;
+
     if (virtual_column)
-        return approximateBytesPerValueForType(*virtual_column->type);
+        return estimate_for_type(*virtual_column->type);
 
     if (auto column_in_storage = storage_metadata->getColumns().tryGetColumnOrSubcolumn(GetColumnsOptions::All, column))
-        return approximateBytesPerValueForType(*column_in_storage->type);
+        return estimate_for_type(*column_in_storage->type);
 
     /// Not resolvable through the metadata. Charge the widest estimate rather than 0, which would
     /// schedule it first.

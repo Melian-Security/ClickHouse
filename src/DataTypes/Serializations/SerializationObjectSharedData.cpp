@@ -670,10 +670,11 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
 
         /// Process each bucket separately to limit peak memory —
         /// only one bucket's ColumnDynamic columns are alive at a time.
+        /// The splitter hashes each distinct path once instead of once per bucket.
+        SharedDataBucketsSplitter buckets_splitter(column, offset, end, buckets);
         for (size_t bucket = 0; bucket != buckets; ++bucket)
         {
-            auto flattened_paths = flattenSharedDataPathsForBucket(
-                column, offset, end, dynamic_type, bucket, buckets);
+            auto flattened_paths = buckets_splitter.flattenBucket(bucket, dynamic_type);
 
             /// Save path names for the copy section.
             bucket_path_names[bucket].reserve(flattened_paths.size());
@@ -754,6 +755,15 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
             /// chunk_bucket_path_names[chunk][bucket] = vector of path names.
             std::vector<std::vector<std::vector<std::string_view>>> chunk_bucket_path_names(num_chunks, std::vector<std::vector<std::string_view>>(buckets));
 
+            /// One splitter per chunk, shared by all buckets, so each distinct path is hashed once per chunk.
+            std::vector<std::unique_ptr<SharedDataBucketsSplitter>> chunk_splitters;
+            chunk_splitters.reserve(num_chunks);
+            for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
+            {
+                auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
+                chunk_splitters.push_back(std::make_unique<SharedDataBucketsSplitter>(column, chunk_start, chunk_end, buckets));
+            }
+
             for (size_t bucket = 0; bucket != buckets; ++bucket)
             {
                 settings.path.push_back(Substream::Bucket);
@@ -772,7 +782,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                 for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
                 {
                     auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
-                    auto path_names = scanPathNamesForBucket(column, chunk_start, chunk_end, bucket, buckets);
+                    auto path_names = chunk_splitters[chunk_idx]->getBucketPathNames(bucket);
 
                     writeVarUInt(chunk_end - chunk_start, *structure_stream);
                     writeVarUInt(path_names.size(), *structure_stream);
@@ -789,9 +799,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                 auto & data_stream = getDataStream(settings);
                 for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
                 {
-                    auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
-                    auto flattened_paths = flattenSharedDataPathsForBucket(
-                        column, chunk_start, chunk_end, dynamic_type, bucket, buckets);
+                    auto flattened_paths = chunk_splitters[chunk_idx]->flattenBucket(bucket, dynamic_type);
 
                     chunk_metadata.push_back(serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_type, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED));
                     /// flattened_paths goes out of scope here, freeing ColumnDynamic memory.
@@ -892,11 +900,11 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
             {
                 auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
                 std::vector<std::vector<std::string_view>> bucket_path_names(buckets);
+                SharedDataBucketsSplitter buckets_splitter(column, chunk_start, chunk_end, buckets);
 
                 for (size_t bucket = 0; bucket != buckets; ++bucket)
                 {
-                    auto flattened_paths = flattenSharedDataPathsForBucket(
-                        column, chunk_start, chunk_end, dynamic_type, bucket, buckets);
+                    auto flattened_paths = buckets_splitter.flattenBucket(bucket, dynamic_type);
 
                     /// Save path names for the copy section.
                     bucket_path_names[bucket].reserve(flattened_paths.size());
@@ -1341,6 +1349,89 @@ std::shared_ptr<SerializationObjectSharedData::PathsInfosChunks> SerializationOb
 
     addElementToSubstreamsCache(cache, paths_infos_path, std::make_unique<SubstreamsCachePathsInfosElement>(paths_infos_chunks));
     return paths_infos_chunks;
+}
+
+void SerializationObjectSharedData::prefetchPathsInfos(
+    const SerializationObjectSharedData::ChunkStructures & chunk_structures,
+    const SerializationObjectSharedData::DeserializeBinaryBulkStateObjectSharedDataStructure & structure_state,
+    ISerialization::DeserializeBinaryBulkSettings & settings,
+    ISerialization::SubstreamsCache * cache)
+{
+    if (!settings.prefetch_stream_at_mark_callback)
+        return;
+
+    auto paths_infos_path = settings.path;
+    paths_infos_path.push_back(Substream::ObjectSharedDataPathsInfos);
+    if (getElementFromSubstreamsCache(cache, paths_infos_path))
+        return;
+
+    /// The next chunks are stored right after the first one, so it's enough to prefetch from the first chunk we read.
+    for (const auto & chunk_structure : chunk_structures)
+    {
+        if (chunk_structure.limit == 0 || chunk_structure.position_to_requested_path.empty())
+            continue;
+
+        bool need_paths_marks = false;
+        bool need_subcolumns_info = false;
+        for (const auto & [_, requested_path] : chunk_structure.position_to_requested_path)
+        {
+            if (structure_state.requested_paths_subcolumns.contains(requested_path))
+                need_subcolumns_info = true;
+            else
+                need_paths_marks = true;
+        }
+
+        if (need_paths_marks)
+        {
+            settings.path.push_back(Substream::ObjectSharedDataPathsMarks);
+            settings.prefetch_stream_at_mark_callback(settings.path, chunk_structure.paths_marks_stream_mark);
+            settings.path.pop_back();
+        }
+
+        if (need_subcolumns_info)
+        {
+            settings.path.push_back(Substream::ObjectSharedDataPathsSubstreamsMetadata);
+            settings.prefetch_stream_at_mark_callback(settings.path, chunk_structure.paths_substreams_metadata_stream_mark);
+            settings.path.pop_back();
+        }
+
+        return;
+    }
+}
+
+void SerializationObjectSharedData::prefetchPathsData(
+    const SerializationObjectSharedData::ChunkStructures & chunk_structures,
+    const PathsInfosChunks & paths_infos_chunks,
+    const SerializationObjectSharedData::DeserializeBinaryBulkStateObjectSharedDataStructure & structure_state,
+    ISerialization::DeserializeBinaryBulkSettings & settings,
+    ISerialization::SubstreamsCache * cache)
+{
+    if (!settings.prefetch_stream_at_mark_callback)
+        return;
+
+    auto data_path = settings.path;
+    data_path.push_back(Substream::ObjectSharedDataData);
+    if (getElementFromSubstreamsCache(cache, data_path))
+        return;
+
+    for (size_t chunk_idx = 0; chunk_idx != chunk_structures.size(); ++chunk_idx)
+    {
+        const auto & chunk_structure = chunk_structures[chunk_idx];
+        const auto & path_to_info = paths_infos_chunks[chunk_idx].path_to_info;
+        if (chunk_structure.limit == 0 || path_to_info.empty() || chunk_structure.position_to_requested_path.empty())
+            continue;
+
+        /// deserializePathsData reads the requested paths in the order of their positions, starting from the first one.
+        /// The first substream read of a path with only subcolumns requested depends on the subcolumns, so prefetch only a whole path.
+        const auto & first_requested_path = chunk_structure.position_to_requested_path.begin()->second;
+        if (structure_state.requested_paths_subcolumns.contains(first_requested_path))
+            return;
+
+        auto path_info_it = path_to_info.find(first_requested_path);
+        if (path_info_it != path_to_info.end())
+            settings.prefetch_stream_at_mark_callback(data_path, path_info_it->second.data_mark);
+        return;
+    }
 }
 
 std::shared_ptr<SerializationObjectSharedData::PathsDataChunks> SerializationObjectSharedData::deserializePathsData(
