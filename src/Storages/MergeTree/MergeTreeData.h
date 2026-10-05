@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -845,7 +847,9 @@ public:
     size_t getNumberOfOutdatedPartsWithExpiredRemovalTime() const;
 
     /// Returns a pair with: max number of parts in partition across partitions; sum size of parts inside that partition.
-    /// (if there are multiple partitions with max number of parts, the sum size of parts is returned for arbitrary of them)
+    /// (if there are multiple partitions with max number of parts, the sum size of parts is returned for the first of them
+    /// in the order of partitions in `data_parts_by_state_and_info`).
+    /// For the Active and Outdated states it takes O(number of partitions) and does not lock the parts.
     std::pair<size_t, size_t> getMaxPartsCountAndSizeForPartitionWithState(DataPartState state) const;
 
     virtual std::pair<size_t, size_t> getMaxPartsCountAndSizeForPartition() const;
@@ -1872,17 +1876,23 @@ protected:
 
     void modifyPartState(DataPartIteratorByStateAndInfo it, DataPartState state, DataPartsLock & /* parts_lock */)
     {
+        DataPartPtr part = *it;
+        const DataPartState old_state = part->getState();
+        /// On failure `modify` erases the element from the container.
         if (!data_parts_by_state_and_info.modify(it, getStateModifier(state)))
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't modify {}", (*it)->getNameWithState());
+        {
+            updatePartitionPartsStats(*part, old_state, std::nullopt);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't modify {}", part->getNameWithState());
+        }
+        updatePartitionPartsStats(*part, old_state, state);
     }
 
-    void modifyPartState(DataPartIteratorByInfo it, DataPartState state, DataPartsLock & /* parts_lock */)
+    void modifyPartState(DataPartIteratorByInfo it, DataPartState state, DataPartsLock & parts_lock)
     {
-        if (!data_parts_by_state_and_info.modify(data_parts_indexes.project<TagByStateAndInfo>(it), getStateModifier(state)))
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't modify {}", (*it)->getNameWithState());
+        modifyPartState(data_parts_indexes.project<TagByStateAndInfo>(it), state, parts_lock);
     }
 
-    void modifyPartState(const DataPartPtr & part, DataPartState state, DataPartsLock & /* parts_lock */)
+    void modifyPartState(const DataPartPtr & part, DataPartState state, DataPartsLock & parts_lock)
     {
         auto it = data_parts_by_info.find(part->info);
         if (it == data_parts_by_info.end())
@@ -1891,9 +1901,32 @@ protected:
         if ((*it).get() != part.get())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot modify part state {} (info: {}) to {}, because there is another copy of the same part in {} state", part->name, part->info.getPartNameForLogs(), state, (*it)->getNameWithState());
 
-        if (!data_parts_by_state_and_info.modify(data_parts_indexes.project<TagByStateAndInfo>(it), getStateModifier(state)))
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't modify {}", (*it)->getNameWithState());
+        modifyPartState(it, state, parts_lock);
     }
+
+    /// Number of parts and their total size on disk in each partition, for the Active and the Outdated states.
+    /// Every insertion into, removal from and state change in `data_parts_indexes` is mirrored here, so the
+    /// partition with the most parts can be found without scanning all parts under the parts lock, which is
+    /// done before every insert (see `delayInsertOrThrowIfNeeded`).
+    struct PartitionPartsStat
+    {
+        size_t count = 0;
+        size_t bytes_on_disk = 0;
+    };
+
+    /// Ordered the same way as partitions are ordered in `data_parts_by_state_and_info`.
+    using PartitionPartsStats = std::map<std::pair<MergeTreePartInfo::Kind, String>, PartitionPartsStat>;
+
+    static std::optional<size_t> getPartitionPartsStatsIndex(DataPartState state);
+
+    /// `old_state` and `new_state` are empty when the part is not in `data_parts_indexes` before or after the change.
+    void updatePartitionPartsStats(const IMergeTreeDataPart & part, std::optional<DataPartState> old_state, std::optional<DataPartState> new_state);
+    /// Accounts for a change of the size on disk of a part that is already in `data_parts_indexes`.
+    void updatePartitionPartsBytes(const IMergeTreeDataPart & part, ssize_t diff_bytes);
+    void clearPartitionPartsStats();
+
+    mutable std::mutex partition_parts_stats_mutex;
+    std::array<PartitionPartsStats, 2> partition_parts_stats TSA_GUARDED_BY(partition_parts_stats_mutex);
 
     /// Used to serialize calls to grabOldParts.
     std::mutex grab_old_parts_mutex;
