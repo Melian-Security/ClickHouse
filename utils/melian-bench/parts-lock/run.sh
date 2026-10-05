@@ -19,7 +19,7 @@ WORK=$(mktemp -d /home/ssm-user/pl.XXXX)
 OUT=${OUT_DIR:-/home/ssm-user/pl-out/$LABEL-$(date +%H%M%S)}
 mkdir -p "$WORK/data" "$WORK/log" "$OUT"
 PORT=39100; KPORT=39181; RPORT=39234
-sed -e "s#@WORK@#$WORK#g" -e "s#@PORT@#$PORT#g" -e "s#@KEEPER_PORT@#$KPORT#g" -e "s#@RAFT_PORT@#$RPORT#g" "$K/server.xml" > "$WORK/config.xml"
+sed -e "s#@WORK@#$WORK#g" -e "s#@PORT@#$PORT#g" -e "s#@KEEPER_PORT@#$KPORT#g" -e "s#@RAFT_PORT@#$RPORT#g" -e "s#@IS_PORT@#$((PORT + 9))#g" "$K/server.xml" > "$WORK/config.xml"
 "$BIN" server --config-file="$WORK/config.xml" > "$WORK/log/stdout.log" 2>&1 &
 PID=$!
 cleanup() { kill $PID 2>/dev/null; wait $PID 2>/dev/null; cp "$WORK/log/server.err.log" "$OUT/" 2>/dev/null; rm -rf "$WORK"; }

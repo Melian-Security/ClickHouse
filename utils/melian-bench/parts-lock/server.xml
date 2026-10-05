@@ -5,6 +5,8 @@
         <errorlog>@WORK@/log/server.err.log</errorlog>
     </logger>
     <tcp_port>@PORT@</tcp_port>
+    <interserver_http_port>@IS_PORT@</interserver_http_port>
+    <interserver_http_host>localhost</interserver_http_host>
     <path>@WORK@/data/</path>
     <tmp_path>@WORK@/tmp/</tmp_path>
     <user_files_path>@WORK@/user_files/</user_files_path>
