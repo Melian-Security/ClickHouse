@@ -65,8 +65,10 @@ struct SerializeBinaryBulkStateDynamic : public ISerialization::SerializeBinaryB
     SerializationPtr variant_serialization;
     ISerialization::SerializeBinaryBulkStatePtr variant_state;
 
-    /// Variants statistics.
+    /// Variants statistics. Sizes of usual variants are accumulated in variants_sizes during serialization.
     ColumnDynamic::Statistics statistics;
+    /// Number of serialized values of each variant, indexed by global discriminator (the order of variant_names).
+    VectorWithMemoryTracking<size_t> variants_sizes;
     /// If true, statistics will be recalculated during serialization.
     bool recalculate_statistics = false;
 
@@ -318,6 +320,7 @@ void SerializationDynamic::serializeBinaryBulkStatePrefix(
     else if (settings.write_statistics == SerializeBinaryBulkSettings::StatisticsMode::SUFFIX)
     {
         dynamic_state->recalculate_statistics = true;
+        dynamic_state->variants_sizes.assign(dynamic_state->variant_names.size(), 0);
     }
 
     dynamic_state->variant_serialization = dynamic_state->variant_type->getSerialization(serialization_info_settings);
@@ -542,8 +545,8 @@ void SerializationDynamic::serializeBinaryBulkStateSuffix(
             writeBinary(true, *stream);
 
         /// First, write statistics for usual variants.
-        for (const auto & variant_name : dynamic_state->variant_names)
-            writeVarUInt(dynamic_state->statistics.variants_statistics[variant_name], *stream);
+        for (size_t i = 0; i != dynamic_state->variant_names.size(); ++i)
+            writeVarUInt(dynamic_state->variants_sizes[i], *stream);
         /// Second, write statistics for shared variants.
         writeVarUInt(dynamic_state->statistics.shared_variants_statistics.size(), *stream);
         for (const auto & [variant_name, size] : dynamic_state->statistics.shared_variants_statistics)
@@ -611,7 +614,7 @@ void SerializationDynamic::serializeBinaryBulkWithMultipleStreamsAndCountTotalSi
             limit,
             settings,
             dynamic_state->variant_state,
-            dynamic_state->statistics.variants_statistics,
+            dynamic_state->recalculate_statistics ? dynamic_state->variants_sizes.data() : nullptr,
             total_size_of_variants);
 
     if (dynamic_state->recalculate_statistics)

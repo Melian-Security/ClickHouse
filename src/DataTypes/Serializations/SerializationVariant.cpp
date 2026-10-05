@@ -304,7 +304,7 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
     size_t limit,
     SerializeBinaryBulkSettings & settings,
     SerializeBinaryBulkStatePtr & state,
-    UnorderedMapWithMemoryTracking<String, size_t> & variants_statistics,
+    size_t * variants_sizes,
     size_t & total_size_of_variants) const
 {
     const ColumnVariant & col = assert_cast<const ColumnVariant &>(column);
@@ -382,7 +382,8 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
             }
             settings.path.pop_back();
         }
-        variants_statistics[variant_names[non_empty_global_discr]] += limit;
+        if (variants_sizes)
+            variants_sizes[non_empty_global_discr] += limit;
         total_size_of_variants += limit;
         settings.path.pop_back();
         return;
@@ -443,7 +444,8 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
             addVariantElementToPath(settings.path, i);
             variant_serializations[i]->serializeBinaryBulkWithMultipleStreams(col.getVariantByGlobalDiscriminator(i), 0, 0, settings, variant_state->variant_states[i]);
             size_t variant_size = col.getVariantByGlobalDiscriminator(i).size();
-            variants_statistics[variant_names[i]] += variant_size;
+            if (variants_sizes)
+                variants_sizes[i] += variant_size;
             total_size_of_variants += variant_size;
             settings.path.pop_back();
         }
@@ -515,7 +517,8 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
             variant_offsets_and_limits[i].second,
             settings,
             variant_state->variant_states[i]);
-        variants_statistics[variant_names[i]] += variant_offsets_and_limits[i].second;
+        if (variants_sizes)
+            variants_sizes[i] += variant_offsets_and_limits[i].second;
         total_size_of_variants += variant_offsets_and_limits[i].second;
         settings.path.pop_back();
     }
@@ -529,9 +532,8 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreams(
     DB::ISerialization::SerializeBinaryBulkSettings & settings,
     DB::ISerialization::SerializeBinaryBulkStatePtr & state) const
 {
-    UnorderedMapWithMemoryTracking<String, size_t> tmp_statistics;
     size_t tmp_size = 0;
-    serializeBinaryBulkWithMultipleStreamsAndUpdateVariantStatistics(column, offset, limit, settings, state, tmp_statistics, tmp_size);
+    serializeBinaryBulkWithMultipleStreamsAndUpdateVariantStatistics(column, offset, limit, settings, state, nullptr, tmp_size);
 }
 
 void SerializationVariant::deserializeBinaryBulkWithMultipleStreams(

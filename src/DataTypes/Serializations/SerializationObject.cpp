@@ -18,6 +18,7 @@
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
+#include <Common/HashTable/HashMap.h>
 #include <Common/ThreadPool.h>
 #include <Common/CurrentThread.h>
 #include <Common/setThreadName.h>
@@ -143,6 +144,8 @@ void SerializationObject::SerializationVersion::checkVersion(UInt64 version, boo
             version);
 }
 
+using SharedDataPathToIndex = HashMapWithSavedHash<std::string_view, size_t>;
+
 struct SerializeBinaryBulkStateObject: public ISerialization::SerializeBinaryBulkState
 {
     SerializationObject::SerializationVersion serialization_version;
@@ -155,6 +158,9 @@ struct SerializeBinaryBulkStateObject: public ISerialization::SerializeBinaryBul
     ColumnObject::Statistics statistics;
     /// If true, statistics will be recalculated during serialization.
     bool recalculate_statistics = false;
+    /// Scratch space to count shared data paths of one serialized range. Keys reference the serialized column.
+    SharedDataPathToIndex shared_data_path_to_index;
+    std::vector<std::pair<std::string_view, size_t>> shared_data_paths_with_counts;
 
     /// For flattened serialization only. string_views reference path data inside the Object column
     /// (shared data paths and dynamic paths map keys), which stays alive during serialization.
@@ -978,14 +984,36 @@ void SerializationObject::serializeBinaryBulkWithMultipleStreams(
         const auto & shared_data_offsets = column_object.getSharedDataOffsets();
         size_t start = shared_data_offsets[offset - 1];
         size_t end = limit == 0 || offset + limit > shared_data_offsets.size() ? shared_data_paths->size() : shared_data_offsets[offset + limit - 1];
+        /// Count the paths of this range in a flat hash map first, then add the counts to the statistics
+        /// in the order of the first occurrence of each path. It inserts the same paths in the same order
+        /// as counting row by row, so the statistics and their iteration order stay the same.
+        auto & path_to_index = object_state->shared_data_path_to_index;
+        auto & paths_with_counts = object_state->shared_data_paths_with_counts;
         for (size_t i = start; i != end; ++i)
         {
             auto path = shared_data_paths->getDataAt(i);
-            if (auto it = object_state->statistics.shared_data_paths_statistics.find(path); it != object_state->statistics.shared_data_paths_statistics.end())
-                ++it->second;
-            else if (object_state->statistics.shared_data_paths_statistics.size() < ColumnObject::Statistics::MAX_SHARED_DATA_STATISTICS_SIZE)
-                object_state->statistics.shared_data_paths_statistics.emplace(path, 1);
+            SharedDataPathToIndex::LookupResult it;
+            bool inserted;
+            path_to_index.emplace(path, it, inserted);
+            if (inserted)
+            {
+                it->getMapped() = paths_with_counts.size();
+                paths_with_counts.emplace_back(path, 0);
+            }
+            ++paths_with_counts[it->getMapped()].second;
         }
+
+        auto & paths_statistics = object_state->statistics.shared_data_paths_statistics;
+        for (const auto & [path, count] : paths_with_counts)
+        {
+            if (auto it = paths_statistics.find(path); it != paths_statistics.end())
+                it->second += count;
+            else if (paths_statistics.size() < ColumnObject::Statistics::MAX_SHARED_DATA_STATISTICS_SIZE)
+                paths_statistics.emplace(path, count);
+        }
+
+        path_to_index.clear();
+        paths_with_counts.clear();
     }
     settings.path.pop_back();
     settings.path.pop_back();

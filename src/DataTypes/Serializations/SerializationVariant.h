@@ -112,13 +112,15 @@ public:
         SerializeBinaryBulkSettings & settings,
         SerializeBinaryBulkStatePtr & state) const override;
 
+    /// Same as serializeBinaryBulkWithMultipleStreams, but also adds the number of serialized values of each variant
+    /// to variants_sizes[global_discriminator] (an array with one counter per variant) and their sum to total_size_of_variants.
     void serializeBinaryBulkWithMultipleStreamsAndUpdateVariantStatistics(
         const IColumn & column,
         size_t offset,
         size_t limit,
         SerializeBinaryBulkSettings & settings,
         SerializeBinaryBulkStatePtr & state,
-        UnorderedMapWithMemoryTracking<String, size_t> & variants_statistics,
+        size_t * variants_sizes,
         size_t & total_size_of_variants) const;
 
     void deserializeBinaryBulkWithMultipleStreams(
