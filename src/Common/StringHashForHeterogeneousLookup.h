@@ -7,6 +7,19 @@
 namespace DB
 {
 
+/// A string with its hash computed once, so the same key can be looked up in several
+/// maps that use StringHashForHeterogeneousLookup without being rehashed for each map.
+/// The stored hash must equal std::hash<std::string_view> of the value.
+struct PrehashedStringView
+{
+    std::string_view value;
+    size_t hash;
+
+    explicit PrehashedStringView(std::string_view value_) : value(value_), hash(std::hash<std::string_view>()(value_)) {}
+
+    friend bool operator==(const PrehashedStringView & lhs, const std::string & rhs) { return lhs.value == rhs; }
+};
+
 /// See https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2018/p0919r3.html
 struct StringHashForHeterogeneousLookup
 {
@@ -27,6 +40,11 @@ struct StringHashForHeterogeneousLookup
     auto operator()(const char * data) const
     {
         return hash_type()(data);
+    }
+
+    size_t operator()(const PrehashedStringView & prehashed) const
+    {
+        return prehashed.hash;
     }
 };
 

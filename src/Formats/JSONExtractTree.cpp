@@ -22,6 +22,7 @@
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <Common/StringHashForHeterogeneousLookup.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVariant.h>
 #include <Columns/ColumnVector.h>
@@ -1943,6 +1944,17 @@ public:
         all_typed_paths_have_trivial_defaults = std::all_of(
             typed_paths_types_.begin(), typed_paths_types_.end(),
             [](const auto & pair) { return pair.second->isDefaultInsertTrivial(); });
+
+        /// ColumnObject keeps typed path columns sorted by path, so a typed path's position
+        /// in the sorted list addresses its column in getSortedTypedPathColumns().
+        std::vector<String> sorted_typed_paths;
+        sorted_typed_paths.reserve(typed_path_nodes.size());
+        for (const auto & [path, _] : typed_path_nodes)
+            sorted_typed_paths.push_back(path);
+        std::sort(sorted_typed_paths.begin(), sorted_typed_paths.end());
+        typed_path_infos.reserve(sorted_typed_paths.size());
+        for (size_t i = 0; i != sorted_typed_paths.size(); ++i)
+            typed_path_infos.emplace(sorted_typed_paths[i], TypedPathInfo{typed_path_nodes.at(sorted_typed_paths[i]).get(), i});
     }
 
     bool insertResultToColumn(IColumn & column, const typename JSONParser::Element & element, const JSONExtractInsertSettings & insert_settings, const FormatSettings & format_settings, String & error) const override
@@ -2104,7 +2116,11 @@ private:
         if (shouldSkipPath(current_path, insert_settings))
             return true;
 
-        if (element.isObject() && (skip_typed_path_check || !typed_path_nodes.contains(current_path) || (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object && hasTypedPathWithPrefix(current_path + "."))))
+        /// The path is hashed once here and the hash is reused for the typed and dynamic path lookups below.
+        const PrehashedStringView prehashed_path(current_path);
+        const auto typed_path_it = typed_path_infos.find(prehashed_path);
+
+        if (element.isObject() && (skip_typed_path_check || typed_path_it == typed_path_infos.end() || (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object && hasTypedPathWithPrefix(current_path + "."))))
         {
             /// First pass: collect the set of distinct element types (LITERAL/OBJECT) per key.
             /// This lets us detect all duplicates upfront so we can:
@@ -2208,13 +2224,15 @@ private:
             return true;
         }
 
-        auto & typed_paths = column_object.getTypedPaths();
         auto & dynamic_paths_ptrs = column_object.getDynamicPathsPtrs();
+        /// The column is created from the same type as this node, so it has exactly the node's typed paths.
+        chassert(column_object.getSortedTypedPathColumns().size() == typed_path_infos.size());
         /// Check if we have this path in typed paths.
-        if (auto typed_it = typed_paths.find(current_path); typed_it != typed_paths.end())
+        if (typed_path_it != typed_path_infos.end())
         {
+            IColumn & typed_column = *column_object.getSortedTypedPathColumns()[typed_path_it->second.sorted_index];
             /// Check if we already had this path.
-            if (typed_it->second->size() > current_size)
+            if (typed_column.size() > current_size)
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2222,7 +2240,7 @@ private:
                     return false;
                 }
             }
-            else if (!typed_path_nodes.at(current_path)->insertResultToColumn(*typed_it->second, element, insert_settings, format_settings, error))
+            else if (!typed_path_it->second.node->insertResultToColumn(typed_column, element, insert_settings, format_settings, error))
             {
                 if (!insert_settings.skip_invalid_typed_paths)
                 {
@@ -2243,7 +2261,7 @@ private:
             paths_and_values_for_shared_data.add(current_path, element);
         }
         /// Check if we have this path in dynamic paths.
-        else if (auto dynamic_it = dynamic_paths_ptrs.find(current_path); dynamic_it != dynamic_paths_ptrs.end())
+        else if (auto dynamic_it = dynamic_paths_ptrs.find(prehashed_path); dynamic_it != dynamic_paths_ptrs.end())
         {
             /// Check if we already had this path.
             if (dynamic_it->second->size() > current_size)
@@ -2310,6 +2328,9 @@ private:
 
     bool shouldSkipPath(const String & path, const JSONExtractInsertSettings & insert_settings) const
     {
+        if (paths_to_skip.empty() && path_regexps_to_skip.empty())
+            return false;
+
         if (paths_to_skip.contains(path))
             return true;
 
@@ -2594,6 +2615,14 @@ private:
 
     std::unordered_map<String, DataTypePtr> typed_paths_types;
     std::unordered_map<String, std::unique_ptr<JSONExtractTreeNode<JSONParser>>> typed_path_nodes;
+
+    struct TypedPathInfo
+    {
+        const JSONExtractTreeNode<JSONParser> * node;
+        /// Index of the path's column in ColumnObject::getSortedTypedPathColumns().
+        size_t sorted_index;
+    };
+    std::unordered_map<String, TypedPathInfo, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> typed_path_infos;
     bool all_typed_paths_have_trivial_defaults = true;
     std::unordered_set<String> paths_to_skip;
     std::vector<String> sorted_paths_to_skip;
