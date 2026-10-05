@@ -41,7 +41,7 @@ SELECT hex(json.a::String) FROM format(JSONAsObject, '{"a":"\\ud83c"}');
 
 DROP TABLE IF EXISTS t_json_surrogates;
 CREATE TABLE t_json_surrogates (id UInt32, event JSON(max_dynamic_paths = 2, message String, `user.name` String)) ENGINE = MergeTree ORDER BY id;
-INSERT INTO t_json_surrogates FORMAT JSONEachRow {"id":1,"event":{"message":"ok \ud83c\udf1e","user":{"name":"n"}}} {"id":2,"event":{"message":"cut \ud83c","DetectedValues":["a\udf1e","b"],"x":1,"y":2,"z":3}} {"id":3,"event":{"message":"plain","user":{"name":"\udfff"}}}
+INSERT INTO t_json_surrogates FORMAT JSONEachRow {"id":1,"event":{"message":"ok \ud83c\udf1e","user":{"name":"n"}}} {"id":2,"event":{"message":"cut \ud83c","tags":["a\udf1e","b"],"x":1,"y":2,"z":3}} {"id":3,"event":{"message":"plain","user":{"name":"\udfff"}}}
 
-SELECT id, hex(event.message), hex(event.user.name), replaceAll(toString(event.DetectedValues), unhex('EFBFBD'), '<U+FFFD>') FROM t_json_surrogates ORDER BY id;
+SELECT id, hex(event.message), hex(event.user.name), replaceAll(toString(event.tags), unhex('EFBFBD'), '<U+FFFD>') FROM t_json_surrogates ORDER BY id;
 DROP TABLE t_json_surrogates;
