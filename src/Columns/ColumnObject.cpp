@@ -996,6 +996,38 @@ void ColumnObject::deserializeValueFromSharedData(const ColumnString * shared_da
     getDynamicSerialization()->deserializeBinary(column, buf, getFormatSettings());
 }
 
+void ColumnObject::deserializeValueFromSharedData(const ColumnString * shared_data_values, size_t n, ColumnDynamic & column, SharedDataValueTypeCache & cache)
+{
+    auto value_data = shared_data_values->getDataAt(n);
+    auto & variant_column = column.getVariantColumn();
+    /// The binary type encoding is read byte by byte without lookahead, so equal leading bytes decode to
+    /// the same type: this is what the full path below would do for this value.
+    if (cache.serialization && value_data.starts_with(cache.encoded_type))
+    {
+        auto & variant = variant_column.getVariantByGlobalDiscriminator(cache.global_discriminator);
+        ReadBufferFromMemory buf(value_data.substr(cache.encoded_type.size()));
+        cache.serialization->deserializeBinary(variant, buf, getFormatSettings());
+        variant_column.getLocalDiscriminators().push_back(variant_column.localDiscriminatorByGlobal(cache.global_discriminator));
+        variant_column.getOffsets().push_back(variant.size() - 1);
+        return;
+    }
+
+    deserializeValueFromSharedData(shared_data_values, n, column);
+
+    /// Adding a variant can renumber the global discriminators, so the cache is rebuilt after every full read.
+    /// NULL and values kept in the shared variant are not cached.
+    cache = {};
+    auto global_discriminator = variant_column.globalDiscriminatorAt(variant_column.size() - 1);
+    if (global_discriminator == ColumnVariant::NULL_DISCRIMINATOR || global_discriminator == column.getSharedVariantDiscriminator())
+        return;
+
+    ReadBufferFromMemory buf(value_data);
+    auto type = decodeDataType(buf, getFormatSettings().binary.max_binary_type_complexity);
+    cache.encoded_type = value_data.substr(0, buf.position() - value_data.data());
+    cache.global_discriminator = global_discriminator;
+    cache.serialization = column.getVariantSerialization(type);
+}
+
 void ColumnObject::insertDefault()
 {
     /// Exception-safe: if some sub-column's insertDefault throws (e.g. on a memory limit),
