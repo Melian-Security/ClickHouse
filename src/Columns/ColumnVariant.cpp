@@ -11,6 +11,7 @@
 #include <Common/typeid_cast.h>
 #include <Common/Arena.h>
 #include <Common/SipHash.h>
+#include <Common/SipHashBuffer.h>
 #include <Common/HashTable/Hash.h>
 #include <Columns/MaskOperations.h>
 
@@ -919,8 +920,10 @@ void ColumnVariant::updateHashWithValueRange(size_t begin, size_t end, SipHash &
     {
         /// Fast path: the range covers the entire column, so each variant's
         /// range is simply [0, variant.size()) — no need to scan offsets.
+        SipHashBuffer<Discriminator> discriminators(hash);
         for (size_t i = 0; i < end; ++i)
-            hash.update(globalDiscriminatorByLocal(local_discriminators_data[i]));
+            discriminators.add(globalDiscriminatorByLocal(local_discriminators_data[i]));
+        discriminators.flush();
 
         for (Discriminator global_discr = 0;
              global_discr < static_cast<Discriminator>(num_variants);
@@ -939,11 +942,11 @@ void ColumnVariant::updateHashWithValueRange(size_t begin, size_t end, SipHash &
     VectorWithMemoryTracking<size_t> variant_first_offset(num_variants, 0);
     VectorWithMemoryTracking<size_t> variant_count(num_variants, 0);
 
+    SipHashBuffer<Discriminator> discriminators(hash);
     for (size_t i = begin; i < end; ++i)
     {
         auto local_discr = local_discriminators_data[i];
-        auto global_discr = globalDiscriminatorByLocal(local_discr);
-        hash.update(global_discr);
+        discriminators.add(globalDiscriminatorByLocal(local_discr));
         if (local_discr != NULL_DISCRIMINATOR)
         {
             if (variant_count[local_discr] == 0)
@@ -951,6 +954,7 @@ void ColumnVariant::updateHashWithValueRange(size_t begin, size_t end, SipHash &
             ++variant_count[local_discr];
         }
     }
+    discriminators.flush();
 
     /// Hash each variant's data in global discriminator order.
     for (Discriminator global_discr = 0; global_discr < static_cast<Discriminator>(num_variants); ++global_discr)

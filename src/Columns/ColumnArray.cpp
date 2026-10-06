@@ -11,6 +11,7 @@
 #include <Common/Exception.h>
 #include <Common/Arena.h>
 #include <Common/SipHash.h>
+#include <Common/SipHashBuffer.h>
 #include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
 #include <Common/HashTable/Hash.h>
@@ -338,11 +339,11 @@ void ColumnArray::updateHashWithValueRange(size_t begin, size_t end, SipHash & h
     size_t nested_end = offsetAt(end);
     getData().updateHashWithValueRange(nested_begin, nested_end, hash);
     /// Relative offsets so equal data hashes equally regardless of position (insert deduplication).
+    const auto & offsets_data = getOffsets();
+    SipHashBuffer<UInt64> relative_offsets(hash);
     for (size_t i = begin; i < end; ++i)
-    {
-        UInt64 relative_offset = getOffsets()[i] - nested_begin;
-        hash.update(relative_offset);
-    }
+        relative_offsets.add(offsets_data[i] - nested_begin);
+    relative_offsets.flush();
 }
 
 void ColumnArray::computeHashInto(size_t row_begin, size_t row_end, UInt32 * hash_out, bool initial) const

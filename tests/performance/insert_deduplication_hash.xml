@@ -1,0 +1,37 @@
+<test>
+    <!-- After the fill query every insert is a duplicate, so the measured queries generate the block,
+         hash it for the block id and skip the write. Many short values make the per-row part of the
+         hash (offsets, discriminators) dominate. -->
+    <settings>
+        <insert_deduplicate>1</insert_deduplicate>
+        <deduplicate_insert_select>enable_even_for_bad_queries</deduplicate_insert_select>
+        <max_threads>1</max_threads>
+        <max_insert_threads>1</max_insert_threads>
+        <max_block_size>1048576</max_block_size>
+        <min_insert_block_size_rows>1048576</min_insert_block_size_rows>
+    </settings>
+
+    <create_query>
+        CREATE TABLE dedup_hash_strings (s String, a Array(String))
+        ENGINE = MergeTree ORDER BY tuple()
+        SETTINGS non_replicated_deduplication_window = 1000
+    </create_query>
+    <create_query>
+        CREATE TABLE dedup_hash_variant (v Variant(UInt64, String))
+        ENGINE = MergeTree ORDER BY tuple()
+        SETTINGS non_replicated_deduplication_window = 1000
+    </create_query>
+
+    <fill_query>
+        INSERT INTO dedup_hash_strings SELECT toString(number % 1000), [toString(number % 7), toString(number % 3)] FROM numbers(1000000)
+    </fill_query>
+    <fill_query>
+        INSERT INTO dedup_hash_variant SELECT if(number % 2, number::Variant(UInt64, String), toString(number % 100)::Variant(UInt64, String)) FROM numbers(1000000)
+    </fill_query>
+
+    <query>INSERT INTO dedup_hash_strings SELECT toString(number % 1000), [toString(number % 7), toString(number % 3)] FROM numbers(1000000)</query>
+    <query>INSERT INTO dedup_hash_variant SELECT if(number % 2, number::Variant(UInt64, String), toString(number % 100)::Variant(UInt64, String)) FROM numbers(1000000)</query>
+
+    <drop_query>DROP TABLE IF EXISTS dedup_hash_strings</drop_query>
+    <drop_query>DROP TABLE IF EXISTS dedup_hash_variant</drop_query>
+</test>
