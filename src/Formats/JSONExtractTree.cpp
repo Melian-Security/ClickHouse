@@ -1998,7 +1998,8 @@ public:
         /// The path of the element being visited. Each object level appends its key and truncates back, so
         /// building child paths does not allocate per key.
         String path_buffer;
-        if (!traverseAndInsert(column_object, element, path_buffer, insert_settings, format_settings, paths_and_values_for_shared_data, prev_size, error, true))
+        size_t path_cache_position = 0;
+        if (!traverseAndInsert(column_object, element, path_buffer, insert_settings, format_settings, paths_and_values_for_shared_data, path_cache_position, prev_size, error, true))
         {
             /// If there was an error, restore previous state.
             SerializationObject::restoreColumnObject(column_object, prev_size);
@@ -2109,6 +2110,7 @@ private:
         const JSONExtractInsertSettings & insert_settings,
         const FormatSettings & format_settings,
         SharedDataPathsAndValues & paths_and_values_for_shared_data,
+        size_t & path_cache_position,
         size_t current_size,
         String & error,
         bool is_root,
@@ -2117,11 +2119,10 @@ private:
         if (shouldSkipPath(current_path, insert_settings))
             return true;
 
-        /// The path is hashed once here and the hash is reused for the typed and dynamic path lookups below.
-        const PrehashedStringView prehashed_path(current_path);
-        const auto typed_path_it = typed_path_infos.find(prehashed_path);
+        PathCacheEntry & path_info = getPathCacheEntry(current_path, path_cache_position);
+        const TypedPathInfo * typed_path = path_info.typed_path;
 
-        if (element.isObject() && (skip_typed_path_check || typed_path_it == typed_path_infos.end() || (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object && hasTypedPathWithPrefix(current_path + "."))))
+        if (element.isObject() && (skip_typed_path_check || !typed_path || (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object && hasTypedPathWithPrefix(current_path + "."))))
         {
             const auto object = element.getObject();
             const size_t current_path_size = current_path.size();
@@ -2135,7 +2136,7 @@ private:
                 {
                     current_path.resize(current_path_size);
                     appendChildPath(current_path, key, insert_settings, is_root);
-                    if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false))
+                    if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, path_cache_position, current_size, error, false))
                         return false;
                 }
 
@@ -2236,7 +2237,7 @@ private:
                     && typed_path_nodes.contains(path)
                     && !canParseObjectValue(typed_paths_types.at(path));
 
-                if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false, skip_typed))
+                if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, path_cache_position, current_size, error, false, skip_typed))
                     return false;
             }
 
@@ -2244,13 +2245,12 @@ private:
             return true;
         }
 
-        auto & dynamic_paths_ptrs = column_object.getDynamicPathsPtrs();
         /// The column is created from the same type as this node, so it has exactly the node's typed paths.
         chassert(column_object.getSortedTypedPathColumns().size() == typed_path_infos.size());
         /// Check if we have this path in typed paths.
-        if (typed_path_it != typed_path_infos.end())
+        if (typed_path)
         {
-            IColumn & typed_column = *column_object.getSortedTypedPathColumns()[typed_path_it->second.sorted_index];
+            IColumn & typed_column = *column_object.getSortedTypedPathColumns()[typed_path->sorted_index];
             /// Check if we already had this path.
             if (typed_column.size() > current_size)
             {
@@ -2260,7 +2260,7 @@ private:
                     return false;
                 }
             }
-            else if (!typed_path_it->second.node->insertResultToColumn(typed_column, element, insert_settings, format_settings, error))
+            else if (!typed_path->node->insertResultToColumn(typed_column, element, insert_settings, format_settings, error))
             {
                 if (!insert_settings.skip_invalid_typed_paths)
                 {
@@ -2280,11 +2280,11 @@ private:
         {
             paths_and_values_for_shared_data.add(current_path, element);
         }
-        /// Check if we have this path in dynamic paths.
-        else if (auto dynamic_it = dynamic_paths_ptrs.find(prehashed_path); dynamic_it != dynamic_paths_ptrs.end())
+        /// Check if we have this path in dynamic paths, or try to add a new dynamic path.
+        else if (ColumnDynamic * dynamic_column = getDynamicPathColumn(column_object, current_path, path_info))
         {
-            /// Check if we already had this path.
-            if (dynamic_it->second->size() > current_size)
+            /// Check if we already had this path. A new dynamic path column has exactly current_size rows.
+            if (dynamic_column->size() > current_size)
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2292,16 +2292,7 @@ private:
                     return false;
                 }
             }
-            else if (!insertIntoDynamicPath(*dynamic_it->second, element, insert_settings, format_settings, error))
-            {
-                error += fmt::format(" (while reading path {})", current_path);
-                return false;
-            }
-        }
-        /// Try to add a new dynamic path.
-        else if (auto * dynamic_column = column_object.tryToAddNewDynamicPath(current_path))
-        {
-            if (!insertIntoDynamicPath(*dynamic_column, element, insert_settings, format_settings, error))
+            else if (!insertIntoDynamicPath(*dynamic_column, element, insert_settings, format_settings, error))
             {
                 error += fmt::format(" (while reading path {})", current_path);
                 return false;
@@ -2724,6 +2715,92 @@ private:
         size_t sorted_index;
     };
     std::unordered_map<String, TypedPathInfo, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> typed_path_infos;
+
+    /// Where a path was found the last time, remembered by the position of the path in the order of traversal.
+    struct PathCacheEntry
+    {
+        String path;
+        /// std::hash of the path, to look it up in the dynamic paths without hashing it again.
+        size_t path_hash = 0;
+        /// The typed path, or nullptr. Depends only on the path.
+        const TypedPathInfo * typed_path = nullptr;
+        /// The dynamic path column, or nullptr if the path goes to shared data. Valid only while the dynamic
+        /// paths version of the column equals dynamic_paths_version (versions start from 1).
+        ColumnDynamic * dynamic_column = nullptr;
+        UInt64 dynamic_paths_version = 0;
+    };
+
+    /// Objects inserted one after another usually have the same keys in the same order, so the path at a position
+    /// of the traversal is usually the same as in the previous object. Comparing it with the remembered path is
+    /// cheaper than hashing it and looking it up in the typed and dynamic paths.
+    /// Returns the entry of the path and moves `position` past it.
+    PathCacheEntry & getPathCacheEntry(const String & path, size_t & position) const
+    {
+        /// Also check a few positions ahead, so an object that lacks some keys of the previous one stays in step.
+        static constexpr size_t max_positions_to_look_ahead = 4;
+        const size_t look_ahead_end = std::min(path_cache.size(), position + max_positions_to_look_ahead);
+        for (size_t i = position; i < look_ahead_end; ++i)
+        {
+            if (path_cache[i].path == path)
+            {
+                position = i + 1;
+                return path_cache[i];
+            }
+        }
+
+        return addPathCacheEntry(path, position);
+    }
+
+    /// Looks up the typed path and remembers the path at `position`, in place of the path that was there.
+    /// When the cache is full, returns an entry that is valid only until the next call.
+    NO_INLINE PathCacheEntry & addPathCacheEntry(const String & path, size_t & position) const
+    {
+        PathCacheEntry * entry = &uncached_path_info;
+        if (position < path_cache.size())
+            entry = &path_cache[position];
+        else if (position < max_path_cache_size)
+            entry = &path_cache.emplace_back();
+
+        if (entry != &uncached_path_info)
+        {
+            entry->path.assign(path);
+            ++position;
+        }
+
+        const PrehashedStringView prehashed_path(path);
+        entry->path_hash = prehashed_path.hash;
+        auto typed_path_it = typed_path_infos.find(prehashed_path);
+        entry->typed_path = typed_path_it == typed_path_infos.end() ? nullptr : &typed_path_it->second;
+        entry->dynamic_column = nullptr;
+        entry->dynamic_paths_version = 0;
+        return *entry;
+    }
+
+    /// Returns the dynamic path column of the path, adding a new dynamic path if the limit allows it.
+    /// Returns nullptr if the path goes to shared data.
+    static ColumnDynamic * getDynamicPathColumn(ColumnObject & column_object, const String & path, PathCacheEntry & path_info)
+    {
+        auto & dynamic_paths_ptrs = column_object.getDynamicPathsPtrs();
+        if (path_info.dynamic_paths_version == column_object.getDynamicPathsVersion())
+        {
+            chassert(path_info.dynamic_column
+                ? dynamic_paths_ptrs.contains(path) && dynamic_paths_ptrs.at(path) == path_info.dynamic_column
+                : !dynamic_paths_ptrs.contains(path) && !column_object.canAddNewDynamicPath());
+            return path_info.dynamic_column;
+        }
+
+        if (auto dynamic_it = dynamic_paths_ptrs.find(PrehashedStringView(path, path_info.path_hash)); dynamic_it != dynamic_paths_ptrs.end())
+            path_info.dynamic_column = dynamic_it->second;
+        else
+            path_info.dynamic_column = column_object.tryToAddNewDynamicPath(path);
+        path_info.dynamic_paths_version = column_object.getDynamicPathsVersion();
+        return path_info.dynamic_column;
+    }
+
+    /// See getPathCacheEntry. Like the caches of DynamicNode, it belongs to one serialization, which one thread uses at a time.
+    mutable std::vector<PathCacheEntry> path_cache;
+    mutable PathCacheEntry uncached_path_info;
+    static constexpr size_t max_path_cache_size = 10000;
     bool all_typed_paths_have_trivial_defaults = true;
     std::unordered_set<String> paths_to_skip;
     std::vector<String> sorted_paths_to_skip;

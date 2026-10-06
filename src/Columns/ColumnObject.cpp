@@ -7,6 +7,7 @@
 #include <IO/Operators.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Arena.h>
+#include <atomic>
 #include <Common/HashTable/Hash.h>
 #include <Common/PODArray.h>
 #include <Common/SipHash.h>
@@ -510,6 +511,12 @@ void ColumnObject::insertData(const char *, size_t)
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method insertData is not supported for {}", getName());
 }
 
+UInt64 ColumnObject::getNextDynamicPathsVersion()
+{
+    static std::atomic<UInt64> last_version = 0;
+    return last_version.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 ColumnDynamic * ColumnObject::tryToAddNewDynamicPath(std::string_view path)
 {
     if (dynamic_paths.size() == max_dynamic_paths)
@@ -521,6 +528,7 @@ ColumnDynamic * ColumnObject::tryToAddNewDynamicPath(std::string_view path)
     auto it = dynamic_paths.emplace(path, std::move(new_dynamic_column)).first;
     auto it_ptr = dynamic_paths_ptrs.emplace(path, assert_cast<ColumnDynamic *>(it->second.get())).first;
     sorted_dynamic_paths.insert(it->first);
+    updateDynamicPathsVersion();
     /// Invalidate statistics because they refer to the old set of dynamic paths.
     statistics.reset();
     return it_ptr->second;
@@ -537,6 +545,7 @@ void ColumnObject::addNewDynamicPath(std::string_view path, MutableColumnPtr col
     auto it = dynamic_paths.emplace(path, std::move(column)).first;
     dynamic_paths_ptrs.emplace(path, assert_cast<ColumnDynamic *>(it->second.get()));
     sorted_dynamic_paths.insert(it->first);
+    updateDynamicPathsVersion();
 }
 
 void ColumnObject::addNewDynamicPath(std::string_view path)
@@ -551,6 +560,7 @@ void ColumnObject::setMaxDynamicPaths(size_t max_dynamic_paths_)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Setting specific max_dynamic_paths parameter is allowed only for empty object column");
 
     max_dynamic_paths = max_dynamic_paths_;
+    updateDynamicPathsVersion();
 }
 
 void ColumnObject::setMaxDynamicPathsUpperBound(size_t max_dynamic_paths_upper_bound_)
@@ -573,7 +583,11 @@ void ColumnObject::setMaxDynamicPathsUpperBound(size_t max_dynamic_paths_upper_b
             max_dynamic_paths_upper_bound_);
 
     max_dynamic_paths_upper_bound = max_dynamic_paths_upper_bound_;
-    max_dynamic_paths = std::min(max_dynamic_paths, max_dynamic_paths_upper_bound);
+    if (max_dynamic_paths > max_dynamic_paths_upper_bound)
+    {
+        max_dynamic_paths = max_dynamic_paths_upper_bound;
+        updateDynamicPathsVersion();
+    }
 }
 
 void ColumnObject::takeMaxDynamicPathsUpperBoundFrom(const ColumnObject & src)
@@ -584,7 +598,11 @@ void ColumnObject::takeMaxDynamicPathsUpperBoundFrom(const ColumnObject & src)
         return;
 
     max_dynamic_paths_upper_bound = new_upper_bound;
-    max_dynamic_paths = std::min(max_dynamic_paths, new_upper_bound);
+    if (max_dynamic_paths > new_upper_bound)
+    {
+        max_dynamic_paths = new_upper_bound;
+        updateDynamicPathsVersion();
+    }
 }
 
 void ColumnObject::setDynamicPaths(const VectorWithMemoryTracking<String> & paths)
@@ -610,6 +628,7 @@ void ColumnObject::setDynamicPaths(const VectorWithMemoryTracking<String> & path
         dynamic_paths_ptrs[path] = assert_cast<ColumnDynamic *>(it->second.get());
         sorted_dynamic_paths.insert(it->first);
     }
+    updateDynamicPathsVersion();
 }
 
 void ColumnObject::setDynamicPaths(const VectorWithMemoryTracking<std::pair<String, ColumnPtr>> & paths)
@@ -626,7 +645,10 @@ void ColumnObject::setDynamicPaths(const VectorWithMemoryTracking<std::pair<Stri
 
     /// Invalidate statistics because they refer to the old set of dynamic paths.
     if (!paths.empty())
+    {
         statistics.reset();
+        updateDynamicPathsVersion();
+    }
 }
 
 void ColumnObject::insert(const Field & x)
@@ -709,6 +731,7 @@ bool ColumnObject::tryInsert(const Field & x)
             sorted_dynamic_paths.erase(path);
             dynamic_paths.erase(path);
         }
+        updateDynamicPathsVersion();
 
         for (auto & [_, column] : dynamic_paths_ptrs)
         {
@@ -1369,6 +1392,7 @@ void ColumnObject::rollback(const ColumnCheckpoint & checkpoint)
             {
                 dynamic_paths_ptrs.erase(name);
                 sorted_dynamic_paths.erase(name);
+                updateDynamicPathsVersion();
             }
 
             columns_map.erase(name);
@@ -1937,6 +1961,7 @@ void ColumnObject::forEachMutableSubcolumn(DB::IColumn::MutableColumnCallback ca
         callback(it->second);
         dynamic_paths_ptrs[it->first] = assert_cast<ColumnDynamic *>(it->second.get());
     }
+    updateDynamicPathsVersion();
     callback(shared_data);
 }
 
@@ -1958,6 +1983,7 @@ void ColumnObject::forEachMutableSubcolumnRecursively(DB::IColumn::RecursiveMuta
         it->second->forEachMutableSubcolumnRecursively(callback);
         dynamic_paths_ptrs[it->first] = assert_cast<ColumnDynamic *>(it->second.get());
     }
+    updateDynamicPathsVersion();
     callback(*shared_data);
     shared_data->forEachMutableSubcolumnRecursively(callback);
 }
@@ -2135,8 +2161,11 @@ void ColumnObject::prepareForSquashing(const VectorWithMemoryTracking<ColumnPtr>
     /// will insert new types to SharedVariant only when that limit is reached.
     /// Raising the limit is only safe while nothing has been spilled yet: otherwise a path could be
     /// promoted to a dynamic path while the earlier rows still keep it in shared data.
-    if (getSharedDataPathsAndValues().first->empty())
+    if (getSharedDataPathsAndValues().first->empty() && max_dynamic_paths != max_dynamic_paths_upper_bound)
+    {
         max_dynamic_paths = max_dynamic_paths_upper_bound;
+        updateDynamicPathsVersion();
+    }
 
     /// Check if the number of all dynamic paths exceeds the limit.
     if (path_to_total_number_of_non_null_values.size() > max_dynamic_paths)
@@ -2345,6 +2374,7 @@ void ColumnObject::chooseDynamicStructureForMerge(const VectorWithMemoryTracking
     /// Set max_dynamic_paths to the number of selected dynamic paths.
     /// It's needed to avoid adding new unexpected dynamic paths during inserts into this column during merge.
     max_dynamic_paths = dynamic_paths.size();
+    updateDynamicPathsVersion();
 
     /// Now we have the resulting set of dynamic paths that will be used in all merged columns.
     /// As we use Dynamic column for dynamic paths, we should call `chooseDynamicStructureForMerge`
@@ -2399,6 +2429,7 @@ void ColumnObject::takeExactDynamicStructureFrom(const IColumn & source)
     /// max_dynamic_paths_upper_bound is deliberately left alone: lowering it to the same value would
     /// make `prepareForSquashing` restore max_dynamic_paths to it and so undo this freeze.
     max_dynamic_paths = dynamic_paths.size();
+    updateDynamicPathsVersion();
 }
 
 void ColumnObject::fixDynamicStructure()
@@ -2406,6 +2437,7 @@ void ColumnObject::fixDynamicStructure()
     /// Set max_dynamic_paths to the number of dynamic paths.
     /// It's needed to avoid adding new unexpected dynamic paths during later inserts into this column.
     max_dynamic_paths = dynamic_paths.size();
+    updateDynamicPathsVersion();
 }
 
 ColumnObject::StatisticsPtr ColumnObject::getOrCalculateStatistics() const
@@ -2892,6 +2924,7 @@ void ColumnObject::repairDuplicatesInDynamicPathsAndSharedData(size_t offset)
         dynamic_paths_ptrs[path] = assert_cast<ColumnDynamic *>(column.get());
         dynamic_paths[path] = std::move(column);
     }
+    updateDynamicPathsVersion();
 
     if (new_shared_data->size() != size)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of new shared data: {} != {}", new_shared_data->size(), size);
