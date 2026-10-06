@@ -1,0 +1,28 @@
+<clickhouse>
+    <logger>
+        <level>information</level>
+    </logger>
+    <listen_host>127.0.0.1</listen_host>
+    <background_pool_size>8</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>4</background_merges_mutations_concurrency_ratio>
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <flush_interval_milliseconds>1000</flush_interval_milliseconds>
+    </query_log>
+    <profiles>
+        <default/>
+    </profiles>
+    <users>
+        <default>
+            <password></password>
+            <networks><ip>::/0</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+    <quotas>
+        <default/>
+    </quotas>
+</clickhouse>
