@@ -354,7 +354,7 @@ void ColumnObject::getValueNameImpl(WriteBufferFromOwnString & name_buf, size_t 
 
     if (options.notFull(name_buf))
     {
-        for (const auto & [path, column] : object_dynamic_paths)
+        for (const auto & [path, column] : dynamic_paths_ptrs)
         {
             if (!options.notFull(name_buf))
                 break;
@@ -1626,7 +1626,7 @@ void ColumnObject::computeHashInto(size_t row_begin, size_t row_end, UInt32 * ha
     else
     {
         PaddedPODArray<UInt32> value_hash(n);
-        for (const auto & [path, column] : object_dynamic_paths)
+        for (const auto & [path, column] : dynamic_paths_ptrs)
         {
             column->computeHashInto(row_begin, row_end, value_hash.data(), /*initial=*/true);
             const UInt32 path_hash = updateWeakHash32(
