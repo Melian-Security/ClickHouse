@@ -1853,6 +1853,14 @@ one `Nested`) and columns with skip indexes are still written one after another.
 the same as with `1`. Each column that is written at the same time holds its own read and write
 buffers, so the memory usage of a merge grows with this setting.
 )", 0) \
+    DECLARE(Bool, vertical_merge_read_in_separate_thread, false, R"(
+If true, a Vertical merge reads and gathers each column in a separate thread, while the thread of the merge
+writes the column. This makes merges of wide columns faster, for example of `JSON` columns, but a merge uses
+two threads instead of one, and it keeps up to two more blocks of the column in memory.
+
+The threads are limited by the server setting [max_merge_helper_threads](/reference/settings/server-settings/settings/max#max_merge_helper_threads).
+If all of them are used, the merge reads the column in its own thread.
+)", 0) \
     DECLARE(UInt64, max_postpone_time_for_failed_mutations_ms, 5ULL * 60 * 1000, R"(
 The maximum postpone time for failed mutations.
 )", 0) \
