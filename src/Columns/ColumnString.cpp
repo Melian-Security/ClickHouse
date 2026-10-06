@@ -10,6 +10,7 @@
 #include <Common/HashTable/StringHashSet.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/SipHash.h>
+#include <Common/SipHashBuffer.h>
 #include <Common/assert_cast.h>
 
 #if USE_EMBEDDED_COMPILER
@@ -855,11 +856,10 @@ void ColumnString::updateHashWithValueRange(size_t begin, size_t end, SipHash & 
     size_t chars_end = offsetAt(end);
     hash.update(reinterpret_cast<const char *>(&chars[chars_begin]), chars_end - chars_begin);
     /// Relative offsets so equal data hashes equally regardless of position (insert deduplication).
+    SipHashBuffer<UInt64> relative_offsets(hash);
     for (size_t i = begin; i < end; ++i)
-    {
-        UInt64 relative_offset = offsets[i] - chars_begin;
-        hash.update(relative_offset);
-    }
+        relative_offsets.add(offsets[i] - chars_begin);
+    relative_offsets.flush();
 }
 
 void ColumnString::updateHashFast(SipHash & hash) const
