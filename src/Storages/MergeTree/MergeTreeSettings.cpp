@@ -1845,6 +1845,14 @@ If true, lightweight delete is optimized on vertical merge.
 If true, rows TTL delete is optimized on vertical merge. Instead of forcing horizontal merge,
 the TTL filter is evaluated and passed to the merging algorithm which sets skip flags in row sources.
 )", 0) \
+    DECLARE(UInt64, vertical_merge_max_parallel_columns, 1, R"(
+The maximum number of columns that the Vertical stage of one merge reads, gathers, serializes and
+compresses at the same time, each in its own thread. With the default value `1` the columns are
+written one after another in the thread of the merge. Columns that share array offsets (elements of
+one `Nested`) and columns with skip indexes are still written one after another. The merged part is
+the same as with `1`. Each column that is written at the same time holds its own read and write
+buffers, so the memory usage of a merge grows with this setting.
+)", 0) \
     DECLARE(UInt64, max_postpone_time_for_failed_mutations_ms, 5ULL * 60 * 1000, R"(
 The maximum postpone time for failed mutations.
 )", 0) \

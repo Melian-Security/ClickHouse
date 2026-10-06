@@ -46,6 +46,9 @@ class MergeTask;
 using MergeTaskPtr = std::shared_ptr<MergeTask>;
 class RowsSourcesTemporaryFile;
 
+class ThreadGroup;
+using ThreadGroupPtr = std::shared_ptr<ThreadGroup>;
+
 class MergedPartOffsets;
 using MergedPartOffsetsPtr = std::shared_ptr<MergedPartOffsets>;
 
@@ -448,12 +451,19 @@ private:
         std::unique_ptr<PullingPipelineExecutor> executor;
         BuildStatisticsTransformMap build_statistics_transforms;
         UInt64 elapsed_execute_ns{0};
+
+        /// The state of the threads that write several columns at the same time, see `vertical_merge_max_parallel_columns`.
+        /// Declared last, so that its destructor joins the threads before the members they use are destroyed.
+        struct ParallelColumns;
+        std::shared_ptr<ParallelColumns> parallel_columns;
     };
 
     using VerticalMergeRuntimeContextPtr = std::shared_ptr<VerticalMergeRuntimeContext>;
 
     struct VerticalMergeStage : public IStage
     {
+        ~VerticalMergeStage() override;
+
         bool execute() override;
         void cancel() noexcept override;
 
@@ -486,6 +496,11 @@ private:
         void finalizeVerticalMergeForOneColumn() const;
 
         VerticalMergeRuntimeContext::PreparedColumnPipeline createPipelineForReadingOneColumn(const String & column_name) const;
+
+        void prepareParallelColumns(size_t max_parallel_columns) const;
+        bool executeVerticalMergeForColumnsInParallel() const;
+        void writeColumnsInParallel(ThreadGroupPtr thread_group) const;
+        void writeOneColumnInParallel(size_t column_index, WrittenOffsetSubstreams & written_offset_substreams) const;
 
         VerticalMergeRuntimeContextPtr ctx;
         GlobalRuntimeContextPtr global_ctx;

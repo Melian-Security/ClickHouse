@@ -6,7 +6,9 @@
 #include <Storages/MergeTree/MergedPartOffsets.h>
 #include <Storages/ColumnsDescription.h>
 
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <fmt/format.h>
 
 #include <Compression/CompressedWriteBuffer.h>
@@ -64,6 +66,10 @@
 #include <Common/JemallocMergeTreeArena.h>
 #include <Common/Logger.h>
 #include <Common/ProfileEvents.h>
+#include <Common/CurrentThread.h>
+#include <Common/ThreadGroupSwitcher.h>
+#include <Common/ThreadPool.h>
+#include <Common/setThreadName.h>
 #include <Common/logger_useful.h>
 
 #include "config.h"
@@ -155,6 +161,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool ttl_only_drop_parts;
     extern const MergeTreeSettingsBool vertical_merge_optimize_lightweight_delete;
     extern const MergeTreeSettingsBool vertical_merge_optimize_ttl_delete;
+    extern const MergeTreeSettingsUInt64 vertical_merge_max_parallel_columns;
     extern const MergeTreeSettingsUInt64Auto merge_max_dynamic_subcolumns_in_wide_part;
     extern const MergeTreeSettingsUInt64Auto merge_max_dynamic_subcolumns_in_compact_part;
     extern const MergeTreeSettingsMergeTreeSerializationInfoVersion serialization_info_version;
@@ -1986,6 +1993,20 @@ bool MergeTask::VerticalMergeStage::prepareVerticalMergeForAllColumns() const
     bool all_parts_on_remote_disks = std::ranges::all_of(global_ctx->future_part->parts, [](const auto & part) { return part->isStoredOnRemoteDisk(); });
     ctx->use_prefetch = all_parts_on_remote_disks && storage_settings[MergeTreeSetting::vertical_merge_remote_filesystem_prefetch];
 
+    /// Text indexes are built into one temporary storage while the columns are read, so a merge that builds them
+    /// writes its columns one after another. So does a merge into a remote disk, whose writes of one part may go through
+    /// one disk transaction.
+    size_t max_parallel_columns = storage_settings[MergeTreeSetting::vertical_merge_max_parallel_columns];
+    if (max_parallel_columns > 1
+        && global_ctx->gathering_columns.size() > 1
+        && global_ctx->new_data_part->getType() == MergeTreeDataPartType::Wide
+        && !global_ctx->new_data_part->isStoredOnRemoteDisk()
+        && global_ctx->text_indexes_to_merge.empty())
+    {
+        prepareParallelColumns(max_parallel_columns);
+        return false;
+    }
+
     if (ctx->use_prefetch && ctx->it_name_and_type != global_ctx->gathering_columns.end())
         ctx->prepared_pipeline = createPipelineForReadingOneColumn(ctx->it_name_and_type->name);
 
@@ -2326,6 +2347,324 @@ bool MergeTask::VerticalMergeStage::finalizeVerticalMergeForAllColumns() const
     return false;
 }
 
+struct MergeTask::VerticalMergeRuntimeContext::ParallelColumns
+{
+    /// The gathered columns, in the order of `gathering_columns`.
+    std::vector<NameAndTypePair> columns;
+    /// Indexes in `columns`. The columns of one group are written one after another by one thread, in their order:
+    /// they share the files of array offsets (the columns of one `Nested`), or they may write skip indexes into one
+    /// packed file. The heaviest group comes first, so that the merge does not end up waiting for it alone.
+    std::vector<std::vector<size_t>> groups;
+    size_t max_threads = 1;
+
+    /// Offset substreams written before the Vertical stage. Each group starts from a copy and adds the offsets it
+    /// writes itself, which no other group writes.
+    WrittenOffsetSubstreams written_offset_substreams_before;
+
+    /// Guards the members below, and every access of a writing thread to the shared state of the merge: building the
+    /// pipeline of a column, creating its writer, and adding the written column to the new part.
+    std::mutex mutex;
+    std::condition_variable column_done;
+    bool started = false;
+    size_t next_group = 0;
+    size_t columns_done = 0;
+    Float64 progress_done = 0;
+    std::exception_ptr exception;
+
+    std::atomic<bool> stop{false};
+    /// Started, joined and destroyed only by the thread that executes the merge, or by the destructor.
+    std::vector<ThreadFromGlobalPool> threads;
+
+    void stopAndJoin() noexcept
+    {
+        stop = true;
+        for (auto & thread : threads)
+            if (thread.joinable())
+                thread.join();
+        threads.clear();
+    }
+
+    ~ParallelColumns() { stopAndJoin(); }
+};
+
+MergeTask::VerticalMergeStage::~VerticalMergeStage()
+{
+    /// The writing threads use this stage, so they must finish before it is destroyed.
+    if (ctx && ctx->parallel_columns)
+        ctx->parallel_columns->stopAndJoin();
+}
+
+void MergeTask::VerticalMergeStage::prepareParallelColumns(size_t max_parallel_columns) const
+{
+    auto state = std::make_shared<VerticalMergeRuntimeContext::ParallelColumns>();
+    state->columns.assign(global_ctx->gathering_columns.begin(), global_ctx->gathering_columns.end());
+    state->written_offset_substreams_before = global_ctx->written_offset_substreams;
+
+    /// Union-find over the columns: the columns of one `Nested` share the files of their offsets, and all columns with
+    /// skip indexes to rebuild may write into the same packed file of skip indexes.
+    const size_t num_columns = state->columns.size();
+    std::vector<size_t> parent(num_columns);
+    for (size_t i = 0; i < num_columns; ++i)
+        parent[i] = i;
+
+    auto find = [&](size_t i)
+    {
+        while (parent[i] != i)
+        {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        return i;
+    };
+    auto unite = [&](size_t a, size_t b)
+    {
+        a = find(a);
+        b = find(b);
+        if (a != b)
+            parent[std::max(a, b)] = std::min(a, b);
+    };
+
+    std::unordered_map<String, size_t> first_column_of_nested;
+    std::optional<size_t> first_column_with_skip_indexes;
+    for (size_t i = 0; i < num_columns; ++i)
+    {
+        const auto & column = state->columns[i];
+        auto [it, inserted] = first_column_of_nested.emplace(Nested::extractTableName(column.getNameInStorage()), i);
+        if (!inserted)
+            unite(it->second, i);
+
+        if (global_ctx->skip_indexes_by_column.contains(column.name))
+        {
+            if (first_column_with_skip_indexes)
+                unite(*first_column_with_skip_indexes, i);
+            else
+                first_column_with_skip_indexes = i;
+        }
+    }
+
+    std::map<size_t, std::vector<size_t>> groups_by_root;
+    for (size_t i = 0; i < num_columns; ++i)
+        groups_by_root[find(i)].push_back(i);
+
+    std::vector<std::pair<Float64, std::vector<size_t>>> weighted_groups;
+    weighted_groups.reserve(groups_by_root.size());
+    for (auto & [root, group_columns] : groups_by_root)
+    {
+        Float64 weight = 0;
+        for (size_t i : group_columns)
+            weight += ctx->column_sizes->columnWeight(state->columns[i].name);
+        weighted_groups.emplace_back(weight, std::move(group_columns));
+    }
+
+    /// Stable, so that groups of equal weight keep the order of their first columns.
+    std::stable_sort(weighted_groups.begin(), weighted_groups.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    for (auto & [weight, group_columns] : weighted_groups)
+        state->groups.push_back(std::move(group_columns));
+
+    state->max_threads = std::min(max_parallel_columns, state->groups.size());
+    state->progress_done = global_ctx->merge_list_element_ptr->progress.load(std::memory_order_relaxed);
+
+    LOG_DEBUG(getLogger("VerticalMergeStage"), "Writing {} columns in {} groups with up to {} threads",
+        num_columns, state->groups.size(), state->max_threads);
+
+    ctx->parallel_columns = std::move(state);
+}
+
+bool MergeTask::VerticalMergeStage::executeVerticalMergeForColumnsInParallel() const
+{
+    auto & state = *ctx->parallel_columns;
+
+    if (!state.started)
+    {
+        state.started = true;
+        auto thread_group = CurrentThread::getGroup();
+        try
+        {
+            for (size_t i = 0; i < state.max_threads; ++i)
+                state.threads.emplace_back([this, thread_group] { writeColumnsInParallel(thread_group); });
+        }
+        catch (...)
+        {
+            /// The global thread pool is full: continue with the threads that did start.
+            if (state.threads.empty())
+                throw;
+            tryLogCurrentException(getLogger("VerticalMergeStage"), "Cannot start all threads to write columns");
+        }
+    }
+
+    const UInt64 step_time_ms
+        = (*global_ctx->data_settings)[MergeTreeSetting::background_task_preferred_step_execution_time_ms].totalMilliseconds();
+
+    bool all_done = false;
+    std::exception_ptr exception;
+    {
+        std::unique_lock lock(state.mutex);
+        state.column_done.wait_for(lock, std::chrono::milliseconds(std::max<UInt64>(step_time_ms, 1)), [&]
+        {
+            return state.exception || state.columns_done == state.columns.size();
+        });
+        exception = state.exception;
+        all_done = state.columns_done == state.columns.size();
+    }
+
+    if (!exception && !all_done && global_ctx->isCancelled())
+        exception = std::make_exception_ptr(Exception(ErrorCodes::ABORTED, "Cancelled merging parts"));
+
+    if (exception)
+    {
+        state.stopAndJoin();
+        std::rethrow_exception(exception);
+    }
+
+    if (!all_done)
+        return true;
+
+    state.stopAndJoin();
+    ctx->it_name_and_type = global_ctx->gathering_columns.cend();
+    return false;
+}
+
+void MergeTask::VerticalMergeStage::writeColumnsInParallel(ThreadGroupPtr thread_group) const
+{
+    ThreadGroupSwitcher switcher(thread_group, ThreadName::MERGE_MUTATE);
+    auto & state = *ctx->parallel_columns;
+
+    try
+    {
+        while (true)
+        {
+            size_t group_index;
+            {
+                std::lock_guard lock(state.mutex);
+                if (state.stop || state.exception || state.next_group == state.groups.size())
+                    return;
+                group_index = state.next_group++;
+            }
+
+            WrittenOffsetSubstreams written_offset_substreams = state.written_offset_substreams_before;
+            for (size_t column_index : state.groups[group_index])
+                writeOneColumnInParallel(column_index, written_offset_substreams);
+        }
+    }
+    catch (...)
+    {
+        std::lock_guard lock(state.mutex);
+        if (!state.exception)
+            state.exception = std::current_exception();
+        state.stop = true;
+        state.column_done.notify_all();
+    }
+}
+
+void MergeTask::VerticalMergeStage::writeOneColumnInParallel(size_t column_index, WrittenOffsetSubstreams & written_offset_substreams) const
+{
+    auto & state = *ctx->parallel_columns;
+    const auto & column = state.columns[column_index];
+    const Float64 column_weight = ctx->column_sizes->columnWeight(column.name);
+
+    auto check_cancelled = [&state, &my_ctx = *global_ctx]
+    {
+        if (state.stop)
+            throw Exception(ErrorCodes::ABORTED, "Cancelled merging parts");
+        my_ctx.checkOperationIsNotCanceled();
+    };
+
+    /// Declared before the pipeline, whose progress callback refers to them.
+    UInt64 watch_prev_elapsed = 0;
+    std::optional<MergeStageProgress> column_progress;
+
+    VerticalMergeRuntimeContext::PreparedColumnPipeline column_pipeline;
+    std::unique_ptr<MergedColumnOnlyOutputStream> column_to;
+    {
+        std::lock_guard lock(state.mutex);
+        column_progress.emplace(state.progress_done, column_weight);
+        column_pipeline = createPipelineForReadingOneColumn(column.name);
+        column_to = std::make_unique<MergedColumnOnlyOutputStream>(
+            global_ctx->new_data_part,
+            global_ctx->data_settings,
+            global_ctx->metadata_snapshot,
+            NamesAndTypesList{column},
+            column_pipeline.indexes_to_recalc,
+            global_ctx->compression_codec,
+            global_ctx->to->getIndexGranularity(),
+            global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed,
+            &written_offset_substreams,
+            /*try_adaptive_codec=*/ !global_ctx->is_explicit_recompression,
+            global_ctx->to->getSkipIndicesPackedWriter());
+    }
+
+    try
+    {
+        auto & pipeline = column_pipeline.pipeline;
+        pipeline.setProgressCallback(MergeProgressCallback(
+            global_ctx->merge_list_element_ptr, watch_prev_elapsed, *column_progress, check_cancelled));
+        pipeline.disableProfileEventUpdate();
+
+        size_t column_elems_written = 0;
+        {
+            PullingPipelineExecutor executor(pipeline);
+            Block block;
+            while (true)
+            {
+                check_cancelled();
+                if (!executor.pull(block))
+                    break;
+                column_elems_written += block.rows();
+                column_to->write(block);
+            }
+        }
+        check_cancelled();
+        throwIfPipelineCancelled(pipeline);
+
+        UInt64 rows = 0;
+        UInt64 bytes = 0;
+        pipeline.tryGetResultRowsAndBytes(rows, bytes);
+
+        {
+            std::lock_guard lock(state.mutex);
+            check_cancelled();
+
+            mergeBuiltStatistics(std::move(column_pipeline.build_statistics_transforms), global_ctx);
+
+            column_to->finalizeIndexGranularity();
+            auto changed_checksums = column_to->fillChecksums(global_ctx->new_data_part, global_ctx->new_data_part->checksums);
+            global_ctx->gathered_data.checksums.add(std::move(changed_checksums));
+
+            const auto & columns_substreams = column_to->getColumnsSubstreams();
+            global_ctx->gathered_data.columns_substreams = ColumnsSubstreams::merge(
+                global_ctx->gathered_data.columns_substreams, columns_substreams, global_ctx->new_data_part->getColumns().getNames());
+
+            auto cached_marks = column_to->releaseCachedMarks();
+            for (auto & [name, marks] : cached_marks)
+                global_ctx->cached_marks.emplace(name, std::move(marks));
+
+            auto cached_index_marks = column_to->releaseCachedIndexMarks();
+            for (auto & [name, marks] : cached_index_marks)
+                global_ctx->cached_index_marks.emplace(name, std::move(marks));
+
+            if (global_ctx->rows_written != column_elems_written)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Written {} elements of column {}, but {} rows of PK columns",
+                                column_elems_written, column.name, global_ctx->rows_written);
+
+            state.progress_done += column_weight;
+            global_ctx->merge_list_element_ptr->columns_written += 1;
+            global_ctx->merge_list_element_ptr->bytes_written_uncompressed += bytes;
+            global_ctx->merge_list_element_ptr->progress.store(state.progress_done, std::memory_order_relaxed);
+        }
+
+        column_to->finish(ctx->need_sync);
+    }
+    catch (...)
+    {
+        column_to->cancel();
+        throw;
+    }
+
+    std::lock_guard lock(state.mutex);
+    ++state.columns_done;
+    state.column_done.notify_all();
+}
+
 
 bool MergeTask::MergeProjectionsStage::prepareProjections() const
 {
@@ -2544,6 +2883,10 @@ bool MergeTask::VerticalMergeStage::execute()
 
 void MergeTask::VerticalMergeStage::cancel() noexcept
 {
+    /// Only signals the writing threads: they are joined by the thread that executes the merge, or by the destructor.
+    if (ctx->parallel_columns)
+        ctx->parallel_columns->stop = true;
+
     if (ctx->column_to)
         ctx->column_to->cancel();
 
@@ -2755,6 +3098,9 @@ bool MergeTask::VerticalMergeStage::executeVerticalMergeForAllColumns() const
     /// No need to execute this part if it is horizontal merge.
     if (global_ctx->chosen_merge_algorithm != MergeAlgorithm::Vertical)
         return false;
+
+    if (ctx->parallel_columns)
+        return executeVerticalMergeForColumnsInParallel();
 
     /// This is the external cycle condition
     if (ctx->it_name_and_type == global_ctx->gathering_columns.end())

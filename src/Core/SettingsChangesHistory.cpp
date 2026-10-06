@@ -1544,6 +1544,7 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
             {"max_table_size_bytes_compressed", 0, 0, "New setting to limit the total number of compressed bytes across all active and inactive data parts of the table."},
             {"max_table_size_bytes_uncompressed", 0, 0, "New setting to limit the total number of uncompressed bytes across all active and inactive data parts of the table."},
             {"object_shared_data_target_chunk_rows", 8192, 8192, "New setting"},
+            {"vertical_merge_max_parallel_columns", 1, 1, "New setting to write several columns of a Vertical merge at the same time"},
         });
 
         addSettingsChanges(merge_tree_settings_changes_history, "26.8",
