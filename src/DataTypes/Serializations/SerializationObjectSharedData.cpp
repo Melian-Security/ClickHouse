@@ -356,7 +356,6 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
     const std::vector<std::pair<std::string_view, ColumnPtr>> & flattened_paths,
     WriteBuffer & data_stream,
     ISerialization::SerializeBinaryBulkSettings & settings,
-    const DataTypePtr & dynamic_type_,
     const SerializationPtr & dynamic_serialization_,
     MergeTreeObjectSharedDataSerializationVersion nested_shared_data_version)
 {
@@ -393,6 +392,12 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
     ISerialization::StreamFileNameSettings stream_file_name_settings;
     stream_file_name_settings.escape_variant_substreams = false;
 
+    /// Substream names of a path are stored without the column name, so the name is empty. It is passed as a
+    /// string rather than as NameAndTypePair("", type): copying a type pointer is an atomic increment and decrement
+    /// of a reference counter shared by all threads that serialize this type, and the getter below is called
+    /// for every substream of every path of every granule.
+    const String empty_column_name;
+
     for (const auto & [path, path_column] : flattened_paths)
     {
         metadata.paths_substreams.emplace_back();
@@ -404,7 +409,7 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
             if (data_stream.offset() >= settings.min_compress_block_size)
                 data_stream.next();
             /// Add new substream and its mark for current path.
-            metadata.paths_substreams.back().push_back(ISerialization::getFileNameForStream(NameAndTypePair("", dynamic_type_), substream_path, stream_file_name_settings));
+            metadata.paths_substreams.back().push_back(ISerialization::getFileNameForStream(empty_column_name, substream_path, stream_file_name_settings));
             metadata.paths_substreams_marks.back().push_back(settings.stream_mark_getter(settings.path));
             return &data_stream;
         };
@@ -673,7 +678,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
 
             /// Serialize data and collect metadata, then write metadata substreams + structure suffix.
             auto & data_stream = getDataStream(settings);
-            auto metadata = serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_type, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED);
+            auto metadata = serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED);
             settings.path.pop_back();
             writeAllChunkBucketMetadata(metadata, settings);
 
@@ -764,7 +769,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                 {
                     auto flattened_paths = chunk_splitters[chunk_idx]->flattenBucket(bucket, dynamic_type);
 
-                    chunk_metadata.push_back(serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_type, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED));
+                    chunk_metadata.push_back(serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED));
                     /// flattened_paths goes out of scope here, freeing ColumnDynamic memory.
                 }
                 settings.path.pop_back();
@@ -888,7 +893,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
 
                     /// Serialize data and write metadata.
                     auto & data_stream = getDataStream(settings);
-                    auto metadata = serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_type, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED);
+                    auto metadata = serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED);
                     settings.path.pop_back();
                     writeAllChunkBucketMetadata(metadata, settings);
 
