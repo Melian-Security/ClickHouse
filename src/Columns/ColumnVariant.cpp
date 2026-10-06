@@ -1250,16 +1250,30 @@ ColumnPtr ColumnVariant::indexImpl(const PaddedPODArray<Type> & indexes, size_t 
         variant_indexes_data[i] = &assert_cast<ColumnUInt64 &>(*variant_indexes_columns[i]).getData();
     }
 
+    /// The new discriminators and offsets are filled in the same pass, so the offsets don't have to be
+    /// reconstructed from the discriminators afterwards.
+    auto new_local_discriminators = ColumnDiscriminators::create(limit);
+    auto & new_local_discriminators_data = new_local_discriminators->getData();
+    auto new_offsets = ColumnOffsets::create(limit);
+    auto & new_offsets_data = new_offsets->getData();
+
     const auto & local_discriminators_data = getLocalDiscriminators();
     const auto & offsets_data = getOffsets();
     for (size_t i = 0; i != limit; ++i)
     {
         auto discr = local_discriminators_data[indexes[i]];
-        if (discr != NULL_DISCRIMINATOR)
+        new_local_discriminators_data[i] = discr;
+        if (discr == NULL_DISCRIMINATOR)
+        {
+            new_offsets_data[i] = 0;
+        }
+        else
+        {
+            new_offsets_data[i] = variant_indexes_data[discr]->size();
             variant_indexes_data[discr]->push_back(offsets_data[indexes[i]]);
+        }
     }
 
-    ColumnPtr new_local_discriminators = assert_cast<const ColumnDiscriminators &>(*local_discriminators).indexImpl(indexes, limit);
     Columns new_variants;
     new_variants.reserve(num_variants);
     for (size_t i = 0; i != num_variants; ++i)
@@ -1271,7 +1285,7 @@ ColumnPtr ColumnVariant::indexImpl(const PaddedPODArray<Type> & indexes, size_t 
             new_variants.emplace_back(variants[i]->index(*variant_indexes_columns[i], 0));
     }
 
-    return ColumnVariant::create(new_local_discriminators, new_variants, local_to_global_discriminators);
+    return ColumnVariant::create(std::move(new_local_discriminators), std::move(new_offsets), new_variants, local_to_global_discriminators);
 }
 
 ColumnPtr ColumnVariant::replicate(const Offsets & replicate_offsets) const

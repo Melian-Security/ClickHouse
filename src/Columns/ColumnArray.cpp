@@ -1265,6 +1265,17 @@ ColumnPtr ColumnArray::indexImpl(const PaddedPODArray<T> & indexes, size_t limit
     if (limit == 0)
         return ColumnArray::create(data->cloneEmpty());
 
+    if (typeid_cast<const ColumnString *>(data.get()))
+        return indexString(indexes, limit);
+    if (typeid_cast<const ColumnTuple *>(data.get()))
+        return indexTuple(indexes, limit);
+
+    return indexGeneric(indexes, limit);
+}
+
+template <typename T>
+ColumnPtr ColumnArray::indexGeneric(const PaddedPODArray<T> & indexes, size_t limit) const
+{
     /// Convert indexes to UInt64 in case of overflow.
     auto nested_indexes_column = ColumnUInt64::create();
     PaddedPODArray<UInt64> & nested_indexes = nested_indexes_column->getData();
@@ -1288,6 +1299,81 @@ ColumnPtr ColumnArray::indexImpl(const PaddedPODArray<T> & indexes, size_t limit
         res->data = data->index(*nested_indexes_column, current_offset);
 
     return res;
+}
+
+template <typename T>
+ColumnPtr ColumnArray::indexString(const PaddedPODArray<T> & indexes, size_t limit) const
+{
+    /// The strings of one array are adjacent in the nested column, so each selected array is
+    /// copied with one memcpy of its characters instead of one copy per string.
+    const auto & src_string = assert_cast<const ColumnString &>(*data);
+    const ColumnString::Chars & src_chars = src_string.getChars();
+    const Offsets & src_string_offsets = src_string.getOffsets();
+    const Offsets & src_offsets = getOffsets();
+
+    size_t res_strings = 0;
+    size_t res_chars_size = 0;
+    for (size_t i = 0; i < limit; ++i)
+    {
+        size_t row = indexes[i];
+        /// `PaddedPODArray` has a zero at index -1, so an empty array and the first one need no branch.
+        res_strings += src_offsets[row] - src_offsets[row - 1];
+        res_chars_size += src_string_offsets[src_offsets[row] - 1] - src_string_offsets[src_offsets[row - 1] - 1];
+    }
+
+    auto res_string_column = ColumnString::create();
+    ColumnString::Chars & res_chars = res_string_column->getChars();
+    Offsets & res_string_offsets = res_string_column->getOffsets();
+    res_chars.resize_exact(res_chars_size);
+    res_string_offsets.resize_exact(res_strings);
+
+    auto res_offsets_column = ColumnOffsets::create(limit);
+    Offsets & res_offsets = res_offsets_column->getData();
+
+    size_t res_string_pos = 0;
+    size_t res_chars_pos = 0;
+    for (size_t i = 0; i < limit; ++i)
+    {
+        size_t row = indexes[i];
+        size_t src_begin = src_offsets[row - 1];
+        size_t src_end = src_offsets[row];
+        size_t src_chars_begin = src_string_offsets[src_begin - 1];
+        size_t chars_to_copy = src_string_offsets[src_end - 1] - src_chars_begin;
+
+        memcpySmallAllowReadWriteOverflow15(&res_chars[res_chars_pos], &src_chars[src_chars_begin], chars_to_copy);
+
+        for (size_t j = src_begin; j < src_end; ++j)
+            res_string_offsets[res_string_pos++] = src_string_offsets[j] - src_chars_begin + res_chars_pos;
+
+        res_chars_pos += chars_to_copy;
+        res_offsets[i] = res_string_pos;
+    }
+
+    return ColumnArray::create(std::move(res_string_column), std::move(res_offsets_column));
+}
+
+template <typename T>
+ColumnPtr ColumnArray::indexTuple(const PaddedPODArray<T> & indexes, size_t limit) const
+{
+    const ColumnTuple & tuple = assert_cast<const ColumnTuple &>(*data);
+    size_t tuple_size = tuple.tupleSize();
+    if (tuple_size == 0)
+        return indexGeneric(indexes, limit);
+
+    /// Index an array of each element of the Tuple separately, so that every element can take its own
+    /// specialized path, then put the elements back together.
+    Columns temporary_arrays(tuple_size);
+    for (size_t i = 0; i < tuple_size; ++i)
+        temporary_arrays[i] = ColumnArray(tuple.getColumns()[i]->assumeMutable(), getOffsetsPtr()->assumeMutable())
+                .indexImpl(indexes, limit);
+
+    Columns tuple_columns(tuple_size);
+    for (size_t i = 0; i < tuple_size; ++i)
+        tuple_columns[i] = assert_cast<const ColumnArray &>(*temporary_arrays[i]).getDataPtr();
+
+    return ColumnArray::create(
+        ColumnTuple::create(tuple_columns),
+        assert_cast<const ColumnArray &>(*temporary_arrays.front()).getOffsetsPtr());
 }
 
 INSTANTIATE_INDEX_IMPL(ColumnArray)
