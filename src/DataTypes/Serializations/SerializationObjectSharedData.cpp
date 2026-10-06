@@ -3,15 +3,24 @@
 #include <DataTypes/Serializations/SerializationObjectHelpers.h>
 #include <DataTypes/Serializations/SerializationArray.h>
 #include <DataTypes/Serializations/SerializationString.h>
+#include <DataTypes/Serializations/SerializationDynamic.h>
+#include <DataTypes/DataTypesBinaryEncoding.h>
+#include <DataTypes/DataTypeDynamic.h>
+#include <DataTypes/DataTypeVariant.h>
 #include <DataTypes/Serializations/getSubcolumnsDeserializationOrder.h>
 #include <DataTypes/DataTypeObject.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnTuple.h>
+#include <Columns/ColumnDynamic.h>
+#include <Columns/ColumnVariant.h>
 #include <Core/Defines.h>
 #include <Core/NamesAndTypes.h>
+#include <Formats/FormatSettings.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
+#include <IO/VarInt.h>
 #include <algorithm>
 #include <numeric>
 
@@ -99,8 +108,174 @@ void SerializationObjectSharedData::SerializationVersion::checkVersion(UInt64 ve
         throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid version for Object shared data serialization: {}", version);
 }
 
+namespace
+{
+
+/// A value in shared data is the binary encoding of its type followed by the value in the binary format of
+/// that type. For the types below the encoding is a single byte, and the binary format of a value is what
+/// the column of the type holds for it (the bytes of a number, or the size and the bytes of a string). So
+/// when all values of a path in a chunk have one such type, they are copied into a single column of that
+/// type instead of being read one by one into a Dynamic column, and the Dynamic structure of the path, which
+/// only depends on the type, is written directly.
+class SharedDataValueTypes
+{
+public:
+    struct Type
+    {
+        DataTypePtr type;
+        UInt8 encoded_type = 0;
+        /// The size of every value, or 0 for String.
+        size_t value_size = 0;
+        /// Serialization of the variant type of a Dynamic column holding only values of this type, created
+        /// the same way as the Dynamic serialization creates it.
+        SerializationPtr variant_serialization;
+        ColumnVariant::Discriminator discriminator = 0;
+        ColumnVariant::Discriminator shared_variant_discriminator = 0;
+    };
+
+    SharedDataValueTypes(const DataTypePtr & dynamic_type, const SerializationPtr & dynamic_serialization_)
+        : dynamic_serialization(typeid_cast<const SerializationDynamic *>(dynamic_serialization_.get()))
+    {
+        /// A Dynamic column that cannot hold any variant keeps every value in the shared variant.
+        const auto * dynamic_data_type = typeid_cast<const DataTypeDynamic *>(dynamic_type.get());
+        enabled = dynamic_serialization && dynamic_data_type && dynamic_data_type->getMaxDynamicTypes() > 0;
+
+        /// Reading a longer string into a Dynamic column throws, so such values are left to that path.
+        FormatSettings format_settings;
+        max_string_size = SerializationString::MAX_STRING_SIZE;
+        if (format_settings.binary.max_binary_string_size)
+            max_string_size = std::min<UInt64>(max_string_size, format_settings.binary.max_binary_string_size);
+    }
+
+    /// Build the Variant column of the Dynamic column of path `path_index`, or return nullptr if its values
+    /// cannot be copied: their types differ or are not supported, or a value is not exactly one value.
+    ColumnPtr tryCopyValues(
+        const SharedDataBucketsSplitter & buckets_splitter,
+        const SharedDataBucketsSplitter::BucketPaths & bucket_paths,
+        size_t path_index,
+        const Type *& result_type)
+    {
+        if (!enabled)
+            return nullptr;
+
+        const auto & values = buckets_splitter.getValuesColumn();
+        size_t begin = bucket_paths.occurrences_begin[path_index];
+        size_t end = bucket_paths.occurrences_begin[path_index + 1];
+        auto first_value = values.getDataAt(bucket_paths.values[begin]);
+        const Type * type = first_value.empty() ? nullptr : getType(static_cast<UInt8>(first_value[0]));
+        if (!type)
+            return nullptr;
+
+        auto column = type->type->createColumn();
+        column->reserve(end - begin);
+        if (type->value_size)
+        {
+            for (size_t i = begin; i != end; ++i)
+            {
+                auto value = values.getDataAt(bucket_paths.values[i]);
+                if (value.size() != 1 + type->value_size || static_cast<UInt8>(value[0]) != type->encoded_type)
+                    return nullptr;
+                column->insertData(value.data() + 1, type->value_size);
+            }
+        }
+        else
+        {
+            auto & column_string = assert_cast<ColumnString &>(*column);
+            for (size_t i = begin; i != end; ++i)
+            {
+                auto value = values.getDataAt(bucket_paths.values[i]);
+                if (value.empty() || static_cast<UInt8>(value[0]) != type->encoded_type)
+                    return nullptr;
+                const char * pos = value.data() + 1;
+                const char * value_end = value.data() + value.size();
+                UInt64 size = 0;
+                pos = readVarUInt(size, pos, value_end - pos);
+                if (size > max_string_size || size != static_cast<UInt64>(value_end - pos))
+                    return nullptr;
+                column_string.insertData(pos, size);
+            }
+        }
+
+        /// The values become variant `discriminator`; the rows where the path is absent are NULL.
+        size_t num_rows = buckets_splitter.getNumRows();
+        auto discriminators = ColumnVariant::ColumnDiscriminators::create(num_rows, ColumnVariant::NULL_DISCRIMINATOR);
+        auto offsets = ColumnVariant::ColumnOffsets::create(num_rows, 0);
+        auto & discriminators_data = discriminators->getData();
+        auto & offsets_data = offsets->getData();
+        for (size_t i = begin; i != end; ++i)
+        {
+            size_t row = bucket_paths.rows[i];
+            discriminators_data[row] = type->discriminator;
+            offsets_data[row] = i - begin;
+        }
+
+        MutableColumns variants(2);
+        variants[type->discriminator] = std::move(column);
+        variants[type->shared_variant_discriminator] = ColumnDynamic::getSharedVariantDataType()->createColumn();
+        result_type = type;
+        return ColumnVariant::create(std::move(discriminators), std::move(offsets), std::move(variants));
+    }
+
+private:
+    const Type * getType(UInt8 encoded_type)
+    {
+        if (!checked[encoded_type])
+        {
+            types[encoded_type] = createType(encoded_type);
+            checked[encoded_type] = true;
+        }
+        return types[encoded_type].get();
+    }
+
+    std::unique_ptr<Type> createType(UInt8 encoded_type) const
+    {
+        switch (static_cast<BinaryTypeIndex>(encoded_type))
+        {
+            case BinaryTypeIndex::UInt8:
+            case BinaryTypeIndex::UInt16:
+            case BinaryTypeIndex::UInt32:
+            case BinaryTypeIndex::UInt64:
+            case BinaryTypeIndex::Int8:
+            case BinaryTypeIndex::Int16:
+            case BinaryTypeIndex::Int32:
+            case BinaryTypeIndex::Int64:
+            case BinaryTypeIndex::Float32:
+            case BinaryTypeIndex::Float64:
+            case BinaryTypeIndex::Bool:
+            case BinaryTypeIndex::String:
+                break;
+            default:
+                return nullptr;
+        }
+
+        const char encoded_type_char = static_cast<char>(encoded_type);
+        ReadBufferFromMemory buf(&encoded_type_char, 1);
+        auto result = std::make_unique<Type>();
+        result->type = decodeDataType(buf);
+        result->encoded_type = encoded_type;
+        result->value_size = isString(result->type) ? 0 : result->type->getSizeOfValueInMemory();
+        /// ColumnDynamic::addNewVariant builds the variant type from the same two types.
+        auto variant_type = std::make_shared<DataTypeVariant>(DataTypes{result->type, ColumnDynamic::getSharedVariantDataType()});
+        result->variant_serialization = dynamic_serialization->createSerializationForType(variant_type);
+        result->discriminator = *variant_type->tryGetVariantDiscriminator(result->type->getName());
+        result->shared_variant_discriminator = *variant_type->tryGetVariantDiscriminator(ColumnDynamic::getSharedVariantTypeName());
+        return result;
+    }
+
+    const SerializationDynamic * dynamic_serialization;
+    bool enabled = false;
+    UInt64 max_string_size = 0;
+    /// Indexed by the encoded type; a null pointer means that values of this type are not copied.
+    std::array<std::unique_ptr<Type>, 256> types;
+    std::array<bool, 256> checked{};
+};
+
+}
+
 struct SerializeBinaryBulkStateObjectSharedData : public ISerialization::SerializeBinaryBulkState
 {
+    /// Kept for the whole part, so the types of shared data values are resolved once per part.
+    std::unique_ptr<SharedDataValueTypes> value_types;
     ISerialization::SerializeBinaryBulkStatePtr map_state;
     std::vector<ISerialization::SerializeBinaryBulkStatePtr> bucket_map_states;
 };
@@ -352,11 +527,40 @@ WriteBuffer & getCopyValuesStream(ISerialization::SerializeBinaryBulkSettings & 
     return *stream;
 }
 
+/// Write what SerializationDynamic writes, with the settings of `serializeChunkBucketData`, for a Dynamic
+/// column whose only variant besides the shared variant is `type`.
+void serializeSingleTypeDynamicColumn(
+    const SharedDataValueTypes::Type & type,
+    const IColumn & variant_column,
+    ISerialization::SerializeBinaryBulkSettings & settings)
+{
+    settings.path.push_back(ISerialization::Substream::DynamicStructure);
+    auto * structure_stream = settings.getter(settings.path);
+    settings.path.pop_back();
+    if (!structure_stream)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Missing stream for Dynamic column structure");
+
+    writeBinaryLittleEndian(static_cast<UInt64>(SerializationDynamic::SerializationVersion::V3), *structure_stream);
+    /// The number of dynamic types and the list of them; the shared variant is not listed.
+    writeVarUInt(1, *structure_stream);
+    encodeDataType(type.type, *structure_stream);
+
+    settings.path.push_back(ISerialization::Substream::DynamicData);
+    ISerialization::SerializeBinaryBulkStatePtr variant_state;
+    type.variant_serialization->serializeBinaryBulkStatePrefix(variant_column, settings, variant_state);
+    type.variant_serialization->serializeBinaryBulkWithMultipleStreams(variant_column, 0, 0, settings, variant_state);
+    type.variant_serialization->serializeBinaryBulkStateSuffix(settings, variant_state);
+    settings.path.pop_back();
+}
+
 ChunkBucketSerializationMetadata serializeChunkBucketData(
-    const std::vector<std::pair<std::string_view, ColumnPtr>> & flattened_paths,
+    const SharedDataBucketsSplitter & buckets_splitter,
+    const SharedDataBucketsSplitter::BucketPaths & bucket_paths,
     WriteBuffer & data_stream,
     ISerialization::SerializeBinaryBulkSettings & settings,
+    const DataTypePtr & dynamic_type_,
     const SerializationPtr & dynamic_serialization_,
+    SharedDataValueTypes & value_types,
     MergeTreeObjectSharedDataSerializationVersion nested_shared_data_version)
 {
     ChunkBucketSerializationMetadata metadata;
@@ -367,11 +571,13 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
     /// Remember the mark of the ObjectSharedDataData stream.
     metadata.data_stream_mark = settings.stream_mark_getter(settings.path);
 
-    metadata.paths_marks.reserve(flattened_paths.size());
-    metadata.paths_substreams.reserve(flattened_paths.size());
-    metadata.paths_substreams_marks.reserve(flattened_paths.size());
+    const size_t num_paths = bucket_paths.paths.size();
+    metadata.paths_marks.reserve(num_paths);
+    metadata.paths_substreams.reserve(num_paths);
+    metadata.paths_substreams_marks.reserve(num_paths);
 
     /// Configure serialization settings as in Compact part.
+    /// `serializeSingleTypeDynamicColumn` writes the Dynamic structure for exactly these settings.
     ISerialization::SerializeBinaryBulkSettings data_serialization_settings;
     data_serialization_settings.data_part_type = MergeTreeDataPartType::Compact;
     data_serialization_settings.position_independent_encoding = true;
@@ -398,28 +604,38 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
     /// for every substream of every path of every granule.
     const String empty_column_name;
 
-    for (const auto & [path, path_column] : flattened_paths)
+    data_serialization_settings.getter = [&](const ISerialization::SubstreamPath & substream_path) -> WriteBuffer *
+    {
+        /// New block per substream only once it's worth it: bounds a selective read's over-read
+        /// to min_compress_block_size while small substreams still share a block (good compression).
+        if (data_stream.offset() >= settings.min_compress_block_size)
+            data_stream.next();
+        /// Add new substream and its mark for current path.
+        metadata.paths_substreams.back().push_back(ISerialization::getFileNameForStream(empty_column_name, substream_path, stream_file_name_settings));
+        metadata.paths_substreams_marks.back().push_back(settings.stream_mark_getter(settings.path));
+        return &data_stream;
+    };
+
+    for (size_t path_index = 0; path_index != num_paths; ++path_index)
     {
         metadata.paths_substreams.emplace_back();
         metadata.paths_substreams_marks.emplace_back();
-        data_serialization_settings.getter = [&](const ISerialization::SubstreamPath & substream_path) -> WriteBuffer *
-        {
-            /// New block per substream only once it's worth it: bounds a selective read's over-read
-            /// to min_compress_block_size while small substreams still share a block (good compression).
-            if (data_stream.offset() >= settings.min_compress_block_size)
-                data_stream.next();
-            /// Add new substream and its mark for current path.
-            metadata.paths_substreams.back().push_back(ISerialization::getFileNameForStream(empty_column_name, substream_path, stream_file_name_settings));
-            metadata.paths_substreams_marks.back().push_back(settings.stream_mark_getter(settings.path));
-            return &data_stream;
-        };
 
-        ISerialization::SerializeBinaryBulkStatePtr path_state;
         /// Same at the path boundary.
         if (data_stream.offset() >= settings.min_compress_block_size)
             data_stream.next();
         /// Remember the mark of ObjectSharedDataData stream for this path before writing any data.
         metadata.paths_marks.push_back(settings.stream_mark_getter(settings.path));
+
+        const SharedDataValueTypes::Type * type = nullptr;
+        if (auto variant_column = value_types.tryCopyValues(buckets_splitter, bucket_paths, path_index, type))
+        {
+            serializeSingleTypeDynamicColumn(*type, *variant_column, data_serialization_settings);
+            continue;
+        }
+
+        auto path_column = buckets_splitter.flattenPath(bucket_paths, path_index, dynamic_type_);
+        ISerialization::SerializeBinaryBulkStatePtr path_state;
         dynamic_serialization_->serializeBinaryBulkStatePrefix(*path_column, data_serialization_settings, path_state);
         dynamic_serialization_->serializeBinaryBulkWithMultipleStreams(*path_column, 0, 0, data_serialization_settings, path_state);
         dynamic_serialization_->serializeBinaryBulkStateSuffix(data_serialization_settings, path_state);
@@ -624,6 +840,9 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
     ISerialization::SerializeBinaryBulkStatePtr & state) const
 {
     auto * shared_data_state = checkAndGetState<SerializeBinaryBulkStateObjectSharedData>(state);
+    if ((serialization_version.value == SerializationVersion::ADVANCED || serialization_version.value == SerializationVersion::ADVANCED_CHUNKED)
+        && !shared_data_state->value_types)
+        shared_data_state->value_types = std::make_unique<SharedDataValueTypes>(dynamic_type, dynamic_serialization);
 
     if (serialization_version.value == SerializationVersion::MAP)
     {
@@ -649,12 +868,12 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
         size_t end = limit && offset + limit < column.size() ? offset + limit : column.size();
 
         /// Process each bucket separately to limit peak memory —
-        /// only one bucket's ColumnDynamic columns are alive at a time.
+        /// only the column of one path is alive at a time.
         /// The splitter hashes each distinct path once instead of once per bucket.
         SharedDataBucketsSplitter buckets_splitter(column, offset, end, buckets);
-        for (size_t bucket = 0; bucket != buckets; ++bucket)
+                for (size_t bucket = 0; bucket != buckets; ++bucket)
         {
-            auto flattened_paths = buckets_splitter.flattenBucket(bucket, dynamic_type);
+            auto bucket_paths = buckets_splitter.getBucketPaths(bucket);
 
             settings.path.push_back(Substream::Bucket);
             settings.path.back().bucket = bucket;
@@ -672,13 +891,15 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                     "Got empty stream for shared data structure in SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams");
 
             writeVarUInt(end - offset, *structure_stream);
-            writeVarUInt(flattened_paths.size(), *structure_stream);
-            for (const auto & [path, _] : flattened_paths)
+            writeVarUInt(bucket_paths.paths.size(), *structure_stream);
+            for (const auto & path : bucket_paths.paths)
                 writeStringBinary(path, *structure_stream);
 
             /// Serialize data and collect metadata, then write metadata substreams + structure suffix.
             auto & data_stream = getDataStream(settings);
-            auto metadata = serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED);
+            auto metadata = serializeChunkBucketData(
+                buckets_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types,
+                MergeTreeObjectSharedDataSerializationVersion::ADVANCED);
             settings.path.pop_back();
             writeAllChunkBucketMetadata(metadata, settings);
 
@@ -767,10 +988,11 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                 auto & data_stream = getDataStream(settings);
                 for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
                 {
-                    auto flattened_paths = chunk_splitters[chunk_idx]->flattenBucket(bucket, dynamic_type);
-
-                    chunk_metadata.push_back(serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED));
-                    /// flattened_paths goes out of scope here, freeing ColumnDynamic memory.
+                    const auto & chunk_splitter = *chunk_splitters[chunk_idx];
+                    auto bucket_paths = chunk_splitter.getBucketPaths(bucket);
+                    chunk_metadata.push_back(serializeChunkBucketData(
+                        chunk_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types,
+                        MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED));
                 }
                 settings.path.pop_back();
 
@@ -871,7 +1093,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
 
                 for (size_t bucket = 0; bucket != buckets; ++bucket)
                 {
-                    auto flattened_paths = buckets_splitter.flattenBucket(bucket, dynamic_type);
+                    auto bucket_paths = buckets_splitter.getBucketPaths(bucket);
 
                     settings.path.push_back(Substream::Bucket);
                     settings.path.back().bucket = bucket;
@@ -887,18 +1109,19 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                             "Got empty stream for shared data structure in ADVANCED_CHUNKED Wide serialization");
 
                     writeVarUInt(chunk_end - chunk_start, *structure_stream);
-                    writeVarUInt(flattened_paths.size(), *structure_stream);
-                    for (const auto & [path, _] : flattened_paths)
+                    writeVarUInt(bucket_paths.paths.size(), *structure_stream);
+                    for (const auto & path : bucket_paths.paths)
                         writeStringBinary(path, *structure_stream);
 
                     /// Serialize data and write metadata.
                     auto & data_stream = getDataStream(settings);
-                    auto metadata = serializeChunkBucketData(flattened_paths, data_stream, settings, dynamic_serialization, MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED);
+                    auto metadata = serializeChunkBucketData(
+                        buckets_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types,
+                        MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED);
                     settings.path.pop_back();
                     writeAllChunkBucketMetadata(metadata, settings);
 
                     settings.path.pop_back();
-                    /// flattened_paths goes out of scope here, freeing ColumnDynamic memory.
                 }
 
                 /// Write Copy section for this chunk.

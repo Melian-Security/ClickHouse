@@ -257,60 +257,85 @@ std::vector<std::string_view> SharedDataBucketsSplitter::getBucketPathNames(size
     return result;
 }
 
-std::vector<std::pair<std::string_view, ColumnPtr>> SharedDataBucketsSplitter::flattenBucket(size_t bucket, const DataTypePtr & dynamic_type) const
+SharedDataBucketsSplitter::BucketPaths SharedDataBucketsSplitter::getBucketPaths(size_t bucket) const
 {
     const auto [shared_data_paths, shared_data_values, shared_data_offsets] = ColumnObject::getSharedDataPathsValuesAndOffsets(shared_data_column);
 
-    /// Collect values of the paths belonging to this bucket into separate columns. Each column is
-    /// densified to have a value for every row (a default where the path is absent). Gaps are backfilled
-    /// with a single bulk insertManyDefaults right before storing a real value (and once at the end).
-    /// Columns are addressed by the dense path id assigned in the constructor, so no path is hashed here.
+    BucketPaths result;
     const auto & unique_ids = bucket_unique_paths[bucket];
     if (unique_ids.empty())
-        return {};
+        return result;
 
-    MutableColumns columns;
-    columns.reserve(unique_ids.size());
+    /// Paths are addressed by their position among the distinct paths of the bucket (first-seen order) and
+    /// written in sorted order, so `sorted_index` maps one to the other.
+    std::vector<UInt32> order(unique_ids.size());
     for (size_t local = 0; local != unique_ids.size(); ++local)
-        columns.push_back(dynamic_type->createColumn());
-    /// Most paths keep one type across rows, so each column remembers the type of its last value.
-    std::vector<ColumnObject::SharedDataValueTypeCache> type_caches(unique_ids.size());
+        order[local] = static_cast<UInt32>(local);
+    std::sort(order.begin(), order.end(), [&](UInt32 lhs, UInt32 rhs) { return id_to_path[unique_ids[lhs]] < id_to_path[unique_ids[rhs]]; });
+    std::vector<UInt32> sorted_index(unique_ids.size());
+    result.paths.reserve(unique_ids.size());
+    for (size_t i = 0; i != order.size(); ++i)
+    {
+        sorted_index[order[i]] = static_cast<UInt32>(i);
+        result.paths.push_back(id_to_path[unique_ids[order[i]]]);
+    }
 
-    /// Visit only this bucket's occurrences (ascending), tracking the row each one belongs to.
+    const size_t bucket_begin = bucket_occurrences_begin[bucket];
+    const size_t bucket_end = bucket_occurrences_begin[bucket + 1];
+
+    /// Counting sort of the occurrences by path, stable so each path keeps its rows ascending.
+    result.occurrences_begin.assign(unique_ids.size() + 1, 0);
+    for (size_t position = bucket_begin; position != bucket_end; ++position)
+        ++result.occurrences_begin[sorted_index[id_to_bucket_position[path_ids[bucket_occurrences[position]]]] + 1];
+    for (size_t i = 0; i != unique_ids.size(); ++i)
+        result.occurrences_begin[i + 1] += result.occurrences_begin[i];
+
+    std::vector<size_t> next(result.occurrences_begin.begin(), result.occurrences_begin.end() - 1);
+    result.rows.resize(bucket_end - bucket_begin);
+    result.values.resize(bucket_end - bucket_begin);
     const size_t first_occurrence = (*shared_data_offsets)[ssize_t(start) - 1];
     size_t row = start;
-    for (size_t position = bucket_occurrences_begin[bucket]; position != bucket_occurrences_begin[bucket + 1]; ++position)
+    for (size_t position = bucket_begin; position != bucket_end; ++position)
     {
         size_t occurrence = bucket_occurrences[position];
         size_t j = first_occurrence + occurrence;
         while ((*shared_data_offsets)[ssize_t(row)] <= j)
             ++row;
 
-        size_t local = id_to_bucket_position[path_ids[occurrence]];
-        auto & column = columns[local];
-        /// Backfill defaults for the rows where this path was absent, up to the current row.
-        size_t row_in_range = row - start;
-        if (column->size() < row_in_range)
-            column->insertManyDefaults(row_in_range - column->size());
-
-        ColumnObject::deserializeValueFromSharedData(shared_data_values, j, assert_cast<ColumnDynamic &>(*column), type_caches[local]);
+        size_t index = next[sorted_index[id_to_bucket_position[path_ids[occurrence]]]]++;
+        result.rows[index] = row - start;
+        result.values[index] = j;
     }
 
-    /// Backfill defaults for the trailing rows where each path was absent.
-    size_t num_rows = end - start;
-    std::vector<std::pair<std::string_view, ColumnPtr>> result;
-    result.reserve(unique_ids.size());
-    for (size_t local = 0; local != unique_ids.size(); ++local)
-    {
-        auto & column = columns[local];
-        if (column->size() < num_rows)
-            column->insertManyDefaults(num_rows - column->size());
-        result.emplace_back(id_to_path[unique_ids[local]], std::move(column));
-    }
-
-    /// Keep paths sorted for consistency.
-    std::sort(result.begin(), result.end());
     return result;
+}
+
+MutableColumnPtr SharedDataBucketsSplitter::flattenPath(const BucketPaths & bucket_paths, size_t path_index, const DataTypePtr & dynamic_type) const
+{
+    const auto * shared_data_values = &getValuesColumn();
+    auto column = dynamic_type->createColumn();
+    auto & dynamic_column = assert_cast<ColumnDynamic &>(*column);
+    /// Most paths keep one type across rows, so the column remembers the type of its last value.
+    ColumnObject::SharedDataValueTypeCache type_cache;
+    for (size_t i = bucket_paths.occurrences_begin[path_index]; i != bucket_paths.occurrences_begin[path_index + 1]; ++i)
+    {
+        /// Backfill defaults for the rows where this path was absent, up to the current row.
+        size_t row = bucket_paths.rows[i];
+        if (column->size() < row)
+            column->insertManyDefaults(row - column->size());
+        ColumnObject::deserializeValueFromSharedData(shared_data_values, bucket_paths.values[i], dynamic_column, type_cache);
+    }
+
+    /// Backfill defaults for the trailing rows where the path was absent.
+    size_t num_rows = end - start;
+    if (column->size() < num_rows)
+        column->insertManyDefaults(num_rows - column->size());
+    return column;
+}
+
+const ColumnString & SharedDataBucketsSplitter::getValuesColumn() const
+{
+    return *std::get<1>(ColumnObject::getSharedDataPathsValuesAndOffsets(shared_data_column));
 }
 
 void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn & shared_data_column, const String * paths_prefix)

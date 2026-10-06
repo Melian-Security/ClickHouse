@@ -48,7 +48,8 @@ size_t getSharedDataPathBucket(std::string_view path, size_t num_buckets);
 /// serializes/frees one bucket at a time. Two output shapes are supported, both driven by the same
 /// bucket assignment:
 ///   - `extractBucket` returns a shared data column for one bucket (used by MAP_WITH_BUCKETS);
-///   - `flattenBucket` returns the flattened per-path columns for one bucket (used by ADVANCED).
+///   - `getBucketPaths` groups the occurrences of one bucket by path and `flattenPath` builds the column
+///     of one of its paths (used by ADVANCED).
 /// Every distinct path gets a dense id and its bucket is hashed once per distinct path in the constructor,
 /// so no call hashes a path again, and per-bucket sizes are precomputed so each `extractBucket` column is
 /// allocated exactly (avoiding power-of-two over-allocation). `createPathsIndexes` builds the paths
@@ -61,14 +62,33 @@ public:
     /// Build the shared data column for a single bucket.
     ColumnPtr extractBucket(size_t bucket) const;
 
-    /// Flatten the paths of a single bucket into separate per-path columns, each densified to one value
-    /// per row (the stored value where the path is present, a default where it is absent), sorted by path.
-    /// IMPORTANT: returned string_views reference path data inside the shared data column, which must
-    /// stay alive while the result is used.
-    std::vector<std::pair<std::string_view, ColumnPtr>> flattenBucket(size_t bucket, const DataTypePtr & dynamic_type) const;
+    /// The path occurrences of a single bucket grouped by path, with the paths sorted.
+    struct BucketPaths
+    {
+        /// IMPORTANT: string_views reference path data inside the shared data column.
+        std::vector<std::string_view> paths;
+        /// The occurrences of `paths[i]` are [occurrences_begin[i], occurrences_begin[i + 1]) in `rows` and `values`.
+        std::vector<size_t> occurrences_begin;
+        /// The row of each occurrence relative to `start`, ascending within a path.
+        PODArray<UInt64> rows;
+        /// The position of each occurrence's value in the shared data values column.
+        PODArray<UInt64> values;
+    };
+
+    /// Group the path occurrences of a single bucket by path, without reading any value.
+    BucketPaths getBucketPaths(size_t bucket) const;
+
+    /// Flatten one path of `bucket_paths` into a separate column with one value per row: the stored value
+    /// where the path is present and a default where it is absent.
+    MutableColumnPtr flattenPath(const BucketPaths & bucket_paths, size_t path_index, const DataTypePtr & dynamic_type) const;
+
+    size_t getNumRows() const { return end - start; }
+
+    /// The shared data values column the occurrences of `BucketPaths` refer to.
+    const ColumnString & getValuesColumn() const;
 
     /// Sorted unique path names of a single bucket, without materializing any value column. Returns the
-    /// same list as the paths of `flattenBucket`.
+    /// same list as `getBucketPaths`.
     /// IMPORTANT: returned string_views reference path data inside the shared data column.
     std::vector<std::string_view> getBucketPathNames(size_t bucket) const;
 
@@ -96,7 +116,7 @@ private:
     std::vector<std::vector<UInt32>> bucket_unique_paths;
     /// Occurrence indexes (positions in `path_ids`) grouped by bucket and ascending within a bucket: the
     /// occurrences of bucket `b` are [bucket_occurrences_begin[b], bucket_occurrences_begin[b + 1]).
-    /// Lets `flattenBucket` visit only its own occurrences instead of scanning all of them per bucket.
+    /// Lets `getBucketPaths` visit only its own occurrences instead of scanning all of them per bucket.
     PODArray<UInt64> bucket_occurrences;
     std::vector<size_t> bucket_occurrences_begin;
 };
