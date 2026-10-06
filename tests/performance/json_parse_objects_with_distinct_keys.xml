@@ -1,0 +1,20 @@
+<test>
+    <!-- Parsing JSON text whose objects have distinct keys (small and large objects, several nesting
+         levels) and whose values are strings, integers, floats and booleans, into dynamic paths and
+         into shared data. -->
+    <create_query>
+        CREATE TABLE json_src (s String) ENGINE = Memory
+    </create_query>
+    <fill_query>
+        INSERT INTO json_src SELECT concat(
+            '{"a":{"b":', toString(number % 100), ',"c":"s', toString(number), '","d":', if(number % 2, 'true', 'false'), ',"e":', toString(number / 7), '},',
+            '"f":{', arrayStringConcat(arrayMap(i -> concat('"k', toString(i), '":"v', toString(number % (i + 3)), '"'), range(12)), ','), '},',
+            '"g":{"h":{"i":', toString(number), ',"j":"', toString(number % 1000), '"}},"l":[1,2,3]}')
+        FROM numbers(300000)
+    </fill_query>
+
+    <query>SELECT s::JSON(max_dynamic_paths=64) FROM json_src FORMAT Null</query>
+    <query>SELECT s::JSON(max_dynamic_paths=0) FROM json_src FORMAT Null</query>
+
+    <drop_query>DROP TABLE IF EXISTS json_src</drop_query>
+</test>

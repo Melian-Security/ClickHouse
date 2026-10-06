@@ -23,6 +23,7 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Common/StringHashForHeterogeneousLookup.h>
+#include <base/StringViewHash.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVariant.h>
 #include <Columns/ColumnVector.h>
@@ -2122,13 +2123,33 @@ private:
 
         if (element.isObject() && (skip_typed_path_check || typed_path_it == typed_path_infos.end() || (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object && hasTypedPathWithPrefix(current_path + "."))))
         {
+            const auto object = element.getObject();
+            const size_t current_path_size = current_path.size();
+
+            /// Objects almost never repeat a key. When all keys are distinct, the per-key bookkeeping below
+            /// admits every key once with its own element type and never skips typed path checks, so the
+            /// keys can be visited directly in their original order.
+            if (!mayHaveDuplicateKeys(object))
+            {
+                for (auto [key, value] : object)
+                {
+                    current_path.resize(current_path_size);
+                    appendChildPath(current_path, key, insert_settings, is_root);
+                    if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false))
+                        return false;
+                }
+
+                current_path.resize(current_path_size);
+                return true;
+            }
+
             /// First pass: collect the set of distinct element types (LITERAL/OBJECT) per key.
             /// This lets us detect all duplicates upfront so we can:
             ///  - throw errors immediately for invalid duplicates (before any data is inserted),
             ///  - handle both orderings of literal+object duplicates in the main loop
             ///    (e.g. {"a":42,"a":{"b":42}} and {"a":{"b":42},"a":42} are both valid).
             std::unordered_map<std::string_view, KeyTypes> key_element_types;
-            for (auto [key, value] : element.getObject())
+            for (auto [key, value] : object)
             {
                 auto value_element_type = getJSONElementType(value);
                 auto & types = key_element_types[key];
@@ -2180,8 +2201,7 @@ private:
             /// Second pass: process each key-value pair in original order.
             /// All invalid duplicates have already been rejected in the first pass,
             /// so here we only need to skip already-processed (key, type) combinations.
-            const size_t current_path_size = current_path.size();
-            for (auto [key, value] : element.getObject())
+            for (auto [key, value] : object)
             {
                 current_path.resize(current_path_size);
                 appendChildPath(current_path, key, insert_settings, is_root);
@@ -2296,6 +2316,51 @@ private:
         return true;
     }
 
+    /// Returns false only if all keys of the object are distinct. May return true for an object with distinct keys.
+    static bool mayHaveDuplicateKeys(const typename JSONParser::Object & object)
+    {
+        const size_t size = object.size();
+        if (size < 2)
+            return false;
+
+        /// Small objects: compare every pair of keys.
+        static constexpr size_t max_keys_to_compare_pairwise = 8;
+        if (size > max_keys_to_compare_pairwise)
+            return mayHaveDuplicateKeyHashes(object);
+
+        std::array<std::string_view, max_keys_to_compare_pairwise> keys;
+        size_t num_keys = 0;
+        for (auto [key, _] : object)
+        {
+            if (num_keys == keys.size())
+                return true;
+            for (size_t i = 0; i != num_keys; ++i)
+            {
+                if (keys[i] == key)
+                    return true;
+            }
+            keys[num_keys++] = key;
+        }
+        return false;
+    }
+
+    /// Looks for equal key hashes. Equal hashes of distinct keys only send the object to the exact duplicate check.
+    /// Not inlined, so that the buffer of hashes is not part of the stack frame of the recursive traversal.
+    static NO_INLINE bool mayHaveDuplicateKeyHashes(const typename JSONParser::Object & object)
+    {
+        static constexpr size_t max_keys_to_hash = 128;
+        std::array<UInt64, max_keys_to_hash> hashes;
+        size_t num_keys = 0;
+        for (auto [key, _] : object)
+        {
+            if (num_keys == hashes.size())
+                return true;
+            hashes[num_keys++] = StringViewHash()(key);
+        }
+        std::sort(hashes.begin(), hashes.begin() + num_keys);
+        return std::adjacent_find(hashes.begin(), hashes.begin() + num_keys) != hashes.begin() + num_keys;
+    }
+
     /// Build the full path for a child key within the current object.
     String buildChildPath(const String & current_path, std::string_view key, const JSONExtractInsertSettings & insert_settings, bool is_root) const
     {
@@ -2376,9 +2441,9 @@ private:
         {
             case ElementType::BOOL:
             {
-                if (variant_info.variant_name_to_discriminator.contains("Bool") || column_dynamic.addNewVariant(getDataTypesCache().getType("Bool"), "Bool"))
+                if (auto discr = findOrAddVariant(column_dynamic, "Bool"))
                 {
-                    insertValueIntoNumericVariant<ColumnUInt8, UInt8>(variant_info, variant_column, element.getBool(), "Bool");
+                    insertValueIntoNumericVariant<ColumnUInt8, UInt8>(variant_column, element.getBool(), *discr);
                     return true;
                 }
 
@@ -2386,9 +2451,9 @@ private:
             }
             case ElementType::INT64:
             {
-                if (variant_info.variant_name_to_discriminator.contains("Int64") || column_dynamic.addNewVariant(getDataTypesCache().getType("Int64"), "Int64"))
+                if (auto discr = findOrAddVariant(column_dynamic, "Int64"))
                 {
-                    insertValueIntoNumericVariant<ColumnInt64, Int64>(variant_info, variant_column, element.getInt64(), "Int64");
+                    insertValueIntoNumericVariant<ColumnInt64, Int64>(variant_column, element.getInt64(), *discr);
                     return true;
                 }
 
@@ -2396,9 +2461,9 @@ private:
             }
             case ElementType::UINT64:
             {
-                if (variant_info.variant_name_to_discriminator.contains("UInt64") || column_dynamic.addNewVariant(getDataTypesCache().getType("UInt64"), "UInt64"))
+                if (auto discr = findOrAddVariant(column_dynamic, "UInt64"))
                 {
-                    insertValueIntoNumericVariant<ColumnUInt64, UInt64>(variant_info, variant_column, element.getUInt64(), "UInt64");
+                    insertValueIntoNumericVariant<ColumnUInt64, UInt64>(variant_column, element.getUInt64(), *discr);
                     return true;
                 }
 
@@ -2406,9 +2471,9 @@ private:
             }
             case ElementType::DOUBLE:
             {
-                if (variant_info.variant_name_to_discriminator.contains("Float64") || column_dynamic.addNewVariant(getDataTypesCache().getType("Float64"), "Float64"))
+                if (auto discr = findOrAddVariant(column_dynamic, "Float64"))
                 {
-                    insertValueIntoNumericVariant<ColumnFloat64, Float64>(variant_info, variant_column, element.getDouble(), "Float64");
+                    insertValueIntoNumericVariant<ColumnFloat64, Float64>(variant_column, element.getDouble(), *discr);
                     return true;
                 }
 
@@ -2422,9 +2487,9 @@ private:
                 /// If inference is disabled, just insert String.
                 if (!format_settings.try_infer_dates && !format_settings.try_infer_datetimes)
                 {
-                    if (variant_info.variant_name_to_discriminator.contains("String") || column_dynamic.addNewVariant(getDataTypesCache().getType("String"), "String"))
+                    if (auto discr = findOrAddVariant(column_dynamic, "String"))
                     {
-                        insertValueIntoStringVariant(variant_column, data, variant_info.variant_name_to_discriminator.at("String"));
+                        insertValueIntoStringVariant(variant_column, data, *discr);
                         return true;
                     }
                 }
@@ -2432,39 +2497,39 @@ private:
                 /// In most cases data is consistent and the same path contains the same type of values.
                 /// So for Date/DateTime/DateTime64 we check if variant info already has these types and try
                 /// to parse data from string into existing variant.
-                if (auto it = variant_info.variant_name_to_discriminator.find("Date"); it != variant_info.variant_name_to_discriminator.end())
+                if (auto discr = findVariant(variant_info, "Date"))
                 {
                     DayNum date;
                     if (tryInferDateFromString(data, date))
                     {
-                        insertValueIntoNumericVariant<ColumnDate, DayNum>(variant_info, variant_column, date, "Date");
+                        insertValueIntoNumericVariant<ColumnDate, DayNum>(variant_column, date, *discr);
                         return true;
                     }
                 }
 
-                if (auto it = variant_info.variant_name_to_discriminator.find("DateTime"); it != variant_info.variant_name_to_discriminator.end())
+                if (auto discr = findVariant(variant_info, "DateTime"))
                 {
                     time_t value = 0;
                     if (tryInferDateTimeFromString(data, value, format_settings, time_zone_for_schema_inference, utc_time_zone_for_schema_inference))
                     {
-                        insertValueIntoNumericVariant<ColumnDateTime, UInt32>(variant_info, variant_column, static_cast<UInt32>(value), "DateTime");
+                        insertValueIntoNumericVariant<ColumnDateTime, UInt32>(variant_column, static_cast<UInt32>(value), *discr);
                         return true;
                     }
                 }
 
-                if (auto it = variant_info.variant_name_to_discriminator.find("DateTime64(9)"); it != variant_info.variant_name_to_discriminator.end())
+                if (auto discr = findVariant(variant_info, "DateTime64(9)"))
                 {
                     DateTime64 value;
                     if (tryInferDateTime64FromString(data, value, format_settings, time_zone_for_schema_inference, utc_time_zone_for_schema_inference))
                     {
-                        insertValueIntoNumericVariant<ColumnDateTime64, DateTime64>(variant_info, variant_column, value, "DateTime64(9)");
+                        insertValueIntoNumericVariant<ColumnDateTime64, DateTime64>(variant_column, value, *discr);
                         return true;
                     }
                 }
 
-                if (auto it = variant_info.variant_name_to_discriminator.find("String"); it != variant_info.variant_name_to_discriminator.end())
+                if (auto discr = findVariant(variant_info, "String"))
                 {
-                    insertValueIntoStringVariant(variant_column, data, it->second);
+                    insertValueIntoStringVariant(variant_column, data, *discr);
                     return true;
                 }
 
@@ -2481,29 +2546,30 @@ private:
     {
         /// Fast track where we process simple data types explicitly and serialize them into
         /// shared data without inserting value into Dynamic column with subsequent binary serialization.
+        /// Simple types are taken from the thread-local cache by index, which needs no lookup by name.
         switch (element.type())
         {
             case ElementType::BOOL:
             {
-                encodeDataType(getDataTypesCache().getType("Bool"), buf);
+                encodeDataType(getSimpleDataTypesCache().getElement(BinaryTypeIndex::Bool).type, buf);
                 writeBinary(element.getBool(), buf);
                 return true;
             }
             case ElementType::INT64:
             {
-                encodeDataType(getDataTypesCache().getType("Int64"), buf);
+                encodeDataType(getSimpleDataTypesCache().getElement(BinaryTypeIndex::Int64).type, buf);
                 writeBinaryLittleEndian(element.getInt64(), buf);
                 return true;
             }
             case ElementType::UINT64:
             {
-                encodeDataType(getDataTypesCache().getType("UInt64"), buf);
+                encodeDataType(getSimpleDataTypesCache().getElement(BinaryTypeIndex::UInt64).type, buf);
                 writeBinaryLittleEndian(element.getUInt64(), buf);
                 return true;
             }
             case ElementType::DOUBLE:
             {
-                encodeDataType(getDataTypesCache().getType("Float64"), buf);
+                encodeDataType(getSimpleDataTypesCache().getElement(BinaryTypeIndex::Float64).type, buf);
                 writeBinaryLittleEndian(element.getDouble(), buf);
                 return true;
             }
@@ -2513,7 +2579,7 @@ private:
 
                 if (!format_settings.try_infer_dates && !format_settings.try_infer_datetimes)
                 {
-                    encodeDataType(getDataTypesCache().getType("String"), buf);
+                    encodeDataType(getSimpleDataTypesCache().getElement(BinaryTypeIndex::String).type, buf);
                     writeStringBinary(data, buf);
                     return true;
                 }
@@ -2523,7 +2589,7 @@ private:
                     DayNum date;
                     if (tryInferDateFromString(data, date))
                     {
-                        encodeDataType(getDataTypesCache().getType("Date"), buf);
+                        encodeDataType(getSimpleDataTypesCache().getElement(BinaryTypeIndex::Date).type, buf);
                         writeBinaryLittleEndian(static_cast<UInt16>(date), buf);
                         return true;
                     }
@@ -2551,7 +2617,7 @@ private:
                     }
                 }
 
-                encodeDataType(getDataTypesCache().getType("String"), buf);
+                encodeDataType(getSimpleDataTypesCache().getElement(BinaryTypeIndex::String).type, buf);
                 writeStringBinary(data, buf);
                 return true;
             }
@@ -2578,10 +2644,45 @@ private:
         return false;
     }
 
-    template <typename ColumnType, typename ElementType>
-    void insertValueIntoNumericVariant(const ColumnDynamic::VariantInfo & variant_info, ColumnVariant & variant_column, ElementType value, const String & type_name) const
+    /// Global discriminator of the variant named `name`, if the Dynamic column has it.
+    /// A Dynamic column usually has a handful of variants, and comparing the names is cheaper than
+    /// building a String and hashing it for a lookup in `variant_name_to_discriminator`.
+    static std::optional<ColumnVariant::Discriminator> findVariant(const ColumnDynamic::VariantInfo & variant_info, std::string_view name)
     {
-        auto global_discr = variant_info.variant_name_to_discriminator.at(type_name);
+        static constexpr size_t max_variants_to_scan = 16;
+        const auto & variant_names = variant_info.variant_names;
+        if (variant_names.size() > max_variants_to_scan)
+        {
+            auto it = variant_info.variant_name_to_discriminator.find(String(name));
+            if (it == variant_info.variant_name_to_discriminator.end())
+                return std::nullopt;
+            return it->second;
+        }
+
+        for (size_t i = 0; i != variant_names.size(); ++i)
+        {
+            if (variant_names[i] == name)
+                return static_cast<ColumnVariant::Discriminator>(i);
+        }
+        return std::nullopt;
+    }
+
+    /// Global discriminator of the simple type variant named `type_name`. Adds the variant if the column
+    /// does not have it yet; returns nothing if it cannot be added.
+    static std::optional<ColumnVariant::Discriminator> findOrAddVariant(ColumnDynamic & column_dynamic, std::string_view type_name)
+    {
+        if (auto discr = findVariant(column_dynamic.getVariantInfo(), type_name))
+            return discr;
+
+        const String name(type_name);
+        if (!column_dynamic.addNewVariant(getDataTypesCache().getType(name), name))
+            return std::nullopt;
+        return findVariant(column_dynamic.getVariantInfo(), type_name);
+    }
+
+    template <typename ColumnType, typename ElementType>
+    void insertValueIntoNumericVariant(ColumnVariant & variant_column, ElementType value, ColumnVariant::Discriminator global_discr) const
+    {
         auto & variant = variant_column.getVariantByGlobalDiscriminator(global_discr);
         assert_cast<ColumnType &>(variant).insertValue(value);
         variant_column.getOffsets().push_back(variant.size() - 1);
