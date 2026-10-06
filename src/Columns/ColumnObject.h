@@ -137,6 +137,10 @@ public:
     void insertDefault() override;
     void insertManyDefaults(size_t length) override;
 
+    /// Rows are gathered from a few source columns, so the mapping of source paths to our paths is
+    /// resolved once per source column instead of once per inserted row or range.
+    void gather(ColumnGathererStream & gatherer) override;
+
     void popBack(size_t n) override;
 
     std::string_view serializeValueIntoArena(size_t n, Arena & arena, char const *& begin, const IColumn::SerializationSettings * settings) const override;
@@ -396,8 +400,18 @@ public:
     };
 
 private:
+    /// Source dynamic paths that have to be inserted into our shared data, with their columns, sorted by path.
+    using DynamicPathsForSharedData = VectorWithMemoryTracking<std::pair<std::string_view, const ColumnDynamic *>>;
 
-    void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, VectorWithMemoryTracking<std::string_view> && src_dynamic_paths_for_shared_data, size_t start, size_t length);
+    struct GatherSourcePlan;
+    struct GatherState;
+
+    /// Returns how to insert rows of src into this column, resolving it again if our dynamic paths changed.
+    const GatherSourcePlan & getGatherSourcePlan(const ColumnObject & src);
+    void insertRangeFromWithPlan(const GatherSourcePlan & plan, const ColumnObject & src, size_t start, size_t length);
+    static void sortDynamicPathsForSharedData(DynamicPathsForSharedData & paths);
+
+    void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length);
     void serializePathAndValueIntoArena(Arena & arena, const char *& begin, std::string_view path, std::string_view value, std::string_view & res) const;
     void serializeDynamicPathsAndSharedDataIntoArena(size_t n, Arena & arena, const char *& begin, std::string_view & res) const;
     void deserializeDynamicPathsAndSharedDataFromArena(ReadBuffer & in);
@@ -448,6 +462,9 @@ private:
     /// Statistics on the number of non-null values for each dynamic path and for some shared data paths in the MergeTree data part.
     /// Calculated during serializing of data part in MergeTree. Used to determine the set of dynamic paths for the merged part.
     StatisticsPtr statistics;
+
+    /// Set only while `gather` runs. Not copied with the column.
+    GatherState * gather_state = nullptr;
 };
 
 }
