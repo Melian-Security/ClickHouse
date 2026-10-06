@@ -9,7 +9,10 @@ namespace DB
 
 struct StreamNameAndMark
 {
-    String stream_name;
+    /// The stream the mark is written to, and the array the mark is cached in (if marks of the column are cached).
+    /// Both are owned by the writer and outlive the marks it keeps.
+    MergeTreeWriterStream * stream = nullptr;
+    MarksInCompressedFile::PlainArray * cached_marks = nullptr;
     MarkInCompressedFile mark{};
 };
 
@@ -127,6 +130,35 @@ private:
         const WrittenOffsetSubstreams & offset_substreams) const;
     const String & getStreamName(const NameAndTypePair & column, const ISerialization::SubstreamPath & substream_path) const;
 
+    /// A stream of a column together with its name (possibly replaced to a hash).
+    struct StreamEntry
+    {
+        const String * stream_name = nullptr;
+        MergeTreeWriterStream * stream = nullptr;
+        MarksInCompressedFile::PlainArray * cached_marks = nullptr;
+    };
+
+    /// Returns the stream of a substream of a column, or nullptr if it is an offsets stream that has been written before
+    /// (not using this object). Unlike resolving the stream name and looking it up in column_streams, it does a single
+    /// hash lookup by the full stream name, and does not need the disk to decide whether the name is replaced to a hash.
+    const StreamEntry * getStream(const NameAndTypePair & column, const ISerialization::SubstreamPath & substream_path) const;
+
+    /// A non-ephemeral substream of a column, in the order the serialization enumerates them.
+    struct ColumnSubstream
+    {
+        /// nullptr if it is an offsets stream that has been written before (not using this object).
+        const StreamEntry * stream = nullptr;
+        bool is_offsets = false;
+    };
+    using ColumnSubstreams = std::vector<ColumnSubstream>;
+
+    /// The streams are enumerated with the column from block_sample, which does not change after the first block,
+    /// so the list of substreams of a column and their streams are resolved once and reused for every granule.
+    const ColumnSubstreams & getColumnSubstreams(const NameAndTypePair & name_and_type);
+
+    /// Whether an offsets substream is not written by this column, because it has been written already.
+    bool isOffsetsWrittenBefore(const ColumnSubstream & substream, const WrittenOffsetSubstreams & offset_substreams) const;
+
     using SerializationState = ISerialization::SerializeBinaryBulkStatePtr;
     using SerializationStates = std::unordered_map<String, SerializationState>;
 
@@ -137,9 +169,11 @@ private:
 
     /// Some long column names may be replaced to hashes.
     /// Below are mapping from original stream name to actual
-    /// stream name (probably hash of the stream) and vice versa.
-    std::unordered_map<String, String> full_name_to_stream_name;
+    /// stream (whose name is probably the hash of the original name) and from actual stream name to original stream name.
+    std::unordered_map<String, StreamEntry> full_name_to_stream;
     std::unordered_map<String, String> stream_name_to_full_name;
+
+    std::unordered_map<String, ColumnSubstreams> column_substreams_cache;
 
     /// Non written marks to disk (for each column). Waiting until all rows for
     /// this marks will be written to disk.
