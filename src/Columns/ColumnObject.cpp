@@ -1114,9 +1114,12 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             {
                 if (auto it = gather_state->dynamic_column_index.find(path); it != gather_state->dynamic_column_index.end())
                 {
-                    const auto * column = gather_state->dynamic_columns[it->second];
-                    if (column->size() != current_size)
+                    /// Dynamic paths are filled with defaults lazily while gathering, see below.
+                    auto * column = gather_state->dynamic_columns[it->second];
+                    if (column->size() > current_size)
                         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path {}: {} != {}", path, column->size(), current_size);
+                    if (column->size() < current_size)
+                        column->insertManyDefaults(current_size - column->size());
 
                     /// Deserialize binary value into dynamic column from shared data.
                     gather_state->deserializeValue(src_shared_data_values, i, it->second);
@@ -1167,21 +1170,24 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
         shared_data_offsets.push_back(shared_data_paths->size());
 
         /// Insert default value in all remaining dynamic paths.
-        if (gather_state)
-        {
-            for (auto * column : gather_state->dynamic_columns)
-            {
-                if (column->size() == current_size)
-                    column->insertDefault();
-            }
-        }
-        else
+        /// While gathering, a dynamic path is filled with defaults only before its next value and after the range.
+        if (!gather_state)
         {
             for (auto & [_, column] : dynamic_paths_ptrs)
             {
                 if (column->size() == current_size)
                     column->insertDefault();
             }
+        }
+    }
+
+    if (gather_state)
+    {
+        size_t new_size = shared_data_offsets.size();
+        for (auto * column : gather_state->dynamic_columns)
+        {
+            if (column->size() < new_size)
+                column->insertManyDefaults(new_size - column->size());
         }
     }
 }
