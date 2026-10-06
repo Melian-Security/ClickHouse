@@ -407,8 +407,11 @@ private:
     struct GatherState;
 
     /// Returns how to insert rows of src into this column, resolving it again if our dynamic paths changed.
-    const GatherSourcePlan & getGatherSourcePlan(const ColumnObject & src);
-    void insertRangeFromWithPlan(const GatherSourcePlan & plan, const ColumnObject & src, size_t start, size_t length);
+    GatherSourcePlan & getGatherSourcePlan(const ColumnObject & src);
+    void insertRangeFromWithPlan(GatherSourcePlan & plan, const ColumnObject & src, size_t start, size_t length);
+    /// Inserts the ranges of rows of a ColumnGathererStream batch path by path.
+    template <typename Ranges>
+    void insertGatheredRanges(const Ranges & ranges);
     static void sortDynamicPathsForSharedData(DynamicPathsForSharedData & paths);
 
     void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length);

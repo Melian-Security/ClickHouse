@@ -450,6 +450,42 @@ void ColumnDynamic::doInsertFrom(const IColumn & src_, size_t n)
         src_offset);
 }
 
+void ColumnDynamic::insertFromWithCache(const ColumnDynamic & src, size_t n, InsertFromCache & cache)
+{
+    if (cache.num_variants != variant_info.variant_names.size())
+    {
+        cache.num_variants = variant_info.variant_names.size();
+        /// The condition of the fast path in insertFrom.
+        cache.insert_variant_directly = variant_info.variant_name == src.variant_info.variant_name
+            && (src.getSharedVariant().empty() || !canAddNewVariant());
+        cache.src_shared_variant_discriminator = src.getSharedVariantDiscriminator();
+        cache.global_discriminators_mapping = nullptr;
+    }
+
+    if (cache.insert_variant_directly)
+    {
+        variant_column_ptr->insertFrom(*src.variant_column, n);
+        return;
+    }
+
+    /// Values from the shared variant of src, and values of src whose variants cannot be combined with ours,
+    /// take the general path.
+    if (src.getVariantColumn().globalDiscriminatorAt(n) != cache.src_shared_variant_discriminator)
+    {
+        /// combineVariants returns the mapping it cached for the variants of src, which stays valid until our variants change.
+        if (!cache.global_discriminators_mapping)
+            cache.global_discriminators_mapping = combineVariants(src.variant_info);
+
+        if (cache.global_discriminators_mapping)
+        {
+            getVariantColumn().insertFrom(*src.variant_column, n, *cache.global_discriminators_mapping);
+            return;
+        }
+    }
+
+    insertFrom(src, n);
+}
+
 #if !defined(DEBUG_OR_SANITIZER_BUILD)
 void ColumnDynamic::insertRangeFrom(const IColumn & src_, size_t start, size_t length)
 #else

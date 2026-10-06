@@ -787,9 +787,19 @@ struct ColumnObject::GatherSourcePlan
     /// to this column or lower its limit on dynamic paths.
     size_t num_dynamic_paths = 0;
     size_t max_dynamic_paths = 0;
-    /// Pairs (our column, source column).
+    /// Pairs (our column, source column), in the order of our typed paths.
     VectorWithMemoryTracking<std::pair<IColumn *, const IColumn *>> typed_paths;
-    VectorWithMemoryTracking<std::pair<ColumnDynamic *, const ColumnDynamic *>> dynamic_paths;
+
+    struct DynamicPath
+    {
+        ColumnDynamic * column;
+        const ColumnDynamic * src_column;
+        std::string_view path;
+        ColumnDynamic::InsertFromCache cache;
+    };
+    VectorWithMemoryTracking<DynamicPath> dynamic_paths;
+    /// For each of GatherState::dynamic_columns, its index in dynamic_paths, or -1 if the source has no such dynamic path.
+    VectorWithMemoryTracking<ssize_t> dynamic_path_by_column;
     /// Source dynamic paths we have no dynamic path for.
     DynamicPathsForSharedData dynamic_paths_for_shared_data;
     /// Our dynamic paths are full and equal to the source ones, so shared data is copied as is.
@@ -814,6 +824,21 @@ struct ColumnObject::GatherState
     VectorWithMemoryTracking<SharedDataValueTypeCache> type_caches;
     VectorWithMemoryTracking<size_t> type_cache_num_variants;
 
+    /// While a batch of ranges is inserted path by path, the values that source shared data has for our dynamic
+    /// paths are collected first, for each of dynamic_columns in the order of rows, and inserted afterwards.
+    struct ValueFromSharedData
+    {
+        /// Our row the value goes to.
+        size_t row;
+        const ColumnString * src_shared_data_values;
+        size_t n;
+    };
+    bool collect_values_from_shared_data = false;
+    VectorWithMemoryTracking<VectorWithMemoryTracking<ValueFromSharedData>> values_from_shared_data;
+
+    /// The plan of each range of the batch.
+    VectorWithMemoryTracking<GatherSourcePlan *> range_plans;
+
     void updateDynamicColumns(const PathToDynamicColumnPtrMap & object_dynamic_paths)
     {
         if (num_dynamic_paths == object_dynamic_paths.size())
@@ -828,6 +853,7 @@ struct ColumnObject::GatherState
         }
         type_caches.assign(dynamic_columns.size(), SharedDataValueTypeCache{});
         type_cache_num_variants.assign(dynamic_columns.size(), 0);
+        values_from_shared_data.resize(dynamic_columns.size());
         num_dynamic_paths = object_dynamic_paths.size();
     }
 
@@ -849,10 +875,17 @@ void ColumnObject::gather(ColumnGathererStream & gatherer)
     GatherState state;
     gather_state = &state;
     SCOPE_EXIT({ gather_state = nullptr; });
-    gatherer.gather(*this);
+
+    /// When no dynamic paths can be added, as in merges, where the structure of the result is chosen in advance,
+    /// rows from all sources can be inserted path by path: each path column still gets the same values in the
+    /// same order, and popBack of the last inserted rows restores the previous state.
+    if (canAddNewDynamicPath())
+        gatherer.gather(*this);
+    else
+        gatherer.gatherInBatches(*this, [this](const auto & ranges) { insertGatheredRanges(ranges); });
 }
 
-const ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnObject & src)
+ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnObject & src)
 {
     auto & state = *gather_state;
     if (state.last_source != &src)
@@ -866,13 +899,16 @@ const ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const C
         return plan;
 
     /// Resolve paths the same way insertFrom does without a plan, adding new dynamic paths while we can.
+    /// Typed paths are the same in both columns. They are listed in our order, so that the plans of all sources agree.
+    if (src.typed_paths.size() != typed_paths.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Different number of typed paths in the source and destination Object columns: {} != {}", src.typed_paths.size(), typed_paths.size());
     plan.typed_paths.clear();
-    for (const auto & [path, column] : src.typed_paths)
+    for (auto & [path, column] : typed_paths)
     {
-        auto it = typed_paths.find(path);
-        if (it == typed_paths.end())
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Typed path {} is missing in the destination Object column", path);
-        plan.typed_paths.emplace_back(it->second.get(), column.get());
+        auto it = src.typed_paths.find(path);
+        if (it == src.typed_paths.end())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Typed path {} is missing in the source Object column", path);
+        plan.typed_paths.emplace_back(column.get(), it->second.get());
     }
 
     plan.dynamic_paths.clear();
@@ -881,13 +917,18 @@ const ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const C
     {
         const auto * src_dynamic_column = assert_cast<const ColumnDynamic *>(column.get());
         if (auto it = dynamic_paths_ptrs.find(path); it != dynamic_paths_ptrs.end())
-            plan.dynamic_paths.emplace_back(it->second, src_dynamic_column);
+            plan.dynamic_paths.push_back({it->second, src_dynamic_column, path, {}});
         else if (auto * dynamic_path_column = tryToAddNewDynamicPath(path))
-            plan.dynamic_paths.emplace_back(dynamic_path_column, src_dynamic_column);
+            plan.dynamic_paths.push_back({dynamic_path_column, src_dynamic_column, path, {}});
         else
             plan.dynamic_paths_for_shared_data.emplace_back(path, src_dynamic_column);
     }
     sortDynamicPathsForSharedData(plan.dynamic_paths_for_shared_data);
+
+    state.updateDynamicColumns(dynamic_paths_ptrs);
+    plan.dynamic_path_by_column.assign(state.dynamic_columns.size(), -1);
+    for (size_t i = 0; i != plan.dynamic_paths.size(); ++i)
+        plan.dynamic_path_by_column[state.dynamic_column_index.at(plan.dynamic_paths[i].path)] = static_cast<ssize_t>(i);
 
     plan.insert_shared_data_directly = !canAddNewDynamicPath() && sorted_dynamic_paths == src.sorted_dynamic_paths;
     plan.num_dynamic_paths = dynamic_paths.size();
@@ -896,14 +937,14 @@ const ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const C
     return plan;
 }
 
-void ColumnObject::insertRangeFromWithPlan(const GatherSourcePlan & plan, const ColumnObject & src, size_t start, size_t length)
+void ColumnObject::insertRangeFromWithPlan(GatherSourcePlan & plan, const ColumnObject & src, size_t start, size_t length)
 {
     if (length == 1)
     {
         for (const auto & [column, src_column] : plan.typed_paths)
             column->insertFrom(*src_column, start);
-        for (const auto & [column, src_column] : plan.dynamic_paths)
-            column->insertFrom(*src_column, start);
+        for (auto & dynamic_path : plan.dynamic_paths)
+            dynamic_path.column->insertFromWithCache(*dynamic_path.src_column, start, dynamic_path.cache);
         if (plan.insert_shared_data_directly)
             shared_data->insertFrom(*src.shared_data, start);
     }
@@ -911,14 +952,108 @@ void ColumnObject::insertRangeFromWithPlan(const GatherSourcePlan & plan, const 
     {
         for (const auto & [column, src_column] : plan.typed_paths)
             column->insertRangeFrom(*src_column, start, length);
-        for (const auto & [column, src_column] : plan.dynamic_paths)
-            column->insertRangeFrom(*src_column, start, length);
+        for (const auto & dynamic_path : plan.dynamic_paths)
+            dynamic_path.column->insertRangeFrom(*dynamic_path.src_column, start, length);
         if (plan.insert_shared_data_directly)
             shared_data->insertRangeFrom(*src.shared_data, start, length);
     }
 
     if (!plan.insert_shared_data_directly)
         insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, start, length);
+}
+
+template <typename Ranges>
+void ColumnObject::insertGatheredRanges(const Ranges & ranges)
+{
+    auto & state = *gather_state;
+    auto & plans = state.range_plans;
+    plans.clear();
+    for (const auto & range : ranges)
+    {
+        const auto & src = assert_cast<const ColumnObject &>(*range.column);
+        takeMaxDynamicPathsUpperBoundFrom(src);
+        plans.push_back(&getGatherSourcePlan(src));
+    }
+
+    /// Typed paths, one at a time.
+    for (size_t i = 0; i != typed_paths.size(); ++i)
+    {
+        IColumn & column = *plans.front()->typed_paths[i].first;
+        for (size_t r = 0; r != ranges.size(); ++r)
+        {
+            const auto & range = ranges[r];
+            const IColumn & src_column = *plans[r]->typed_paths[i].second;
+            if (range.length == 1)
+                column.insertFrom(src_column, range.start);
+            else
+                column.insertRangeFrom(src_column, range.start, range.length);
+        }
+    }
+
+    /// Shared data, row by row. Values for our dynamic paths found in source shared data are collected.
+    state.updateDynamicColumns(dynamic_paths_ptrs);
+    for (auto & values : state.values_from_shared_data)
+        values.clear();
+
+    size_t start_row = shared_data->size();
+    state.collect_values_from_shared_data = true;
+    for (size_t r = 0; r != ranges.size(); ++r)
+    {
+        const auto & range = ranges[r];
+        const auto & plan = *plans[r];
+        const auto & src = assert_cast<const ColumnObject &>(*range.column);
+        if (!plan.insert_shared_data_directly)
+            insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, range.start, range.length);
+        else if (range.length == 1)
+            shared_data->insertFrom(*src.shared_data, range.start);
+        else
+            shared_data->insertRangeFrom(*src.shared_data, range.start, range.length);
+    }
+    state.collect_values_from_shared_data = false;
+    size_t end_row = shared_data->size();
+
+    /// Dynamic paths, one at a time: values from source dynamic paths and from source shared data in the order
+    /// of rows, and defaults for the rows without a value.
+    for (size_t i = 0; i != state.dynamic_columns.size(); ++i)
+    {
+        ColumnDynamic & column = *state.dynamic_columns[i];
+        const auto & values = state.values_from_shared_data[i];
+        auto value_it = values.begin();
+        size_t row = start_row;
+        for (size_t r = 0; r != ranges.size(); ++r)
+        {
+            const auto & range = ranges[r];
+            size_t range_end_row = row + range.length;
+            if (ssize_t index = plans[r]->dynamic_path_by_column[i]; index != -1)
+            {
+                if (value_it != values.end() && value_it->row < range_end_row)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Path {} is both a dynamic path and in shared data of the source Object column", plans[r]->dynamic_paths[index].path);
+
+                auto & dynamic_path = plans[r]->dynamic_paths[index];
+                if (column.size() < row)
+                    column.insertManyDefaults(row - column.size());
+                if (range.length == 1)
+                    column.insertFromWithCache(*dynamic_path.src_column, range.start, dynamic_path.cache);
+                else
+                    column.insertRangeFrom(*dynamic_path.src_column, range.start, range.length);
+            }
+            else
+            {
+                for (; value_it != values.end() && value_it->row < range_end_row; ++value_it)
+                {
+                    if (column.size() < value_it->row)
+                        column.insertManyDefaults(value_it->row - column.size());
+                    state.deserializeValue(value_it->src_shared_data_values, value_it->n, i);
+                }
+            }
+            row = range_end_row;
+        }
+
+        if (column.size() < end_row)
+            column.insertManyDefaults(end_row - column.size());
+        if (column.size() != end_row)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path column: {} != {}", column.size(), end_row);
+    }
 }
 
 void ColumnObject::sortDynamicPathsForSharedData(DynamicPathsForSharedData & paths)
@@ -1077,10 +1212,13 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
         /// Insert default values in all remaining dynamic paths.
         if (gather_state)
         {
-            for (auto * column : gather_state->dynamic_columns)
+            if (!gather_state->collect_values_from_shared_data)
             {
-                if (column->size() == current_size)
-                    column->insertManyDefaults(length);
+                for (auto * column : gather_state->dynamic_columns)
+                {
+                    if (column->size() == current_size)
+                        column->insertManyDefaults(length);
+                }
             }
         }
         else
@@ -1114,6 +1252,12 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             {
                 if (auto it = gather_state->dynamic_column_index.find(path); it != gather_state->dynamic_column_index.end())
                 {
+                    if (gather_state->collect_values_from_shared_data)
+                    {
+                        gather_state->values_from_shared_data[it->second].push_back({current_size, src_shared_data_values, i});
+                        continue;
+                    }
+
                     /// Dynamic paths are filled with defaults lazily while gathering, see below.
                     auto * column = gather_state->dynamic_columns[it->second];
                     if (column->size() > current_size)
@@ -1181,7 +1325,7 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
         }
     }
 
-    if (gather_state)
+    if (gather_state && !gather_state->collect_values_from_shared_data)
     {
         size_t new_size = shared_data_offsets.size();
         for (auto * column : gather_state->dynamic_columns)
