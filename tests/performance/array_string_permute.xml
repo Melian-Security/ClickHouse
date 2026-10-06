@@ -1,0 +1,26 @@
+<test>
+    <settings>
+        <max_threads>1</max_threads>
+        <max_insert_threads>1</max_insert_threads>
+    </settings>
+
+    <create_query>CREATE TABLE t_array_permute_src (key UInt64, s Array(String), t Array(Tuple(String, String)), m Map(String, String)) ENGINE = Memory</create_query>
+    <create_query>CREATE TABLE t_array_permute_dst (key UInt64, s Array(String), t Array(Tuple(String, String)), m Map(String, String)) ENGINE = MergeTree ORDER BY key</create_query>
+
+    <fill_query>
+        INSERT INTO t_array_permute_src
+        SELECT
+            cityHash64(number),
+            arrayMap(x -> concat('value_', toString(number % 1000 + x)), range(number % 50)),
+            arrayMap(x -> (concat('path.', toString(x)), toString(number + x)), range(number % 50)),
+            mapFromArrays(arrayMap(x -> concat('key_', toString(x)), range(number % 20)), arrayMap(x -> toString(number * x), range(number % 20)))
+        FROM numbers(1000000)
+    </fill_query>
+
+    <query>SELECT s FROM t_array_permute_src ORDER BY key LIMIT 100000 FORMAT Null</query>
+    <query>SELECT t FROM t_array_permute_src ORDER BY key LIMIT 100000 FORMAT Null</query>
+    <query>INSERT INTO t_array_permute_dst SELECT * FROM t_array_permute_src</query>
+
+    <drop_query>DROP TABLE IF EXISTS t_array_permute_src</drop_query>
+    <drop_query>DROP TABLE IF EXISTS t_array_permute_dst</drop_query>
+</test>

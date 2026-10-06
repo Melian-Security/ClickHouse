@@ -261,6 +261,14 @@ private:
     ColumnPtr filterNullable(const Filter & filt, ssize_t result_size_hint) const;
     ColumnPtr filterGeneric(const Filter & filt, ssize_t result_size_hint) const;
 
+    /// Specializations for the index function.
+    template <typename T>
+    ColumnPtr indexString(const PaddedPODArray<T> & indexes, size_t limit) const;
+    template <typename T>
+    ColumnPtr indexTuple(const PaddedPODArray<T> & indexes, size_t limit) const;
+    template <typename T>
+    ColumnPtr indexGeneric(const PaddedPODArray<T> & indexes, size_t limit) const;
+
     template <typename T>
     void filterNumber(const Filter & filt);
 
