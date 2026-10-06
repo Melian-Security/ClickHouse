@@ -66,7 +66,9 @@
 #include <Common/JemallocMergeTreeArena.h>
 #include <Common/Logger.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ProfileEventsScope.h>
 #include <Common/CurrentThread.h>
+#include <Common/ThreadStatus.h>
 #include <Common/ThreadGroupSwitcher.h>
 #include <Common/ThreadPool.h>
 #include <Common/setThreadName.h>
@@ -2374,6 +2376,9 @@ struct MergeTask::VerticalMergeRuntimeContext::ParallelColumns
     std::atomic<bool> stop{false};
     /// Started, joined and destroyed only by the thread that executes the merge, or by the destructor.
     std::vector<ThreadFromGlobalPool> threads;
+    /// The profile events of each writing thread. They reach the thread group of the merge as they happen, and are added
+    /// to the profile events of the merge thread after the threads are joined, so that `system.part_log` shows the whole merge.
+    std::vector<std::unique_ptr<ProfileEvents::Counters>> thread_counters;
 
     void stopAndJoin() noexcept
     {
@@ -2481,7 +2486,10 @@ bool MergeTask::VerticalMergeStage::executeVerticalMergeForColumnsInParallel() c
         try
         {
             for (size_t i = 0; i < state.max_threads; ++i)
-                state.threads.emplace_back([this, thread_group] { writeColumnsInParallel(thread_group); });
+            {
+                auto * counters = state.thread_counters.emplace_back(std::make_unique<ProfileEvents::Counters>()).get();
+                state.threads.emplace_back([this, thread_group, counters] { writeColumnsInParallel(thread_group, counters); });
+            }
         }
         catch (...)
         {
@@ -2520,12 +2528,32 @@ bool MergeTask::VerticalMergeStage::executeVerticalMergeForColumnsInParallel() c
         return true;
 
     state.stopAndJoin();
+
+    /// The merge thread counts its profile events in a scope that becomes the profile events of `system.part_log`. Add the
+    /// events of the writing threads to that scope only: they have already reached the thread group and the global counters.
+    auto & thread_status = CurrentThread::get();
+    ProfileEvents::Counters * scope = thread_status.current_performance_counters;
+    if (scope && scope != &thread_status.performance_counters)
+    {
+        scope->setParent(nullptr);
+        for (const auto & counters : state.thread_counters)
+        {
+            auto snapshot = counters->getPartiallyAtomicSnapshot();
+            for (ProfileEvents::Event event = ProfileEvents::Event(0), end = ProfileEvents::end(); event < end; ++event)
+                if (auto value = snapshot[event])
+                    scope->incrementNoTrace(event, value);
+        }
+        scope->setParent(&thread_status.performance_counters);
+    }
+
     ctx->it_name_and_type = global_ctx->gathering_columns.cend();
     return false;
 }
 
-void MergeTask::VerticalMergeStage::writeColumnsInParallel(ThreadGroupPtr thread_group) const
+void MergeTask::VerticalMergeStage::writeColumnsInParallel(ThreadGroupPtr thread_group, ProfileEvents::Counters * thread_counters) const
 {
+    /// Outlives the switcher, which adds the CPU time of the thread to the current counters when it detaches the thread.
+    ProfileEventsScope profile_events_scope(thread_counters);
     ThreadGroupSwitcher switcher(thread_group, ThreadName::MERGE_MUTATE);
     auto & state = *ctx->parallel_columns;
 

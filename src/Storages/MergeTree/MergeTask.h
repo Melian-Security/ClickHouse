@@ -499,7 +499,7 @@ private:
 
         void prepareParallelColumns(size_t max_parallel_columns) const;
         bool executeVerticalMergeForColumnsInParallel() const;
-        void writeColumnsInParallel(ThreadGroupPtr thread_group) const;
+        void writeColumnsInParallel(ThreadGroupPtr thread_group, ProfileEvents::Counters * thread_counters) const;
         void writeOneColumnInParallel(size_t column_index, WrittenOffsetSubstreams & written_offset_substreams) const;
 
         VerticalMergeRuntimeContextPtr ctx;
