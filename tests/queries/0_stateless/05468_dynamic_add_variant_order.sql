@@ -11,7 +11,7 @@ CREATE TABLE test_dynamic_add_variant (id UInt64, d Dynamic) ENGINE = Memory;
 INSERT INTO test_dynamic_add_variant SELECT 1, 'abc'::String;
 INSERT INTO test_dynamic_add_variant VALUES
     (2, 'b'::String), (3, 42::Int64), (4, [1, 2]::Array(Int64)), (5, 'c'::String), (6, 3.5::Float64),
-    (7, toDate('2020-01-01')), (8, true::Bool), (9, NULL), (10, (1, 'x')::Tuple(a UInt8, b String)), (11, 7::UInt8),
+    (7, toDate('2020-01-01')), (8, true::Bool), (9, -1::Int8), (10, (1, 'x')::Tuple(a UInt8, b String)), (11, 7::UInt8),
     (12, ['x']::Array(String)), (13, 43::Int64), (14, toDateTime64('2020-01-01 00:00:00', 3, 'UTC')), (15, 'z'::String);
 
 SELECT id, d, dynamicType(d) FROM test_dynamic_add_variant ORDER BY id;
