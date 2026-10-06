@@ -1,6 +1,7 @@
 #include <DataTypes/DataTypesBinaryEncoding.h>
 #include <DataTypes/DataTypesCache.h>
 #include <DataTypes/DataTypeDynamic.h>
+#include <DataTypes/DataTypeVariant.h>
 #include <Columns/ColumnObject.h>
 #include <Columns/ColumnCompressed.h>
 #include <Columns/ColumnVariant.h>
@@ -800,8 +801,9 @@ struct ColumnObject::GatherSourcePlan
     VectorWithMemoryTracking<DynamicPath> dynamic_paths;
     /// For each of GatherState::dynamic_columns, its index in dynamic_paths, or -1 if the source has no such dynamic path.
     VectorWithMemoryTracking<ssize_t> dynamic_path_by_column;
-    /// Source dynamic paths we have no dynamic path for.
+    /// Source dynamic paths we have no dynamic path for, and how their values are written into our shared data.
     DynamicPathsForSharedData dynamic_paths_for_shared_data;
+    VectorWithMemoryTracking<SharedDataValueSerializationCache> shared_data_serialization_caches;
     /// Our dynamic paths are full and equal to the source ones, so shared data is copied as is.
     bool insert_shared_data_directly = false;
 };
@@ -924,6 +926,7 @@ ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnO
             plan.dynamic_paths_for_shared_data.emplace_back(path, src_dynamic_column);
     }
     sortDynamicPathsForSharedData(plan.dynamic_paths_for_shared_data);
+    plan.shared_data_serialization_caches.assign(plan.dynamic_paths_for_shared_data.size(), SharedDataValueSerializationCache{});
 
     state.updateDynamicColumns(dynamic_paths_ptrs);
     plan.dynamic_path_by_column.assign(state.dynamic_columns.size(), -1);
@@ -959,7 +962,7 @@ void ColumnObject::insertRangeFromWithPlan(GatherSourcePlan & plan, const Column
     }
 
     if (!plan.insert_shared_data_directly)
-        insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, start, length);
+        insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, start, length, plan.shared_data_serialization_caches.data());
 }
 
 template <typename Ranges>
@@ -1000,10 +1003,10 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
     for (size_t r = 0; r != ranges.size(); ++r)
     {
         const auto & range = ranges[r];
-        const auto & plan = *plans[r];
+        auto & plan = *plans[r];
         const auto & src = assert_cast<const ColumnObject &>(*range.column);
         if (!plan.insert_shared_data_directly)
-            insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, range.start, range.length);
+            insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, range.start, range.length, plan.shared_data_serialization_caches.data());
         else if (range.length == 1)
             shared_data->insertFrom(*src.shared_data, range.start);
         else
@@ -1175,8 +1178,18 @@ void ColumnObject::doInsertRangeFrom(const IColumn & src, size_t start, size_t l
     }
 }
 
-void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length)
+void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length, SharedDataValueSerializationCache * serialization_caches)
 {
+    /// Writes the value of src_dynamic_paths_for_shared_data[index] in row n into our shared data.
+    auto serialize_path_and_value = [&](ColumnString * shared_data_paths, ColumnString * shared_data_values, size_t index, size_t n)
+    {
+        const auto & [path, src_column] = src_dynamic_paths_for_shared_data[index];
+        if (serialization_caches)
+            serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, path, *src_column, n, serialization_caches[index]);
+        else
+            serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, path, *src_column, n);
+    };
+
     /// Paths in shared data are sorted, and src_dynamic_paths_for_shared_data is sorted by path,
     /// so these paths can be merged into each row in order.
 
@@ -1203,8 +1216,8 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             for (size_t i = start; i != start + length; ++i)
             {
                 /// Paths in src_dynamic_paths_for_shared_data are already sorted.
-                for (const auto & [path, src_column] : src_dynamic_paths_for_shared_data)
-                    serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, path, *src_column, i);
+                for (size_t index = 0; index != src_dynamic_paths_for_shared_data.size(); ++index)
+                    serialize_path_and_value(shared_data_paths, shared_data_values, index, i);
                 shared_data_offsets.push_back(shared_data_paths->size());
             }
         }
@@ -1293,8 +1306,7 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
                 while (src_dynamic_paths_for_shared_data_index < src_dynamic_paths_for_shared_data.size()
                        && src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index].first < path)
                 {
-                    const auto & [dynamic_path, src_column] = src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index];
-                    serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, dynamic_path, *src_column, row);
+                    serialize_path_and_value(shared_data_paths, shared_data_values, src_dynamic_paths_for_shared_data_index, row);
                     ++src_dynamic_paths_for_shared_data_index;
                 }
 
@@ -1306,10 +1318,7 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
 
         /// Insert remaining dynamic paths from src_dynamic_paths_for_shared_data.
         for (; src_dynamic_paths_for_shared_data_index != src_dynamic_paths_for_shared_data.size(); ++src_dynamic_paths_for_shared_data_index)
-        {
-            const auto & [dynamic_path, src_column] = src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index];
-            serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, dynamic_path, *src_column, row);
-        }
+            serialize_path_and_value(shared_data_paths, shared_data_values, src_dynamic_paths_for_shared_data_index, row);
 
         shared_data_offsets.push_back(shared_data_paths->size());
 
@@ -1348,6 +1357,53 @@ void ColumnObject::serializePathAndValueIntoSharedData(ColumnString * shared_dat
     {
         WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag());
         getDynamicSerialization()->serializeBinary(column, n, value_buf, getFormatSettings());
+    }
+    shared_data_values->getOffsets().push_back(shared_data_values_chars.size());
+}
+
+void ColumnObject::serializePathAndValueIntoSharedData(ColumnString * shared_data_paths, ColumnString * shared_data_values, std::string_view path, const ColumnDynamic & column, size_t n, SharedDataValueSerializationCache & cache)
+{
+    const auto & variant_column = column.getVariantColumn();
+    auto global_discr = variant_column.globalDiscriminatorAt(n);
+    /// Null values are not stored, see the overload above.
+    if (global_discr == ColumnVariant::NULL_DISCRIMINATOR)
+        return;
+
+    if (!cache.is_initialized)
+    {
+        cache.shared_variant_discriminator = column.getSharedVariantDiscriminator();
+        cache.encoded_types.resize(column.getVariantInfo().variant_names.size());
+        cache.serializations.resize(column.getVariantInfo().variant_names.size());
+        cache.is_initialized = true;
+    }
+
+    shared_data_paths->insertData(path.data(), path.size());
+    auto & shared_data_values_chars = shared_data_values->getChars();
+    const auto & variant = variant_column.getVariantByGlobalDiscriminator(global_discr);
+    /// The same bytes as SerializationDynamic::serializeBinary writes: a value of the shared variant is already
+    /// a binary-encoded type and value, other values are written as the encoded variant type and the value.
+    if (global_discr == cache.shared_variant_discriminator)
+    {
+        auto value = assert_cast<const ColumnString &>(variant).getDataAt(variant_column.offsetAt(n));
+        shared_data_values_chars.insert(value.data(), value.data() + value.size());
+    }
+    else
+    {
+        auto & serialization = cache.serializations[global_discr];
+        if (!serialization)
+        {
+            const auto & variant_info = column.getVariantInfo();
+            WriteBufferFromString type_buf(cache.encoded_types[global_discr]);
+            encodeDataType(assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariant(global_discr), type_buf);
+            type_buf.finalize();
+            serialization = getDataTypesCache().getSerialization(variant_info.variant_names[global_discr]);
+        }
+
+        const auto & encoded_type = cache.encoded_types[global_discr];
+        shared_data_values_chars.insert(encoded_type.data(), encoded_type.data() + encoded_type.size());
+        WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag());
+        serialization->serializeBinary(variant, variant_column.offsetAt(n), value_buf, getFormatSettings());
+        value_buf.finalize();
     }
     shared_data_values->getOffsets().push_back(shared_data_values_chars.size());
 }

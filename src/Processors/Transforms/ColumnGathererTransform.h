@@ -329,6 +329,13 @@ void ColumnGathererStream::gatherInBatches(Column & column_res, InsertRanges && 
             insert_ranges(batch_ranges);
         bytes = column_res.byteSize();
 
+        /// A batch of one range was inserted the same way as by `gather`, which stops after it.
+        if (batch.size() == 1 && bytes >= block_preferred_size_bytes)
+        {
+            row_sources_buf.position() = reinterpret_cast<char *>(row_source_pos);
+            return;
+        }
+
         if (!batch.empty() && bytes >= block_preferred_size_bytes)
         {
             column_res.popBack(batch_rows);
