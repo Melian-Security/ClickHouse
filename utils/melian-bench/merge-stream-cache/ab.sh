@@ -20,7 +20,7 @@ PERF=${PERF:-/usr/lib/linux-tools/6.8.0-146-generic/perf}
 declare -A PORT=([base]=19100 [fix]=19110)
 declare -A HPORT=([base]=18100 [fix]=18110)
 
-q() { local name=$1; shift; "${BIN[$name]}" client --port "${PORT[$name]}" -q "$@"; }
+q() { local name=$1; shift; "${BIN[$name]}" client --receive_timeout=14400 --port "${PORT[$name]}" -q "$@"; }
 
 start_server() {
     local name=$1; local dir=$WORK/$1
@@ -63,6 +63,8 @@ run_one() {
     q "$name" "DROP TABLE IF EXISTS bench.r_$((i - 1)) SYNC"
     q "$name" "DROP TABLE IF EXISTS bench.$t SYNC"
     q "$name" "CREATE TABLE bench.$t AS bench.src"
+    # Only the OPTIMIZE below merges: background merges never pick parts larger than 1 byte, OPTIMIZE FINAL ignores the limit.
+    q "$name" "ALTER TABLE bench.$t MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 1, max_bytes_to_merge_at_min_space_in_pool = 1"
     q "$name" "SYSTEM STOP MERGES bench.$t"
     q "$name" "ALTER TABLE bench.$t ATTACH PARTITION tuple() FROM bench.src"
     q "$name" "SYSTEM START MERGES bench.$t"
