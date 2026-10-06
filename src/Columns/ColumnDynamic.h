@@ -169,6 +169,21 @@ public:
     void doInsertManyFrom(const IColumn & src, size_t position, size_t length) override;
 #endif
 
+    /// How values of one source column are inserted into this column, see `insertFromWithCache`.
+    struct InsertFromCache
+    {
+        /// Variants are only added by inserts, so the cache is valid while the number of our variants is the same.
+        size_t num_variants = 0;
+        bool insert_variant_directly = false;
+        ColumnVariant::Discriminator src_shared_variant_discriminator = 0;
+        const VectorWithMemoryTracking<ColumnVariant::Discriminator> * global_discriminators_mapping = nullptr;
+    };
+
+    /// Same result as insertFrom. Whether src has our variants, the discriminator of its shared variant and the
+    /// mapping of its variants to ours are resolved once per cache instead of once per value.
+    /// A cache must be used with one source column, which must not change while the cache is used.
+    void insertFromWithCache(const ColumnDynamic & src, size_t n, InsertFromCache & cache);
+
     void insertDefault() override
     {
         variant_column_ptr->insertDefault();

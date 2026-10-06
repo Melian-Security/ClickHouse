@@ -1,0 +1,53 @@
+before merge
+8500	16509078330410487359	16533463314437208473
+all_1_1_0	['b','c','x0']	10
+all_2_2_0	['c','d','e']	13
+all_3_3_0	['b','e','f.g']	11
+all_4_4_0	['b','d','z0']	17
+all_5_5_0	['b','c','d']	0
+after merge
+8500	16509078330410487359	16533463314437208473
+['b','c','d']	44
+0	{"a":0,"arr":[],"b":0,"c":"s0","l":"l0","x0":0}
+397	{"a":99,"arr":[{"p":99,"q":"99"}],"c":99,"d":[99],"e":1,"l":""}
+794	{"a":198,"arr":[],"b":297,"e":198,"f":{"g":198},"l":"","x0":"z"}
+1191	{"a":0,"arr":[],"b":"297","d":"t297","l":"","w":"wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww","z8":297}
+1588	{"a":397,"arr":[],"b":397,"c":"s5","l":"l1"}
+1985	{"a":496,"arr":[{"p":496,"q":"496"}],"c":"496","d":[496],"e":0,"l":"","y2":"vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"}
+2382	{"a":595,"arr":[],"b":892.5,"e":595,"f":{"g":595},"l":""}
+2779	{"a":0,"arr":[],"b":"694","d":"t694","l":"","z14":694}
+3176	{"a":794,"arr":[],"b":794,"c":"s3","l":"l2"}
+3573	{"a":893,"arr":[{"p":893,"q":"893"}],"c":893,"d":[893],"e":0,"l":""}
+3970	{"a":992,"arr":[],"b":1488,"e":992,"f":{"g":992},"l":""}
+4367	{"a":0,"arr":[],"b":"1091","d":"t1091","l":"","z3":1091}
+4764	{"a":1191,"arr":[],"b":1191,"c":"s1","l":"l0"}
+5161	{"a":1290,"arr":[{"p":1290,"q":"1290"}],"c":"1290","d":[1290],"e":1,"l":""}
+5558	{"a":1389,"arr":[],"b":2083.5,"e":1389,"f":{"g":1389},"l":"","x3":"z"}
+5955	{"a":0,"arr":[],"b":"1488","d":"t1488","l":"","z9":1488}
+6352	{"a":1588,"arr":[],"b":1588,"c":"s6","l":"l1"}
+6749	{"a":1687,"arr":[{"p":1687,"q":"1687"}],"c":1687,"d":[1687],"e":0,"l":""}
+7146	{"a":1786,"arr":[],"b":2679,"e":1786,"f":{"g":1786},"l":""}
+7543	{"a":0,"arr":[],"b":"1885","d":"t1885","l":"","z15":1885}
+7940	{"a":1985,"arr":[],"b":1985,"c":"s4","l":"l2","x5":1985}
+8337	{"a":0,"arr":[],"b":337,"c":337,"d":[337],"l":""}
+0	\N	\N	s0	\N	\N	l0	[]	\N
+\N	\N	\N	0	\N	\N		['{"p":0,"q":"0"}']	\N
+0	\N	\N	\N	\N	\N		[]	\N
+\N	0	\N	\N	\N	\N		[]	2000
+1	\N	\N	s1	\N	\N	l1	[]	\N
+\N	\N	\N	\N	1	\N		['{"p":1,"q":"1"}']	\N
+\N	9	\N	\N	\N	\N		[]	2000
+0	\N	\N	\N	0	\N		[]	\N
+1	\N	\N	\N	1	\N		[]	\N
+Vertical
+replacing after merge
+3000	2305659366033274443
+['k','m']	16
+0	2	{"m":0,"q":{"r":0},"s0":2}
+499	2	{"k":"499","o":[499],"p1":1}
+998	2	{"k":998,"m":"a998","n3":0}
+1497	2	{"m":1497,"q":{"r":1497},"s6":2}
+1996	2	{"k":"1996","o":[1996],"p4":1}
+2495	2	{"k":2495,"m":"a2495","n0":0}
+2994	2	{"m":2994,"q":{"r":2994},"s5":2}
+Vertical

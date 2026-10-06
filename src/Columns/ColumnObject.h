@@ -299,6 +299,21 @@ public:
     void setStatistics(const StatisticsPtr & statistics_) { statistics = statistics_; }
 
     static void serializePathAndValueIntoSharedData(ColumnString * shared_data_paths, ColumnString * shared_data_values, std::string_view path, const ColumnDynamic & column, size_t n);
+
+    /// The binary-encoded types and the serializations of the variants of one Dynamic column whose values
+    /// `serializePathAndValueIntoSharedData` writes into shared data.
+    struct SharedDataValueSerializationCache
+    {
+        bool is_initialized = false;
+        ColumnVariant::Discriminator shared_variant_discriminator = 0;
+        /// Indexed by global discriminator, filled at the first value of each variant.
+        VectorWithMemoryTracking<String> encoded_types;
+        VectorWithMemoryTracking<SerializationPtr> serializations;
+    };
+
+    /// Same result as the overload above, without encoding the type and looking up the serialization of every value.
+    /// IMPORTANT: a cache must be used with a single Dynamic column, which must not change while the cache is used.
+    static void serializePathAndValueIntoSharedData(ColumnString * shared_data_paths, ColumnString * shared_data_values, std::string_view path, const ColumnDynamic & column, size_t n, SharedDataValueSerializationCache & cache);
     static void deserializeValueFromSharedData(const ColumnString * shared_data_values, size_t n, IColumn & column);
 
     /// The binary-encoded type of the last value that `deserializeValueFromSharedData` decoded into one
@@ -413,11 +428,15 @@ private:
     struct GatherState;
 
     /// Returns how to insert rows of src into this column, resolving it again if our dynamic paths changed.
-    const GatherSourcePlan & getGatherSourcePlan(const ColumnObject & src);
-    void insertRangeFromWithPlan(const GatherSourcePlan & plan, const ColumnObject & src, size_t start, size_t length);
+    GatherSourcePlan & getGatherSourcePlan(const ColumnObject & src);
+    void insertRangeFromWithPlan(GatherSourcePlan & plan, const ColumnObject & src, size_t start, size_t length);
+    /// Inserts the ranges of rows of a ColumnGathererStream batch path by path.
+    template <typename Ranges>
+    void insertGatheredRanges(const Ranges & ranges);
     static void sortDynamicPathsForSharedData(DynamicPathsForSharedData & paths);
 
-    void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length);
+    /// serialization_caches, if not null, has a cache for each of src_dynamic_paths_for_shared_data.
+    void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length, SharedDataValueSerializationCache * serialization_caches = nullptr);
     void serializePathAndValueIntoArena(Arena & arena, const char *& begin, std::string_view path, std::string_view value, std::string_view & res) const;
     void serializeDynamicPathsAndSharedDataIntoArena(size_t n, Arena & arena, const char *& begin, std::string_view & res) const;
     void deserializeDynamicPathsAndSharedDataFromArena(ReadBuffer & in);
