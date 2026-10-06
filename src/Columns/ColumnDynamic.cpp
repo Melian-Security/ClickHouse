@@ -172,7 +172,7 @@ bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, const String 
         return true;
     }
 
-    const size_t new_discr = std::lower_bound(current_names.begin(), current_names.end(), new_variant_name) - current_names.begin();
+    const size_t new_discr = static_cast<size_t>(std::lower_bound(current_names.begin(), current_names.end(), new_variant_name) - current_names.begin());
 
     DataTypes new_variants;
     new_variants.reserve(current_variants.size() + 1);
