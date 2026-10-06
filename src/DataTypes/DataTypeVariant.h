@@ -37,6 +37,14 @@ public:
     /// Used to maintain backward compatibility for variant discriminators.
     DataTypeVariant(const DataTypes & variants_, FixedDiscriminatorOrder);
 
+    /// A tag for the constructor below.
+    struct AlreadySorted {};
+
+    /// Creates a Variant from variants that are already in the canonical order: sorted by their names,
+    /// with no duplicates and no Nothing. The result is the same as of the first constructor,
+    /// but the names of the variants are not computed. The caller is responsible for the order.
+    DataTypeVariant(DataTypes variants_, AlreadySorted);
+
     TypeIndex getTypeId() const override { return TypeIndex::Variant; }
     const char * getFamilyName() const override { return "Variant"; }
 

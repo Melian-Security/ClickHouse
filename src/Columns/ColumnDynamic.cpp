@@ -158,10 +158,66 @@ bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, const String 
     }
 
     const DataTypes & current_variants = assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariants();
-    DataTypes all_variants = current_variants;
-    all_variants.push_back(new_variant);
-    auto new_variant_type = std::make_shared<DataTypeVariant>(all_variants);
-    updateVariantInfoAndExpandVariantColumn(new_variant_type);
+    const auto & current_names = variant_info.variant_names;
+
+    /// Variants of a Dynamic column are sorted by their names. The names of the current variants are known,
+    /// so the new variant can be put at its place in this order without computing the names of all variants
+    /// again, which is expensive for nested types like Array(JSON(...)).
+    if (isNothing(new_variant) || !std::is_sorted(current_names.begin(), current_names.end()))
+    {
+        DataTypes all_variants = current_variants;
+        all_variants.push_back(new_variant);
+        auto new_variant_type = std::make_shared<DataTypeVariant>(all_variants);
+        updateVariantInfoAndExpandVariantColumn(new_variant_type);
+        return true;
+    }
+
+    const size_t new_discr = std::lower_bound(current_names.begin(), current_names.end(), new_variant_name) - current_names.begin();
+
+    DataTypes new_variants;
+    new_variants.reserve(current_variants.size() + 1);
+    new_variants.insert(new_variants.end(), current_variants.begin(), current_variants.begin() + new_discr);
+    new_variants.push_back(new_variant);
+    new_variants.insert(new_variants.end(), current_variants.begin() + new_discr, current_variants.end());
+    auto new_variant_type = std::make_shared<DataTypeVariant>(std::move(new_variants), DataTypeVariant::AlreadySorted{});
+
+    /// The variants after the new one move by one position.
+    VectorWithMemoryTracking<ColumnVariant::Discriminator> current_to_new_discriminators(current_variants.size());
+    for (size_t discr = 0; discr != current_variants.size(); ++discr)
+        current_to_new_discriminators[discr] = static_cast<ColumnVariant::Discriminator>(discr < new_discr ? discr : discr + 1);
+    VectorWithMemoryTracking<std::pair<MutableColumnPtr, ColumnVariant::Discriminator>> new_variant_columns;
+    new_variant_columns.emplace_back(new_variant->createColumn(), static_cast<ColumnVariant::Discriminator>(new_discr));
+    variant_column_ptr->extend(current_to_new_discriminators, std::move(new_variant_columns));
+
+    variant_info.variant_type = std::move(new_variant_type);
+    variant_info.variant_names.insert(variant_info.variant_names.begin() + new_discr, new_variant_name);
+    for (auto & [_, discr] : variant_info.variant_name_to_discriminator)
+    {
+        if (discr >= new_discr)
+            ++discr;
+    }
+    variant_info.variant_name_to_discriminator.emplace(new_variant_name, static_cast<ColumnVariant::Discriminator>(new_discr));
+
+    /// The same string as DataTypeVariant::getName.
+    size_t variant_name_size = strlen("Variant()") + 2 * (variant_info.variant_names.size() - 1);
+    for (const auto & name : variant_info.variant_names)
+        variant_name_size += name.size();
+    variant_info.variant_name.clear();
+    variant_info.variant_name.reserve(variant_name_size);
+    variant_info.variant_name += "Variant(";
+    for (size_t discr = 0; discr != variant_info.variant_names.size(); ++discr)
+    {
+        if (discr != 0)
+            variant_info.variant_name += ", ";
+        variant_info.variant_name += variant_info.variant_names[discr];
+    }
+    variant_info.variant_name += ")";
+    chassert(variant_info.variant_name == variant_info.variant_type->getName());
+
+    /// Clear mappings cache because now with new Variant we will have new mappings.
+    variant_mappings_cache.clear();
+    /// Invalidate statistics because they refer to the old set of variants.
+    statistics.reset();
     return true;
 }
 
@@ -169,7 +225,7 @@ void extendVariantColumn(
     IColumn & variant_column,
     const DataTypePtr & old_variant_type,
     const DataTypePtr & new_variant_type,
-    UnorderedMapWithMemoryTracking<String, UInt8> old_variant_name_to_discriminator)
+    const UnorderedMapWithMemoryTracking<String, UInt8> & old_variant_name_to_discriminator)
 {
     const DataTypes & current_variants =  assert_cast<const DataTypeVariant *>(old_variant_type.get())->getVariants();
     const DataTypes & new_variants = assert_cast<const DataTypeVariant *>(new_variant_type.get())->getVariants();
