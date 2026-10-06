@@ -51,7 +51,8 @@ size_t getSharedDataPathBucket(std::string_view path, size_t num_buckets);
 ///   - `flattenBucket` returns the flattened per-path columns for one bucket (used by ADVANCED).
 /// Every distinct path gets a dense id and its bucket is hashed once per distinct path in the constructor,
 /// so no call hashes a path again, and per-bucket sizes are precomputed so each `extractBucket` column is
-/// allocated exactly (avoiding power-of-two over-allocation).
+/// allocated exactly (avoiding power-of-two over-allocation). `createPathsIndexes` builds the paths
+/// indexes of the ADVANCED copy section from the same ids.
 class SharedDataBucketsSplitter
 {
 public:
@@ -71,6 +72,11 @@ public:
     /// IMPORTANT: returned string_views reference path data inside the shared data column.
     std::vector<std::string_view> getBucketPathNames(size_t bucket) const;
 
+    /// Column with the index of every path occurrence of rows [start, end) in the concatenation of the
+    /// sorted per-bucket path lists (bucket 0 first), and the smallest unsigned type that fits all indexes.
+    /// Built from the path ids, so no path is hashed or compared.
+    std::pair<ColumnPtr, DataTypePtr> createPathsIndexes() const;
+
 private:
     const IColumn & shared_data_column;
     size_t start;
@@ -81,19 +87,23 @@ private:
     /// Indexed by path id.
     std::vector<std::string_view> id_to_path;
     PODArray<UInt8> id_to_bucket;
+    /// Position of the path among the distinct paths of its bucket, in first-seen order.
+    PODArray<UInt32> id_to_bucket_position;
     std::vector<size_t> bucket_num_paths;
     std::vector<size_t> bucket_paths_chars_size;
     std::vector<size_t> bucket_values_chars_size;
     /// Ids of the distinct paths of each bucket, in first-seen order.
     std::vector<std::vector<UInt32>> bucket_unique_paths;
+    /// Occurrence indexes (positions in `path_ids`) grouped by bucket and ascending within a bucket: the
+    /// occurrences of bucket `b` are [bucket_occurrences_begin[b], bucket_occurrences_begin[b + 1]).
+    /// Lets `flattenBucket` visit only its own occurrences instead of scanning all of them per bucket.
+    PODArray<UInt64> bucket_occurrences;
+    std::vector<size_t> bucket_occurrences_begin;
 };
 /// Collect paths from bucket columns into a single shared data column.
 /// If paths_prefix != nullptr collect only paths that matches this prefix
 /// and write paths without this prefix in the result column.
 void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn & shared_data_column, const String * paths_prefix = nullptr);
-
-/// Create a column that will contain indexes of paths from paths_column column based on provided mapping path_to_index.
-std::pair<ColumnPtr, DataTypePtr> createPathsIndexes(const std::unordered_map<std::string_view, size_t> & path_to_index, const IColumn & paths_column, size_t start, size_t end);
 
 /// Deserialize up to limit indexes from the read buffer and collect corresponding paths to the paths_column.
 void deserializeIndexesAndCollectPaths(IColumn & paths_column, ReadBuffer & istr, VectorWithMemoryTracking<String> && paths, size_t limit);

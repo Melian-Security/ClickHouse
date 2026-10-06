@@ -187,6 +187,7 @@ SharedDataBucketsSplitter::SharedDataBucketsSplitter(const IColumn & shared_data
                 size_t path_bucket = getSharedDataPathBucket(path, num_buckets);
                 id_to_path.push_back(path);
                 id_to_bucket.push_back(static_cast<UInt8>(path_bucket));
+                id_to_bucket_position.push_back(static_cast<UInt32>(bucket_unique_paths[path_bucket].size()));
                 bucket_unique_paths[path_bucket].push_back(new_id);
             }
 
@@ -200,6 +201,16 @@ SharedDataBucketsSplitter::SharedDataBucketsSplitter(const IColumn & shared_data
             bucket_values_chars_size[bucket] += values_offsets[ssize_t(j)] - values_offsets[ssize_t(j) - 1];
         }
     }
+
+    /// Counting sort of the occurrences by bucket, stable so each bucket keeps the traversal order.
+    bucket_occurrences_begin.resize(num_buckets + 1);
+    bucket_occurrences_begin[0] = 0;
+    for (size_t bucket = 0; bucket != num_buckets; ++bucket)
+        bucket_occurrences_begin[bucket + 1] = bucket_occurrences_begin[bucket] + bucket_num_paths[bucket];
+    std::vector<size_t> next_position(bucket_occurrences_begin.begin(), bucket_occurrences_begin.end() - 1);
+    bucket_occurrences.resize(path_ids.size());
+    for (size_t occurrence = 0; occurrence != path_ids.size(); ++occurrence)
+        bucket_occurrences[next_position[id_to_bucket[path_ids[occurrence]]]++] = occurrence;
 }
 
 ColumnPtr SharedDataBucketsSplitter::extractBucket(size_t bucket) const
@@ -258,35 +269,31 @@ std::vector<std::pair<std::string_view, ColumnPtr>> SharedDataBucketsSplitter::f
     if (unique_ids.empty())
         return {};
 
-    /// Map a global path id to its position among this bucket's paths.
-    PODArray<UInt32> id_to_local(id_to_path.size(), std::numeric_limits<UInt32>::max());
     MutableColumns columns;
     columns.reserve(unique_ids.size());
     for (size_t local = 0; local != unique_ids.size(); ++local)
-    {
-        id_to_local[unique_ids[local]] = static_cast<UInt32>(local);
         columns.push_back(dynamic_type->createColumn());
-    }
+    /// Most paths keep one type across rows, so each column remembers the type of its last value.
+    std::vector<ColumnObject::SharedDataValueTypeCache> type_caches(unique_ids.size());
 
-    size_t path_index = 0;
-    for (size_t i = start; i != end; ++i)
+    /// Visit only this bucket's occurrences (ascending), tracking the row each one belongs to.
+    const size_t first_occurrence = (*shared_data_offsets)[ssize_t(start) - 1];
+    size_t row = start;
+    for (size_t position = bucket_occurrences_begin[bucket]; position != bucket_occurrences_begin[bucket + 1]; ++position)
     {
-        size_t offset_start = (*shared_data_offsets)[ssize_t(i) - 1];
-        size_t offset_end = (*shared_data_offsets)[ssize_t(i)];
-        size_t row = i - start;
-        for (size_t j = offset_start; j != offset_end; ++j, ++path_index)
-        {
-            UInt32 id = path_ids[path_index];
-            if (id_to_bucket[id] != bucket)
-                continue;
+        size_t occurrence = bucket_occurrences[position];
+        size_t j = first_occurrence + occurrence;
+        while ((*shared_data_offsets)[ssize_t(row)] <= j)
+            ++row;
 
-            auto & column = columns[id_to_local[id]];
-            /// Backfill defaults for the rows where this path was absent, up to the current row.
-            if (column->size() < row)
-                column->insertManyDefaults(row - column->size());
+        size_t local = id_to_bucket_position[path_ids[occurrence]];
+        auto & column = columns[local];
+        /// Backfill defaults for the rows where this path was absent, up to the current row.
+        size_t row_in_range = row - start;
+        if (column->size() < row_in_range)
+            column->insertManyDefaults(row_in_range - column->size());
 
-            ColumnObject::deserializeValueFromSharedData(shared_data_values, j, *column);
-        }
+        ColumnObject::deserializeValueFromSharedData(shared_data_values, j, assert_cast<ColumnDynamic &>(*column), type_caches[local]);
     }
 
     /// Backfill defaults for the trailing rows where each path was absent.
@@ -380,13 +387,13 @@ namespace
 {
 
 template <typename T>
-ColumnPtr createPathsIndexesImpl(const std::unordered_map<std::string_view, size_t> & path_to_index, const ColumnString & paths_column, size_t start, size_t end)
+ColumnPtr createPathsIndexesImpl(const PODArray<UInt32> & path_ids, const PODArray<UInt64> & id_to_index)
 {
     auto indexes_column = ColumnVector<T>::create();
     auto & data = indexes_column->getData();
-    data.reserve(end - start);
-    for (size_t i = start; i < end; ++i)
-        data.push_back(static_cast<T>(path_to_index.at(paths_column.getDataAt(i))));
+    data.resize(path_ids.size());
+    for (size_t i = 0; i != path_ids.size(); ++i)
+        data[i] = static_cast<T>(id_to_index[path_ids[i]]);
     return indexes_column;
 }
 
@@ -426,20 +433,30 @@ void deserializeIndexesAndCollectPathsImpl(ColumnString & paths_column, ReadBuff
 
 }
 
-std::pair<ColumnPtr, DataTypePtr> createPathsIndexes(const std::unordered_map<std::string_view, size_t> & path_to_index, const IColumn & paths_column, size_t start, size_t end)
+std::pair<ColumnPtr, DataTypePtr> SharedDataBucketsSplitter::createPathsIndexes() const
 {
-    const auto & paths_string_column = assert_cast<const ColumnString &>(paths_column);
-    auto indexes_type = getSmallestIndexesType(path_to_index.size());
+    PODArray<UInt64> id_to_index(id_to_path.size());
+    size_t index = 0;
+    std::vector<UInt32> ids;
+    for (size_t bucket = 0; bucket != num_buckets; ++bucket)
+    {
+        ids = bucket_unique_paths[bucket];
+        std::sort(ids.begin(), ids.end(), [&](UInt32 lhs, UInt32 rhs) { return id_to_path[lhs] < id_to_path[rhs]; });
+        for (UInt32 id : ids)
+            id_to_index[id] = index++;
+    }
+
+    auto indexes_type = getSmallestIndexesType(id_to_path.size());
     switch (indexes_type->getTypeId())
     {
         case TypeIndex::UInt8:
-            return {createPathsIndexesImpl<UInt8>(path_to_index, paths_string_column, start, end), indexes_type};
+            return {createPathsIndexesImpl<UInt8>(path_ids, id_to_index), indexes_type};
         case TypeIndex::UInt16:
-            return {createPathsIndexesImpl<UInt16>(path_to_index, paths_string_column, start, end), indexes_type};
+            return {createPathsIndexesImpl<UInt16>(path_ids, id_to_index), indexes_type};
         case TypeIndex::UInt32:
-            return {createPathsIndexesImpl<UInt32>(path_to_index, paths_string_column, start, end), indexes_type};
+            return {createPathsIndexesImpl<UInt32>(path_ids, id_to_index), indexes_type};
         case TypeIndex::UInt64:
-            return {createPathsIndexesImpl<UInt64>(path_to_index, paths_string_column, start, end), indexes_type};
+            return {createPathsIndexesImpl<UInt64>(path_ids, id_to_index), indexes_type};
         default:
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected type of paths indexes: {}", indexes_type->getName());
     }

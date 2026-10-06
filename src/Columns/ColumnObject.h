@@ -291,6 +291,22 @@ public:
     static void serializePathAndValueIntoSharedData(ColumnString * shared_data_paths, ColumnString * shared_data_values, std::string_view path, const ColumnDynamic & column, size_t n);
     static void deserializeValueFromSharedData(const ColumnString * shared_data_values, size_t n, IColumn & column);
 
+    /// The binary-encoded type of the last value that `deserializeValueFromSharedData` decoded into one
+    /// Dynamic column, with the variant it went to.
+    struct SharedDataValueTypeCache
+    {
+        /// References the value bytes inside the shared data values column.
+        std::string_view encoded_type;
+        UInt8 global_discriminator = 0;
+        SerializationPtr serialization;
+    };
+
+    /// Same result as the overload above. A value whose type is encoded by the same bytes as the cached
+    /// one is read straight into the cached variant, without decoding its type and looking the variant up.
+    /// IMPORTANT: the cache references data inside shared_data_values, which must stay alive and unchanged
+    /// while the cache is used, and a cache must be used with a single Dynamic column.
+    static void deserializeValueFromSharedData(const ColumnString * shared_data_values, size_t n, ColumnDynamic & column, SharedDataValueTypeCache & cache);
+
     /// Paths in shared data are sorted in each row. Use this method to find the lower bound for specific path in the row.
     static size_t findPathLowerBoundInSharedData(std::string_view path, const ColumnString & shared_data_paths, size_t start, size_t end);
     /// Insert all the data from shared data with specified path to dynamic column.

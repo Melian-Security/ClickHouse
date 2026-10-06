@@ -533,37 +533,16 @@ void writeAllChunkBucketMetadata(
     settings.path.pop_back();
 }
 
-std::unordered_map<std::string_view, size_t> buildPathToIndex(
-    const std::vector<std::vector<std::string_view>> & bucket_path_names)
+void writeCopyIndexesForChunk(const SharedDataBucketsSplitter & buckets_splitter, size_t num_paths_occurrences, WriteBuffer & stream)
 {
-    std::unordered_map<std::string_view, size_t> path_to_index;
-    size_t index = 0;
-    for (const auto & paths : bucket_path_names)
-    {
-        for (const auto & path : paths)
-        {
-            path_to_index[path] = index;
-            ++index;
-        }
-    }
-    return path_to_index;
-}
-
-void writeCopyIndexesForChunk(
-    const std::vector<std::vector<std::string_view>> & bucket_path_names,
-    const IColumn & keys_column,
-    size_t nested_offset, size_t nested_end,
-    WriteBuffer & stream)
-{
-    auto path_to_index = buildPathToIndex(bucket_path_names);
-    auto [indexes_column, indexes_type] = createPathsIndexes(path_to_index, keys_column, nested_offset, nested_end);
-    indexes_type->getDefaultSerialization()->serializeBinaryBulk(*indexes_column, stream, 0, nested_end - nested_offset);
+    auto [indexes_column, indexes_type] = buckets_splitter.createPathsIndexes();
+    indexes_type->getDefaultSerialization()->serializeBinaryBulk(*indexes_column, stream, 0, num_paths_occurrences);
 }
 
 void writeChunkCopySection(
     const IColumn & column,
     size_t offset, size_t end,
-    const std::vector<std::vector<std::string_view>> & bucket_path_names,
+    const SharedDataBucketsSplitter & buckets_splitter,
     ISerialization::SerializeBinaryBulkSettings & settings)
 {
     settings.path.push_back(ISerialization::Substream::ObjectSharedDataCopy);
@@ -581,7 +560,7 @@ void writeChunkCopySection(
     size_t nested_limit = nested_end - nested_offset;
 
     auto & copy_indexes_stream = getCopyPathsIndexesStream(settings);
-    writeCopyIndexesForChunk(bucket_path_names, cols.keys_column, nested_offset, nested_end, copy_indexes_stream);
+    writeCopyIndexesForChunk(buckets_splitter, nested_limit, copy_indexes_stream);
     settings.path.pop_back();
 
     auto & copy_values_stream = getCopyValuesStream(settings);
@@ -663,10 +642,6 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
     else if (serialization_version.value == SerializationVersion::ADVANCED)
     {
         size_t end = limit && offset + limit < column.size() ? offset + limit : column.size();
-        /// Per-bucket path names for the copy section.
-        /// We save them separately because each bucket's flattened columns
-        /// are freed after serialization to reduce peak memory.
-        std::vector<std::vector<std::string_view>> bucket_path_names(buckets);
 
         /// Process each bucket separately to limit peak memory —
         /// only one bucket's ColumnDynamic columns are alive at a time.
@@ -675,11 +650,6 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
         for (size_t bucket = 0; bucket != buckets; ++bucket)
         {
             auto flattened_paths = buckets_splitter.flattenBucket(bucket, dynamic_type);
-
-            /// Save path names for the copy section.
-            bucket_path_names[bucket].reserve(flattened_paths.size());
-            for (const auto & [path, _] : flattened_paths)
-                bucket_path_names[bucket].push_back(path);
 
             settings.path.push_back(Substream::Bucket);
             settings.path.back().bucket = bucket;
@@ -711,7 +681,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
         }
 
         /// Write Copy section.
-        writeChunkCopySection(column, offset, end, bucket_path_names, settings);
+        writeChunkCopySection(column, offset, end, buckets_splitter, settings);
     }
     else if (serialization_version.value == SerializationVersion::ADVANCED_CHUNKED)
     {
@@ -751,10 +721,6 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
             /// Phase 3: Write buffered metadata substreams
             /// Phase 4: Write Copy section in stream-then-chunks order
 
-            /// Path names per bucket per chunk, for the copy section.
-            /// chunk_bucket_path_names[chunk][bucket] = vector of path names.
-            std::vector<std::vector<std::vector<std::string_view>>> chunk_bucket_path_names(num_chunks, std::vector<std::vector<std::string_view>>(buckets));
-
             /// One splitter per chunk, shared by all buckets, so each distinct path is hashed once per chunk.
             std::vector<std::unique_ptr<SharedDataBucketsSplitter>> chunk_splitters;
             chunk_splitters.reserve(num_chunks);
@@ -788,9 +754,6 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                     writeVarUInt(path_names.size(), *structure_stream);
                     for (const auto & path : path_names)
                         writeStringBinary(path, *structure_stream);
-
-                    /// Save path names for the copy section.
-                    chunk_bucket_path_names[chunk_idx][bucket] = std::move(path_names);
                 }
 
                 /// Phase 2: Write Data for all chunks, buffer metadata.
@@ -873,7 +836,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                 auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
                 size_t nested_offset = chunk_start ? cols.offsets[chunk_start - 1] : 0;
                 size_t nested_end = cols.offsets[chunk_end - 1];
-                writeCopyIndexesForChunk(chunk_bucket_path_names[chunk_idx], cols.keys_column, nested_offset, nested_end, copy_indexes_stream);
+                writeCopyIndexesForChunk(*chunk_splitters[chunk_idx], nested_end - nested_offset, copy_indexes_stream);
             }
             settings.path.pop_back();
 
@@ -899,17 +862,11 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
             for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
             {
                 auto [chunk_start, chunk_end] = get_chunk_range(chunk_idx);
-                std::vector<std::vector<std::string_view>> bucket_path_names(buckets);
                 SharedDataBucketsSplitter buckets_splitter(column, chunk_start, chunk_end, buckets);
 
                 for (size_t bucket = 0; bucket != buckets; ++bucket)
                 {
                     auto flattened_paths = buckets_splitter.flattenBucket(bucket, dynamic_type);
-
-                    /// Save path names for the copy section.
-                    bucket_path_names[bucket].reserve(flattened_paths.size());
-                    for (const auto & [path, _] : flattened_paths)
-                        bucket_path_names[bucket].push_back(path);
 
                     settings.path.push_back(Substream::Bucket);
                     settings.path.back().bucket = bucket;
@@ -940,7 +897,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                 }
 
                 /// Write Copy section for this chunk.
-                writeChunkCopySection(column, chunk_start, chunk_end, bucket_path_names, settings);
+                writeChunkCopySection(column, chunk_start, chunk_end, buckets_splitter, settings);
             }
         }
     }
