@@ -874,11 +874,6 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
     /// Paths in shared data are sorted, so paths from src_dynamic_paths_for_shared_data should be inserted properly
     /// to keep paths sorted. Let's sort them in advance.
     std::sort(src_dynamic_paths_for_shared_data.begin(), src_dynamic_paths_for_shared_data.end());
-    /// Their columns, looked up once for the whole range.
-    VectorWithMemoryTracking<const ColumnDynamic *> src_dynamic_columns_for_shared_data;
-    src_dynamic_columns_for_shared_data.reserve(src_dynamic_paths_for_shared_data.size());
-    for (const auto path : src_dynamic_paths_for_shared_data)
-        src_dynamic_columns_for_shared_data.push_back(src_object_column.dynamic_paths_ptrs.find(path)->second);
 
     /// Check if src object doesn't have any paths in shared data in specified range.
     const auto & src_shared_data_offsets = src_object_column.getSharedDataOffsets();
@@ -899,8 +894,8 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             for (size_t i = start; i != start + length; ++i)
             {
                 /// Paths in src_dynamic_paths_for_shared_data are already sorted.
-                for (size_t j = 0; j != src_dynamic_paths_for_shared_data.size(); ++j)
-                    serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, src_dynamic_paths_for_shared_data[j], *src_dynamic_columns_for_shared_data[j], i);
+                for (const auto path : src_dynamic_paths_for_shared_data)
+                    serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, path, *src_object_column.dynamic_paths_ptrs.find(path)->second, i);
                 shared_data_offsets.push_back(shared_data_paths->size());
             }
         }
@@ -919,8 +914,6 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
     const auto [src_shared_data_paths, src_shared_data_values] = src_object_column.getSharedDataPathsAndValues();
     const auto [shared_data_paths, shared_data_values] = getSharedDataPathsAndValues();
     auto & shared_data_offsets = getSharedDataOffsets();
-    /// A dynamic path gets the defaults of the rows where it has no value in bulk, right before its next
-    /// value and at the end of the range, instead of a pass over all dynamic paths in every row.
     for (size_t row = start; row != start + length; ++row)
     {
         size_t current_size = shared_data_offsets.size();
@@ -934,9 +927,6 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             /// Check if we have this path in dynamic paths.
             if (auto it = dynamic_paths_ptrs.find(path); it != dynamic_paths_ptrs.end())
             {
-                if (it->second->size() < current_size)
-                    it->second->insertManyDefaults(current_size - it->second->size());
-
                 /// Deserialize binary value into dynamic column from shared data.
                 if (it->second->size() != current_size)
                     throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path {}: {} != {}", path, it->second->size(), current_size);
@@ -954,12 +944,8 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
                 while (src_dynamic_paths_for_shared_data_index < src_dynamic_paths_for_shared_data.size()
                        && src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index] < path)
                 {
-                    serializePathAndValueIntoSharedData(
-                        shared_data_paths,
-                        shared_data_values,
-                        src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index],
-                        *src_dynamic_columns_for_shared_data[src_dynamic_paths_for_shared_data_index],
-                        row);
+                    const auto dynamic_path = src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index];
+                    serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, dynamic_path, *src_object_column.dynamic_paths_ptrs.find(dynamic_path)->second, row);
                     ++src_dynamic_paths_for_shared_data_index;
                 }
 
@@ -971,22 +957,19 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
 
         /// Insert remaining dynamic paths from src_dynamic_paths_for_shared_data.
         for (; src_dynamic_paths_for_shared_data_index != src_dynamic_paths_for_shared_data.size(); ++src_dynamic_paths_for_shared_data_index)
-            serializePathAndValueIntoSharedData(
-                shared_data_paths,
-                shared_data_values,
-                src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index],
-                *src_dynamic_columns_for_shared_data[src_dynamic_paths_for_shared_data_index],
-                row);
+        {
+            const auto dynamic_path = src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index];
+            serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, dynamic_path, *src_object_column.dynamic_paths_ptrs.find(dynamic_path)->second, row);
+        }
 
         shared_data_offsets.push_back(shared_data_paths->size());
-    }
 
-    /// Insert default values in the dynamic paths that got no value in the last rows of the range.
-    size_t new_size = shared_data_offsets.size();
-    for (auto & [_, column] : dynamic_paths_ptrs)
-    {
-        if (column->size() < new_size)
-            column->insertManyDefaults(new_size - column->size());
+        /// Insert default value in all remaining dynamic paths.
+        for (auto & [_, column] : dynamic_paths_ptrs)
+        {
+            if (column->size() == current_size)
+                column->insertDefault();
+        }
     }
 }
 
