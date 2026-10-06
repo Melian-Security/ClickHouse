@@ -226,6 +226,12 @@ public:
     const PathToDynamicColumnPtrMap & getDynamicPathsPtrs() const { return dynamic_paths_ptrs; }
     PathToDynamicColumnPtrMap & getDynamicPathsPtrs() { return dynamic_paths_ptrs; }
 
+    /// Changes whenever a dynamic path is added or removed, a dynamic path column is replaced or the limit
+    /// max_dynamic_paths changes. Values are never reused, also between different Object columns, so a
+    /// dynamic path column (or the absence of a path) remembered together with the version stays valid
+    /// while the column returns the same version.
+    UInt64 getDynamicPathsVersion() const { return dynamic_paths_version; }
+
     const StatisticsPtr & getStatistics() const { return statistics; }
     StatisticsPtr getOrCalculateStatistics() const;
     bool hasStatistics() const override { return true; }
@@ -465,6 +471,11 @@ private:
 
     /// Set only while `gather` runs. Not copied with the column.
     GatherState * gather_state = nullptr;
+
+    static UInt64 getNextDynamicPathsVersion();
+    void updateDynamicPathsVersion() { dynamic_paths_version = getNextDynamicPathsVersion(); }
+    /// See getDynamicPathsVersion. Not copied with the column.
+    UInt64 dynamic_paths_version = getNextDynamicPathsVersion();
 };
 
 }

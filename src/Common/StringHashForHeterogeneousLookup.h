@@ -16,6 +16,7 @@ struct PrehashedStringView
     size_t hash;
 
     explicit PrehashedStringView(std::string_view value_) : value(value_), hash(std::hash<std::string_view>()(value_)) {}
+    PrehashedStringView(std::string_view value_, size_t hash_) : value(value_), hash(hash_) {}
 
     friend bool operator==(const PrehashedStringView & lhs, const std::string & rhs) { return lhs.value == rhs; }
 };
