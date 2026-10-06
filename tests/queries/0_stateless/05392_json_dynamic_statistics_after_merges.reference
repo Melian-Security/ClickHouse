@@ -1,0 +1,15 @@
+parts	3
+first merge
+dynamic paths	['c','e']
+shared data paths	['a','b','f']
+types	Date	false	100
+types	String	false	40
+types	UInt64	true	10
+second merge
+dynamic paths	['c','e']
+shared data paths	['a','b','f']
+types	Date	false	100
+types	Float64	true	5
+types	String	false	40
+types	UInt64	true	10
+rows	155	925	980	310
