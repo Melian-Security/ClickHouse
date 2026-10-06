@@ -2394,6 +2394,8 @@ struct MergeTask::VerticalMergeRuntimeContext::ParallelColumns
     std::atomic<bool> stop{false};
     /// Started, joined and destroyed only by the thread that executes the merge, or by the destructor.
     std::vector<ThreadFromGlobalPool> threads;
+    /// The threads beyond the first one count against the server setting `max_merge_helper_threads`.
+    std::vector<MergeHelperThreads::SlotPtr> helper_thread_slots;
     /// The profile events of each writing thread. They reach the thread group of the merge as they happen, and are added
     /// to the profile events of the merge thread after the threads are joined, so that `system.part_log` shows the whole merge.
     std::vector<std::unique_ptr<ProfileEvents::Counters>> thread_counters;
@@ -2405,6 +2407,7 @@ struct MergeTask::VerticalMergeRuntimeContext::ParallelColumns
             if (thread.joinable())
                 thread.join();
         threads.clear();
+        helper_thread_slots.clear();
     }
 
     ~ParallelColumns() { stopAndJoin(); }
@@ -2500,10 +2503,23 @@ bool MergeTask::VerticalMergeStage::executeVerticalMergeForColumnsInParallel() c
     if (!state.started)
     {
         state.started = true;
+
+        /// The merge thread only waits for the writing threads, so the first writing thread takes its place and
+        /// every other one needs a free helper thread.
+        size_t num_threads = 1;
+        while (num_threads < state.max_threads)
+        {
+            auto slot = MergeHelperThreads::tryAcquire();
+            if (!slot)
+                break;
+            state.helper_thread_slots.push_back(std::move(slot));
+            ++num_threads;
+        }
+
         auto thread_group = CurrentThread::getGroup();
         try
         {
-            for (size_t i = 0; i < state.max_threads; ++i)
+            for (size_t i = 0; i < num_threads; ++i)
             {
                 auto * counters = state.thread_counters.emplace_back(std::make_unique<ProfileEvents::Counters>()).get();
                 state.threads.emplace_back([this, thread_group, counters] { writeColumnsInParallel(thread_group, counters); });
@@ -2647,17 +2663,57 @@ void MergeTask::VerticalMergeStage::writeOneColumnInParallel(size_t column_index
         pipeline.disableProfileEventUpdate();
 
         size_t column_elems_written = 0;
+        auto write_column = [&](auto & executor)
         {
-            PullingPipelineExecutor executor(pipeline);
             Block block;
             while (true)
             {
                 check_cancelled();
                 if (!executor.pull(block))
                     break;
+                /// The asynchronous executor returns an empty block when it has nothing yet.
+                if (block.empty())
+                    continue;
                 column_elems_written += block.rows();
                 column_to->write(block);
             }
+        };
+
+        /// Read and gather the column in one more thread, so it overlaps with writing, if a helper thread is free.
+        /// Declared before the executor, so the slot is released after its thread is joined.
+        MergeHelperThreads::SlotPtr read_thread_slot;
+        if ((*global_ctx->data_settings)[MergeTreeSetting::vertical_merge_read_in_separate_thread])
+            read_thread_slot = MergeHelperThreads::tryAcquire();
+
+        if (read_thread_slot)
+        {
+            pipeline.setNumThreads(1);
+            pipeline.setConcurrencyControl(false);
+            PullingAsyncPipelineExecutor executor(pipeline);
+            try
+            {
+                write_column(executor);
+            }
+            catch (...)
+            {
+                /// `cancel` rethrows an exception of the reading thread that `pull` has not rethrown yet. The column has
+                /// already failed with its own exception.
+                try
+                {
+                    executor.cancel();
+                }
+                catch (...)
+                {
+                    if (getCurrentExceptionCode() != ErrorCodes::ABORTED)
+                        tryLogCurrentException(getLogger("VerticalMergeStage"), "Exception of the thread that read a column");
+                }
+                throw;
+            }
+        }
+        else
+        {
+            PullingPipelineExecutor executor(pipeline);
+            write_column(executor);
         }
         check_cancelled();
         throwIfPipelineCancelled(pipeline);

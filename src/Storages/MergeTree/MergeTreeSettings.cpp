@@ -1848,9 +1848,14 @@ the TTL filter is evaluated and passed to the merging algorithm which sets skip 
     DECLARE(UInt64, vertical_merge_max_parallel_columns, 1, R"(
 The maximum number of columns that the Vertical stage of one merge reads, gathers, serializes and
 compresses at the same time, each in its own thread. With the default value `1` the columns are
-written one after another in the thread of the merge. Columns that share array offsets (elements of
-one `Nested`) and columns with skip indexes are still written one after another. The merged part is
-the same as with `1`. Each column that is written at the same time holds its own read and write
+written one after another in the thread of the merge. The merged part is the same as with `1`.
+
+Columns that share array offsets (the columns of one `Nested`) and columns with skip indexes are still
+written one after another, and so are all columns of a merge that builds text indexes or writes to a
+remote disk. Every thread beyond the first one needs a free thread of the server setting
+[max_merge_helper_threads](/reference/settings/server-settings/settings/max#max_merge_helper_threads);
+with [vertical_merge_read_in_separate_thread](#vertical_merge_read_in_separate_thread) each column is also
+read in one more such thread. Each column that is written at the same time holds its own read and write
 buffers, so the memory usage of a merge grows with this setting.
 )", 0) \
     DECLARE(Bool, vertical_merge_read_in_separate_thread, false, R"(
