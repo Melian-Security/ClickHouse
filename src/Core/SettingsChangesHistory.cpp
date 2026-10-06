@@ -1532,6 +1532,10 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
     static std::once_flag initialized_flag;
     std::call_once(initialized_flag, [&]
     {
+        addSettingsChanges(merge_tree_settings_changes_history, "26.10",
+        {
+            {"vertical_merge_read_in_separate_thread", false, false, "New setting to read and gather the columns of a Vertical merge in a separate thread"},
+        });
         addSettingsChanges(merge_tree_settings_changes_history, "26.9",
         {
             {"min_partition_age_to_force_merge_seconds", 0, 0, "New setting to force merging of parts in partitions that no longer receive inserts"},
@@ -1544,6 +1548,7 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
             {"max_table_size_bytes_compressed", 0, 0, "New setting to limit the total number of compressed bytes across all active and inactive data parts of the table."},
             {"max_table_size_bytes_uncompressed", 0, 0, "New setting to limit the total number of uncompressed bytes across all active and inactive data parts of the table."},
             {"object_shared_data_target_chunk_rows", 8192, 8192, "New setting"},
+            {"vertical_merge_max_parallel_columns", 1, 1, "New setting to write several columns of a Vertical merge at the same time"},
         });
 
         addSettingsChanges(merge_tree_settings_changes_history, "26.8",
