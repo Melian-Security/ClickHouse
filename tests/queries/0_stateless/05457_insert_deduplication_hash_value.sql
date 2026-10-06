@@ -44,7 +44,7 @@ INSERT INTO t_dedup_hash_value (s, a) VALUES ('a', ['b', 'cc']), ('', []), ('ddd
 SELECT count() FROM t_dedup_hash_value;
 
 SELECT name FROM system.zookeeper
-WHERE path = '/clickhouse/tables/' || currentDatabase() || '/t_dedup_hash_value/blocks'
+WHERE path = '/clickhouse/tables/' || currentDatabase() || '/t_dedup_hash_value/deduplication_hashes'
 ORDER BY name;
 
 DROP TABLE t_dedup_hash_value;
