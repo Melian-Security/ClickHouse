@@ -1,0 +1,18 @@
+<test>
+    <!-- Parsing JSON adds variants to Dynamic columns one by one: to the dynamic path columns of each block,
+         and to the temporary Dynamic column that writes each row's values of non-simple types to shared data. -->
+    <settings>
+        <allow_experimental_json_type>1</allow_experimental_json_type>
+    </settings>
+
+    <query>
+        SELECT count() FROM numbers(1000000)
+        WHERE NOT ignore(
+            concat('{"a', toString(number % 100), '":[{"k":', toString(number), '}],"b', toString(number % 50), '":["x"],"c":[1,2],"d":{"e":[1.5]}}')::JSON(max_dynamic_paths=2))
+    </query>
+    <query>
+        SELECT count() FROM numbers(1000000)
+        WHERE NOT ignore(
+            concat('{"p', toString(number % 200), '":', multiIf(number % 4 = 0, '"s"', number % 4 = 1, '1', number % 4 = 2, '1.5', '[1]'), '}')::JSON(max_dynamic_paths=256))
+    </query>
+</test>

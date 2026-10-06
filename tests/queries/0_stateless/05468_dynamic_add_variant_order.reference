@@ -1,0 +1,51 @@
+1	abc	String
+2	b	String
+3	42	Int64
+4	[1,2]	Array(Int64)
+5	c	String
+6	3.5	Float64
+7	2020-01-01	Date
+8	true	Bool
+9	-1	Int8
+10	(1,'x')	Tuple(a UInt8, b String)
+11	7	UInt8
+12	['x']	Array(String)
+13	43	Int64
+14	2020-01-01 00:00:00.000	DateTime64(3, \'UTC\')
+15	z	String
+1	abc	\N	[]	\N
+2	b	\N	[]	\N
+3	\N	42	[]	\N
+4	\N	\N	[1,2]	\N
+5	c	\N	[]	\N
+6	\N	\N	[]	3.5
+7	\N	\N	[]	\N
+8	\N	\N	[]	\N
+9	\N	\N	[]	\N
+10	\N	\N	[]	\N
+11	\N	\N	[]	\N
+12	\N	\N	[]	\N
+13	\N	43	[]	\N
+14	\N	\N	[]	\N
+15	z	\N	[]	\N
+Array(Int64)	1
+Array(String)	1
+Bool	1
+Date	1
+DateTime64(3, \'UTC\')	1
+Float64	1
+Int64	2
+Int8	1
+String	4
+Tuple(a UInt8, b String)	1
+UInt8	1
+a	String	false
+1	Int64	false
+[1,2]	Array(Int64)	false
+1.5	Float64	true
+true	Bool	true
+b	String	false
+['x']	Array(String)	true
+2	Int64	false
+{"a":1,"b":[{"k":"x"}],"c":["s"],"d":[1,2],"e":{"f":1.5},"g":"str"}	{'a':'Int64','b':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))','c':'Array(Nullable(String))','d':'Array(Nullable(Int64))','e.f':'Float64','g':'String'}	['b','c','d','e.f','g']
+{"a":"x","b":[[1]],"c":[1],"g":[{"k":1}]}	{'a':'String','b':'Array(Array(Nullable(Int64)))','c':'Array(Nullable(Int64))','g':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))'}	['b','c','g']

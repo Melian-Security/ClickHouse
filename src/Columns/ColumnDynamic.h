@@ -549,6 +549,6 @@ void extendVariantColumn(
     IColumn & variant_column,
     const DataTypePtr & old_variant_type,
     const DataTypePtr & new_variant_type,
-    UnorderedMapWithMemoryTracking<String, UInt8> old_variant_name_to_discriminator);
+    const UnorderedMapWithMemoryTracking<String, UInt8> & old_variant_name_to_discriminator);
 
 }

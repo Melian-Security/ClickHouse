@@ -82,6 +82,17 @@ DataTypeVariant::DataTypeVariant(const DataTypes & variants_, FixedDiscriminator
     checkVariantsNotEmptyAndNotTooMany(variants);
 }
 
+DataTypeVariant::DataTypeVariant(DataTypes variants_, AlreadySorted) : variants(std::move(variants_))
+{
+    for (const auto & type : variants)
+    {
+        checkAllowedInsideVariant(type);
+        chassert(!isNothing(type));
+    }
+
+    checkVariantsNotEmptyAndNotTooMany(variants);
+}
+
 void DataTypeVariant::updateHashImpl(SipHash & hash) const
 {
     hash.update(variants.size());
