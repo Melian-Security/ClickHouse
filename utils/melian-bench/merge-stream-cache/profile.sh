@@ -8,7 +8,7 @@ n=$1
 BIN=/work/bin/clickhouse-base; PORT=19100
 [ "$n" = fix ] && BIN=$L/bin/clickhouse-fix && PORT=19110
 D=$W/$n
-q() { "$BIN" client --port $PORT "$@"; }
+q() { "$BIN" client --receive_timeout=14400 --port $PORT "$@"; }
 
 stop() {
     [ -f "$D/pid" ] || return 0
@@ -35,6 +35,8 @@ EOF
 start
 q -q "DROP TABLE IF EXISTS bench.prof SYNC"
 q -q "CREATE TABLE bench.prof AS bench.src"
+# Only the OPTIMIZE below merges: background merges never pick parts larger than 1 byte.
+q -q "ALTER TABLE bench.prof MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 1, max_bytes_to_merge_at_min_space_in_pool = 1"
 q -q "SYSTEM STOP MERGES bench.prof"
 q -q "ALTER TABLE bench.prof ATTACH PARTITION tuple() FROM bench.src"
 q -q "SYSTEM FLUSH LOGS"
