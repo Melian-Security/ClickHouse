@@ -354,7 +354,7 @@ void ColumnObject::getValueNameImpl(WriteBufferFromOwnString & name_buf, size_t 
 
     if (options.notFull(name_buf))
     {
-        for (const auto & [path, column] : dynamic_paths_ptrs)
+        for (const auto & [path, column] : object_dynamic_paths)
         {
             if (!options.notFull(name_buf))
                 break;
@@ -814,21 +814,21 @@ struct ColumnObject::GatherState
     VectorWithMemoryTracking<SharedDataValueTypeCache> type_caches;
     VectorWithMemoryTracking<size_t> type_cache_num_variants;
 
-    void updateDynamicColumns(const PathToDynamicColumnPtrMap & dynamic_paths_ptrs)
+    void updateDynamicColumns(const PathToDynamicColumnPtrMap & object_dynamic_paths)
     {
-        if (num_dynamic_paths == dynamic_paths_ptrs.size())
+        if (num_dynamic_paths == object_dynamic_paths.size())
             return;
 
         dynamic_columns.clear();
         dynamic_column_index.clear();
-        for (const auto & [path, column] : dynamic_paths_ptrs)
+        for (const auto & [path, column] : object_dynamic_paths)
         {
             dynamic_column_index.emplace(std::string_view(path), dynamic_columns.size());
             dynamic_columns.push_back(column);
         }
         type_caches.assign(dynamic_columns.size(), SharedDataValueTypeCache{});
         type_cache_num_variants.assign(dynamic_columns.size(), 0);
-        num_dynamic_paths = dynamic_paths_ptrs.size();
+        num_dynamic_paths = object_dynamic_paths.size();
     }
 
     void deserializeValue(const ColumnString * src_shared_data_values, size_t n, size_t column_index)
@@ -1626,7 +1626,7 @@ void ColumnObject::computeHashInto(size_t row_begin, size_t row_end, UInt32 * ha
     else
     {
         PaddedPODArray<UInt32> value_hash(n);
-        for (const auto & [path, column] : dynamic_paths_ptrs)
+        for (const auto & [path, column] : object_dynamic_paths)
         {
             column->computeHashInto(row_begin, row_end, value_hash.data(), /*initial=*/true);
             const UInt32 path_hash = updateWeakHash32(
