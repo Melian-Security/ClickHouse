@@ -1,0 +1,22 @@
+{"id":1,"json":{"a":1,"b":[{"x":1,"y":"s1"},{"x":2,"z":[1,2]}],"c":[{"w":{"q":3},"y":"s2"}],"d":["t1","t2"],"e":[1,2,3]}}
+{"id":2,"json":{"a":2,"b":[{"k":"v"}],"c":[{"k":"u","m":1.5},{"n":true}],"d":[1,"s",2.5],"f":[[1,2],[3]]}}
+{"id":3,"json":{"a":3,"b":[{"x":3}],"c":[{"p1":1,"p2":2,"p3":3,"p4":4}],"g":{"h":[{"i":[{"j":1}]}]}}}
+{"id":4,"json":{"a":4,"b":[{"y":"s4"}],"c":[{"x":5}],"d":[null,"s"],"e":[[],[1]]}}
+{"id":5,"json":{"a":5,"b":"2020-01-01","c":[{"t":"2020-01-01 00:00:00"}],"d":["2020-01-01"]}}
+1	['b','c','d','e']
+2	['b','c','d','f']
+3	['b','c','g.h']
+4	['b','c','d','e']
+5	['b','c','d']
+1	['{"x":1,"y":"s1"}','{"x":2,"z":[1,2]}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	['{"w":{"q":3},"y":"s2"}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	['t1','t2']	Array(Nullable(String))
+2	['{"k":"v"}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	['{"k":"u","m":1.5}','{"n":true}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	[1,'s',2.5]	Array(Dynamic)
+3	['{"x":3}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	['{"p1":1,"p2":2,"p3":3,"p4":4}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	\N	None
+4	['{"y":"s4"}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	['{"x":5}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	[NULL,'s']	Array(Nullable(String))
+5	2020-01-01	Date	['{"t":"2020-01-01 00:00:00"}']	Array(JSON(max_dynamic_types=16, max_dynamic_paths=0))	['2020-01-01']	Array(Nullable(Date))
+1	[1,2]	['s2']	[]
+2	[NULL]	[NULL,NULL]	[]
+3	[3]	[NULL]	[['{"j":1}']]
+4	[NULL]	[NULL]	[]
+5	[]	[NULL]	[]
+5
+{"json":{"a":1,"b":[{"x":1,"y":"s1"},{"x":2,"z":[1,2]}],"c":[{"y":"s2"}],"d":["t1"]},"JSONSharedDataPaths(json)":["a","b","c","d"],"json.b":[{"x":1,"y":"s1"},{"x":2,"z":[1,2]}],"json.c":[{"y":"s2"}]}

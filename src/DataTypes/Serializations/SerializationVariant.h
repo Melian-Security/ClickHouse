@@ -175,6 +175,16 @@ private:
 
     void addVariantElementToPath(SubstreamPath & path, size_t i) const;
 
+    /// The statistics of variants are not collected if variants_statistics is null.
+    void serializeBinaryBulkWithMultipleStreamsImpl(
+        const IColumn & column,
+        size_t offset,
+        size_t limit,
+        SerializeBinaryBulkSettings & settings,
+        SerializeBinaryBulkStatePtr & state,
+        UnorderedMapWithMemoryTracking<String, size_t> * variants_statistics,
+        size_t & total_size_of_variants) const;
+
     enum CompactDiscriminatorsGranuleFormat
     {
         PLAIN = 0,   /// Granule has different discriminators and they are serialized as is row by row.

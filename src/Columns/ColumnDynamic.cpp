@@ -78,8 +78,35 @@ const DataTypePtr & ColumnDynamic::getSharedVariantDataType()
 
 ColumnDynamic::ColumnDynamic(size_t max_dynamic_types_) : max_dynamic_types(max_dynamic_types_), global_max_dynamic_types(max_dynamic_types)
 {
-    /// Create Variant with shared variant.
-    setVariantType(std::make_shared<DataTypeVariant>(DataTypes{getSharedVariantDataType()}));
+    /// Create Variant with shared variant only. Its type and names are the same for every new Dynamic column,
+    /// so they are built once per thread instead of for every column (a JSON column creates one for every new path).
+    struct EmptyVariant
+    {
+        DataTypePtr type;
+        String name;
+        size_t name_hash;
+        size_t shared_variant_name_hash;
+    };
+    static thread_local const EmptyVariant empty_variant = []
+    {
+        EmptyVariant result;
+        result.type = std::make_shared<DataTypeVariant>(DataTypes{getSharedVariantDataType()});
+        result.name = result.type->getName();
+        result.name_hash = PrehashedStringView(result.name).hash;
+        result.shared_variant_name_hash = PrehashedStringView(getSharedVariantTypeName()).hash;
+        return result;
+    }();
+
+    variant_column = empty_variant.type->createColumn();
+    variant_column_ptr = assert_cast<ColumnVariant *>(variant_column.get());
+    /// The same as createVariantInfo(empty_variant.type).
+    variant_info.variant_type = empty_variant.type;
+    variant_info.variant_name = empty_variant.name;
+    variant_info.variant_name_hash = empty_variant.name_hash;
+    variant_info.variant_names.push_back(getSharedVariantTypeName());
+    variant_info.variant_name_hashes.push_back(empty_variant.shared_variant_name_hash);
+    variant_info.variant_name_to_discriminator.emplace(getSharedVariantTypeName(), 0);
+    variant_info.shared_variant_discriminator = 0;
 }
 
 ColumnDynamic::ColumnDynamic(
@@ -512,18 +539,14 @@ void ColumnDynamic::doInsertFrom(const IColumn & src_, size_t n)
     insertValueIntoSharedVariant(src_variant_col.getVariantByGlobalDiscriminator(src_global_discr), variant_type, variant_name, src_offset);
 }
 
-bool ColumnDynamic::insertsVariantDirectly(const ColumnDynamic & src, InsertFromCache & cache) const
+bool ColumnDynamic::updateInsertFromCache(const ColumnDynamic & src, InsertFromCache & cache) const
 {
-    if (cache.num_variants != variant_info.variant_names.size())
-    {
-        cache.num_variants = variant_info.variant_names.size();
-        /// The condition of the fast path in insertFrom.
-        cache.insert_variant_directly = variant_info.variant_name == src.variant_info.variant_name
-            && (src.getSharedVariant().empty() || !canAddNewVariant());
-        cache.src_shared_variant_discriminator = src.getSharedVariantDiscriminator();
-        cache.global_discriminators_mapping = nullptr;
-    }
-
+    cache.num_variants = variant_info.variant_names.size();
+    /// The condition of the fast paths in insertFrom and insertRangeFrom. ColumnString::size is not a virtual call.
+    cache.insert_variant_directly = variant_info.variant_name == src.variant_info.variant_name
+        && (src.getSharedVariant().size() == 0 || !canAddNewVariant());
+    cache.src_shared_variant_discriminator = src.getSharedVariantDiscriminator();
+    cache.global_discriminators_mapping = nullptr;
     return cache.insert_variant_directly;
 }
 
@@ -559,18 +582,19 @@ void ColumnDynamic::insertRangeFrom(const IColumn & src_, size_t start, size_t l
 void ColumnDynamic::doInsertRangeFrom(const IColumn & src_, size_t start, size_t length)
 #endif
 {
-    if (start + length > src_.size())
-        throw Exception(ErrorCodes::PARAMETER_OUT_OF_BOUND, "Parameter out of bound in ColumnDynamic::insertRangeFrom method. "
-                                                            "[start({}) + length({}) > src.size()({})]", start, length, src_.size());
-
     const auto & dynamic_src = assert_cast<const ColumnDynamic &>(src_);
+    if (start + length > dynamic_src.size())
+        throw Exception(ErrorCodes::PARAMETER_OUT_OF_BOUND, "Parameter out of bound in ColumnDynamic::insertRangeFrom method. "
+                                                            "[start({}) + length({}) > src.size()({})]", start, length, dynamic_src.size());
+
     auto & variant_col = getVariantColumn();
 
     /// Same variants: copy the Variant range directly. Skip this fast path when the source has values in
     /// its shared variant and we still have room, so those types get promoted to regular variants in the
     /// combine path below instead of ending up in both storages.
-    if (variant_info.variant_names == dynamic_src.variant_info.variant_names
-        && (dynamic_src.getSharedVariant().empty() || !canAddNewVariant()))
+    /// The name of the Variant type lists all variants in the order of their global discriminators.
+    if (variant_info.variant_name == dynamic_src.variant_info.variant_name
+        && (dynamic_src.getSharedVariant().size() == 0 || !canAddNewVariant()))
     {
         variant_col.insertRangeFrom(*dynamic_src.variant_column, start, length);
         return;

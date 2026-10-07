@@ -202,8 +202,14 @@ public:
     void insertFromWithCache(const ColumnDynamic & src, size_t n, InsertFromCache & cache);
 
     /// Whether `insertFromWithCache(src, n, cache)` inserts the value into our Variant column with
-    /// `ColumnVariant::insertFrom`, which never adds variants. Updates the cache like `insertFromWithCache`.
-    bool insertsVariantDirectly(const ColumnDynamic & src, InsertFromCache & cache) const;
+    /// `ColumnVariant::insertFrom` and `insertRangeFrom(src, start, length)` inserts the range with
+    /// `ColumnVariant::insertRangeFrom`, which never add variants. Updates the cache like `insertFromWithCache`.
+    bool insertsVariantDirectly(const ColumnDynamic & src, InsertFromCache & cache) const
+    {
+        if (cache.num_variants == variant_info.variant_names.size()) [[likely]]
+            return cache.insert_variant_directly;
+        return updateInsertFromCache(src, cache);
+    }
 
     void insertDefault() override
     {
@@ -537,6 +543,9 @@ public:
 
 private:
     void createVariantInfo(const DataTypePtr & variant_type);
+
+    /// Fills the cache for the current variants and returns whether the values of src are inserted directly.
+    bool updateInsertFromCache(const ColumnDynamic & src, InsertFromCache & cache) const;
 
     /// Combine current variant with the other variant and return global discriminators mapping
     /// from other variant to the combined one. It's used for inserting from
