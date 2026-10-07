@@ -9,7 +9,9 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Arena.h>
 #include <atomic>
+#include <optional>
 #include <Common/HashTable/Hash.h>
+#include <Common/HashTable/HashMap.h>
 #include <Common/PODArray.h>
 #include <Common/SipHash.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
@@ -899,7 +901,16 @@ struct ColumnObject::GatherState
     /// Our dynamic paths in a flat list, for the lookup of paths from source shared data and default filling.
     size_t num_dynamic_paths = std::numeric_limits<size_t>::max();
     VectorWithMemoryTracking<ColumnDynamic *> dynamic_columns;
-    UnorderedMapWithMemoryTracking<std::string_view, size_t, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> dynamic_column_index;
+    /// Looked up for each value in source shared data, so it is a flat hash map. Keys point to the paths in dynamic_paths_ptrs.
+    HashMapWithSavedHash<std::string_view, size_t> dynamic_column_index;
+
+    /// Index in dynamic_columns of our dynamic path, or nullopt.
+    std::optional<size_t> findDynamicColumn(std::string_view path) const
+    {
+        if (const auto * it = dynamic_column_index.find(path))
+            return it->getMapped();
+        return std::nullopt;
+    }
 
     /// The type of the last value read from source shared data into each of dynamic_columns.
     /// A cached global discriminator is valid only while the column has the same number of variants.
@@ -930,7 +941,10 @@ struct ColumnObject::GatherState
         dynamic_column_index.clear();
         for (const auto & [path, column] : object_dynamic_paths)
         {
-            dynamic_column_index.emplace(std::string_view(path), dynamic_columns.size());
+            HashMapWithSavedHash<std::string_view, size_t>::LookupResult it;
+            bool inserted;
+            dynamic_column_index.emplace(std::string_view(path), it, inserted);
+            it->getMapped() = dynamic_columns.size();
             dynamic_columns.push_back(column);
         }
         type_caches.assign(dynamic_columns.size(), SharedDataValueTypeCache{});
@@ -1012,7 +1026,7 @@ ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnO
     state.updateDynamicColumns(dynamic_paths_ptrs);
     plan.dynamic_path_by_column.assign(state.dynamic_columns.size(), -1);
     for (size_t i = 0; i != plan.dynamic_paths.size(); ++i)
-        plan.dynamic_path_by_column[state.dynamic_column_index.at(plan.dynamic_paths[i].path)] = static_cast<ssize_t>(i);
+        plan.dynamic_path_by_column[state.findDynamicColumn(plan.dynamic_paths[i].path).value()] = static_cast<ssize_t>(i);
 
     plan.insert_shared_data_directly = !canAddNewDynamicPath() && sorted_dynamic_paths == src.sorted_dynamic_paths;
     plan.num_dynamic_paths = dynamic_paths.size();
@@ -1376,23 +1390,23 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             /// Check if we have this path in dynamic paths.
             if (gather_state)
             {
-                if (auto it = gather_state->dynamic_column_index.find(path); it != gather_state->dynamic_column_index.end())
+                if (auto column_index = gather_state->findDynamicColumn(path))
                 {
                     if (gather_state->collect_values_from_shared_data)
                     {
-                        gather_state->values_from_shared_data[it->second].push_back({current_size, src_shared_data_values, i});
+                        gather_state->values_from_shared_data[*column_index].push_back({current_size, src_shared_data_values, i});
                         continue;
                     }
 
                     /// Dynamic paths are filled with defaults lazily while gathering, see below.
-                    auto * column = gather_state->dynamic_columns[it->second];
+                    auto * column = gather_state->dynamic_columns[*column_index];
                     if (column->size() > current_size)
                         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path {}: {} != {}", path, column->size(), current_size);
                     if (column->size() < current_size)
                         column->insertManyDefaults(current_size - column->size());
 
                     /// Deserialize binary value into dynamic column from shared data.
-                    gather_state->deserializeValue(src_shared_data_values, i, it->second);
+                    gather_state->deserializeValue(src_shared_data_values, i, *column_index);
                     continue;
                 }
             }
@@ -2747,16 +2761,42 @@ ColumnObject::StatisticsPtr ColumnObject::getOrCalculateStatistics() const
         calculated_statistics->dynamic_paths_statistics[path] = column->size() - column->getNumberOfDefaultRows();
 
     const auto [shared_data_paths, _] = getSharedDataPathsAndValues();
-    for (size_t i = 0; i != shared_data_paths->size(); ++i)
+    calculated_statistics->addSharedDataPaths(*shared_data_paths, 0, shared_data_paths->size());
+    return calculated_statistics;
+}
+
+void ColumnObject::Statistics::addSharedDataPaths(const ColumnString & shared_data_paths, size_t start, size_t end)
+{
+    /// The same paths repeat in many rows, so they are counted in a flat hash map first, and the statistics are
+    /// updated once per distinct path. Doing it in the order of the first occurrence of each path adds the same
+    /// paths in the same order as counting the paths one by one, so the iteration order of the statistics,
+    /// in which they are written, stays the same.
+    HashMapWithSavedHash<std::string_view, size_t> path_to_index;
+    std::vector<std::pair<std::string_view, size_t>> paths_and_counts;
+    for (size_t i = start; i != end; ++i)
     {
-        auto path = shared_data_paths->getDataAt(i);
-        if (auto it = calculated_statistics->shared_data_paths_statistics.find(path); it != calculated_statistics->shared_data_paths_statistics.end())
-            ++it->second;
-        else if (calculated_statistics->shared_data_paths_statistics.size() < ColumnObject::Statistics::MAX_SHARED_DATA_STATISTICS_SIZE)
-            calculated_statistics->shared_data_paths_statistics.emplace(path, 1);
+        auto path = shared_data_paths.getDataAt(i);
+        HashMapWithSavedHash<std::string_view, size_t>::LookupResult it;
+        bool inserted;
+        path_to_index.emplace(path, it, inserted);
+        if (inserted)
+        {
+            it->getMapped() = paths_and_counts.size();
+            paths_and_counts.emplace_back(path, 1);
+        }
+        else
+        {
+            ++paths_and_counts[it->getMapped()].second;
+        }
     }
 
-    return calculated_statistics;
+    for (const auto & [path, count] : paths_and_counts)
+    {
+        if (auto it = shared_data_paths_statistics.find(path); it != shared_data_paths_statistics.end())
+            it->second += count;
+        else if (shared_data_paths_statistics.size() < MAX_SHARED_DATA_STATISTICS_SIZE)
+            shared_data_paths_statistics.emplace(path, count);
+    }
 }
 
 void ColumnObject::takeOrCalculateStatisticsFrom(const VectorWithMemoryTracking<ColumnPtr> & source_columns)

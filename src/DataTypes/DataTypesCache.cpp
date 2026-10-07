@@ -99,6 +99,11 @@ SerializationPtr SimpleDataTypesCache::getSerialization(BinaryTypeIndex index) c
 
 const SimpleDataTypesCache::Element * SimpleDataTypesCache::findByName(const String & type_name) const
 {
+    return findByName(PrehashedStringView(type_name));
+}
+
+const SimpleDataTypesCache::Element * SimpleDataTypesCache::findByName(PrehashedStringView type_name) const
+{
     auto it = by_name.find(type_name);
     return it != by_name.end() ? &it->second : nullptr;
 }
@@ -128,23 +133,34 @@ const SimpleDataTypesCache & getSimpleDataTypesCache()
 
 DataTypePtr DataTypesCache::getType(const String & type_name)
 {
+    /// The name is hashed once for both caches.
+    PrehashedStringView prehashed_type_name(type_name);
+
     /// Check the thread-local cache of simple types first.
-    if (const auto * elem = getSimpleDataTypesCache().findByName(type_name))
+    if (const auto * elem = getSimpleDataTypesCache().findByName(prehashed_type_name))
         return elem->type;
 
-    return getCacheElement(type_name).type;
+    return getCacheElement(prehashed_type_name).type;
 }
 
 SerializationPtr DataTypesCache::getSerialization(const String & type_name)
 {
+    /// The name is hashed once for both caches.
+    PrehashedStringView prehashed_type_name(type_name);
+
     /// Check the thread-local cache of simple types first.
-    if (const auto * elem = getSimpleDataTypesCache().findByName(type_name))
+    if (const auto * elem = getSimpleDataTypesCache().findByName(prehashed_type_name))
         return elem->serialization;
 
-    return getCacheElement(type_name).serialization;
+    return getCacheElement(prehashed_type_name).serialization;
 }
 
 SerializationPtr DataTypesCache::getSerialization(const String & type_name, const DataTypePtr & type)
+{
+    return getSerialization(PrehashedStringView(type_name), type);
+}
+
+SerializationPtr DataTypesCache::getSerialization(PrehashedStringView type_name, const DataTypePtr & type)
 {
     /// Check the thread-local cache of simple types first.
     if (const auto * elem = getSimpleDataTypesCache().findByName(type_name))
@@ -182,7 +198,7 @@ void DataTypesCache::clearIfQueryContextChanged()
     session_timezone = current_session_timezone ? *current_session_timezone : String();
 }
 
-const DataTypesCache::Element & DataTypesCache::getCacheElement(const String & type_name, const DataTypePtr * known_type)
+const DataTypesCache::Element & DataTypesCache::getCacheElement(PrehashedStringView type_name, const DataTypePtr * known_type)
 {
     clearIfQueryContextChanged();
 
@@ -194,8 +210,9 @@ const DataTypesCache::Element & DataTypesCache::getCacheElement(const String & t
     if (cache.size() >= MAX_ELEMENTS)
         cache.clear();
 
-    auto type = known_type ? *known_type : DataTypeFactory::instance().get(type_name);
-    it = cache.emplace(type_name, Element{type, withThreadLocalCounter(type->getDefaultSerialization())}).first;
+    String type_name_str(type_name.value);
+    auto type = known_type ? *known_type : DataTypeFactory::instance().get(type_name_str);
+    it = cache.emplace(std::move(type_name_str), Element{type, withThreadLocalCounter(type->getDefaultSerialization())}).first;
     return it->second;
 }
 
