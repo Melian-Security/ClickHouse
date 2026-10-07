@@ -308,11 +308,23 @@ public:
     /// `serializePathAndValueIntoSharedData` writes into shared data.
     struct SharedDataValueSerializationCache
     {
+        /// How the binary format of a value is written. A String value is its size and its bytes, and a native number
+        /// is the bytes of its value, so these are copied directly instead of being written by the serialization.
+        enum class ValueFormat : UInt8
+        {
+            Serialization,
+            String,
+            FixedSize,
+        };
+
         bool is_initialized = false;
         ColumnVariant::Discriminator shared_variant_discriminator = 0;
+        /// The serialization of a longer String value throws, so such values are written by it.
+        UInt64 max_string_size = 0;
         /// Indexed by global discriminator, filled at the first value of each variant.
         VectorWithMemoryTracking<String> encoded_types;
         VectorWithMemoryTracking<SerializationPtr> serializations;
+        VectorWithMemoryTracking<ValueFormat> value_formats;
     };
 
     /// Same result as the overload above, without encoding the type and looking up the serialization of every value.

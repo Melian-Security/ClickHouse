@@ -317,8 +317,16 @@ MutableColumnPtr SharedDataBucketsSplitter::flattenPath(const BucketPaths & buck
     auto & dynamic_column = assert_cast<ColumnDynamic &>(*column);
     /// Most paths keep one type across rows, so the column remembers the type of its last value.
     ColumnObject::SharedDataValueTypeCache type_cache;
-    for (size_t i = bucket_paths.occurrences_begin[path_index]; i != bucket_paths.occurrences_begin[path_index + 1]; ++i)
+    /// The values of one path are spread over the values column, so the ones a few iterations ahead are prefetched.
+    static constexpr size_t prefetch_distance = 8;
+    const auto & values_offsets = shared_data_values->getOffsets();
+    const auto * values_chars = shared_data_values->getChars().data();
+    const size_t occurrences_end = bucket_paths.occurrences_begin[path_index + 1];
+    for (size_t i = bucket_paths.occurrences_begin[path_index]; i != occurrences_end; ++i)
     {
+        if (i + prefetch_distance < occurrences_end)
+            __builtin_prefetch(values_chars + values_offsets[ssize_t(bucket_paths.values[i + prefetch_distance]) - 1]);
+
         /// Backfill defaults for the rows where this path was absent, up to the current row.
         size_t row = bucket_paths.rows[i];
         if (column->size() < row)
