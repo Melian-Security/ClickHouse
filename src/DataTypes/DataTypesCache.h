@@ -3,6 +3,7 @@
 #include <DataTypes/IDataType.h>
 #include <DataTypes/DataTypesBinaryEncoding.h>
 #include <Interpreters/Context_fwd.h>
+#include <Common/StringHashForHeterogeneousLookup.h>
 
 #include <array>
 #include <unordered_map>
@@ -39,6 +40,7 @@ public:
 
     /// Lookup by type name. Returns pre-cached element for simple types, nullptr otherwise.
     const Element * findByName(const String & type_name) const;
+    const Element * findByName(PrehashedStringView type_name) const;
 
     /// Lookup by type name. Returns pre-cached type for simple types,
     /// falls back to DataTypeFactory for others.
@@ -54,7 +56,7 @@ private:
     void addSimpleType(BinaryTypeIndex index, const String & type_name);
 
     std::array<Element, BINARY_TYPE_INDEX_SIZE> by_index{};
-    std::unordered_map<String, Element> by_name;
+    std::unordered_map<String, Element, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> by_name;
 };
 
 /// Return a thread-local instance of the simple data type cache.
@@ -106,6 +108,10 @@ public:
     /// `type_name` must be equal to `type->getName()`.
     SerializationPtr getSerialization(const String & type_name, const DataTypePtr & type);
 
+    /// Same as getSerialization(type_name, type), with the hash of the name computed by the caller,
+    /// e.g. once per variant of a Dynamic column instead of once per value.
+    SerializationPtr getSerialization(PrehashedStringView type_name, const DataTypePtr & type);
+
 private:
     /// Sized to cover a full set of Dynamic variants (up to 255) plus types from the
     /// shared variant, so that interleaved values of many distinct non-simple types
@@ -120,14 +126,14 @@ private:
     };
 
     /// If `known_type` is provided, it is used on a cache miss instead of a DataTypeFactory lookup.
-    const Element & getCacheElement(const String & type_name, const DataTypePtr * known_type = nullptr);
+    const Element & getCacheElement(PrehashedStringView type_name, const DataTypePtr * known_type = nullptr);
 
     /// Clear the cache if the thread is now attached to a different query context
     /// than the one the cache was populated under, or if `session_timezone` was
     /// changed in place on the same context.
     void clearIfQueryContextChanged();
 
-    std::unordered_map<String, Element> cache;
+    std::unordered_map<String, Element, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> cache;
 
     /// The query context the cached entries were created under (null for threads
     /// not attached to any query). Holding a weak_ptr keeps the control block alive,

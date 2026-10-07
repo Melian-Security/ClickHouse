@@ -774,9 +774,10 @@ void SerializationDynamic::serializeBinary(const ColumnDynamic & dynamic_column,
     }
 
     const auto & variant_type = assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariant(global_discr);
-    const auto & variant_type_name = variant_info.variant_names[global_discr];
     encodeDataType(variant_type, ostr);
-    getDataTypesCache().getSerialization(variant_type_name)->serializeBinary(variant_column.getVariantByGlobalDiscriminator(global_discr), variant_column.offsetAt(row_num), ostr, settings);
+    getDataTypesCache()
+        .getSerialization(variant_info.getPrehashedVariantName(global_discr), variant_type)
+        ->serializeBinary(variant_column.getVariantByGlobalDiscriminator(global_discr), variant_column.offsetAt(row_num), ostr, settings);
 }
 
 void SerializationDynamic::serializeForHashCalculation(const IColumn & column, size_t row_num, WriteBuffer & ostr) const
@@ -807,11 +808,10 @@ void SerializationDynamic::serializeForHashCalculation(const IColumn & column, s
         return;
     }
 
-    const auto & variant_type_name = variant_info.variant_names[global_discr];
     const auto & variant_type = assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariant(global_discr);
     serializeVariantForHashCalculation(
         variant_column.getVariantByGlobalDiscriminator(global_discr),
-        getDataTypesCache().getSerialization(variant_type_name),
+        getDataTypesCache().getSerialization(variant_info.getPrehashedVariantName(global_discr), variant_type),
         variant_type,
         variant_column.offsetAt(row_num),
         ostr);
@@ -872,9 +872,11 @@ void SerializationDynamic::deserializeBinary(ColumnDynamic & dynamic_column, Rea
     }
 
     auto variant_type_name = variant_type->getName();
-    const auto & variant_serialization = dynamic_column.getVariantSerialization(variant_type, variant_type_name);
+    /// The name is hashed once for all lookups below.
+    PrehashedStringView prehashed_variant_type_name(variant_type_name);
+    const auto & variant_serialization = dynamic_column.getVariantSerialization(variant_type, prehashed_variant_type_name);
     const auto & variant_info = dynamic_column.getVariantInfo();
-    auto it = variant_info.variant_name_to_discriminator.find(variant_type_name);
+    auto it = variant_info.variant_name_to_discriminator.find(prehashed_variant_type_name);
     if (it != variant_info.variant_name_to_discriminator.end())
     {
         deserializeVariant(dynamic_column.getVariantColumn(), variant_serialization, it->second, istr, [&settings](const ISerialization & serialization, IColumn & variant, ReadBuffer & buf){ serialization.deserializeBinary(variant, buf, settings); });
@@ -882,9 +884,9 @@ void SerializationDynamic::deserializeBinary(ColumnDynamic & dynamic_column, Rea
     }
 
     /// We don't have this variant yet. Let's try to add it.
-    if (dynamic_column.addNewVariant(variant_type))
+    if (dynamic_column.addNewVariant(variant_type, prehashed_variant_type_name))
     {
-        auto discr = variant_info.variant_name_to_discriminator.at(variant_type_name);
+        auto discr = variant_info.variant_name_to_discriminator.find(prehashed_variant_type_name)->second;
         deserializeVariant(dynamic_column.getVariantColumn(), variant_serialization, discr, istr, [&settings](const ISerialization & serialization, IColumn & variant, ReadBuffer & buf){ serialization.deserializeBinary(variant, buf, settings); });
         return;
     }
@@ -893,7 +895,7 @@ void SerializationDynamic::deserializeBinary(ColumnDynamic & dynamic_column, Rea
     /// In this case we insert this value into shared variant in binary form.
     auto tmp_variant_column = variant_type->createColumn();
     variant_serialization->deserializeBinary(*tmp_variant_column, istr, settings);
-    dynamic_column.insertValueIntoSharedVariant(*tmp_variant_column, variant_type, variant_type_name, 0);
+    dynamic_column.insertValueIntoSharedVariant(*tmp_variant_column, variant_type, prehashed_variant_type_name, 0);
 }
 
 template <typename ReadFieldFunc, typename TryDeserializeVariantFunc, typename DeserializeVariant>
@@ -1003,7 +1005,7 @@ static void serializeTextImpl(
     const auto & variant_info = dynamic_column.getVariantInfo();
     const auto & variant_types = assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariants();
     nested_serialize(
-        *getDataTypesCache().getSerialization(variant_info.variant_names[global_discr], variant_types[global_discr]),
+        *getDataTypesCache().getSerialization(variant_info.getPrehashedVariantName(global_discr), variant_types[global_discr]),
         variant_column.getVariantByGlobalDiscriminator(global_discr),
         variant_column.offsetAt(row_num),
         ostr);

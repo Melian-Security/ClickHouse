@@ -27,6 +27,10 @@ public:
         /// (is 10000 a good limit? It should not be expensive to store 10000 paths per part)
         static const size_t MAX_SHARED_DATA_STATISTICS_SIZE = 10000;
         UnorderedMapWithMemoryTracking<String, size_t, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> shared_data_paths_statistics;
+
+        /// Counts the paths at positions [start, end) of the shared data paths column in shared_data_paths_statistics.
+        /// A path that is not in the statistics yet is added while there are less than MAX_SHARED_DATA_STATISTICS_SIZE paths.
+        void addSharedDataPaths(const ColumnString & shared_data_paths, size_t start, size_t end);
     };
 
     using StatisticsPtr = std::shared_ptr<const Statistics>;

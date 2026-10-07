@@ -83,6 +83,10 @@ SerializationObject::SerializationObject(
 
 bool SerializationObject::shouldSkipPath(const String & path) const
 {
+    /// Most types have no paths to skip; contains() would hash the path even for an empty set.
+    if (paths_to_skip.empty() && path_regexps_to_skip.empty())
+        return false;
+
     if (paths_to_skip.contains(path))
         return true;
 
@@ -978,14 +982,7 @@ void SerializationObject::serializeBinaryBulkWithMultipleStreams(
         const auto & shared_data_offsets = column_object.getSharedDataOffsets();
         size_t start = shared_data_offsets[offset - 1];
         size_t end = limit == 0 || offset + limit > shared_data_offsets.size() ? shared_data_paths->size() : shared_data_offsets[offset + limit - 1];
-        for (size_t i = start; i != end; ++i)
-        {
-            auto path = shared_data_paths->getDataAt(i);
-            if (auto it = object_state->statistics.shared_data_paths_statistics.find(path); it != object_state->statistics.shared_data_paths_statistics.end())
-                ++it->second;
-            else if (object_state->statistics.shared_data_paths_statistics.size() < ColumnObject::Statistics::MAX_SHARED_DATA_STATISTICS_SIZE)
-                object_state->statistics.shared_data_paths_statistics.emplace(path, 1);
-        }
+        object_state->statistics.addSharedDataPaths(*shared_data_paths, start, end);
     }
     settings.path.pop_back();
     settings.path.pop_back();
@@ -1391,10 +1388,13 @@ void SerializationObject::deserializeBinary(IColumn & col, ReadBuffer & istr, co
             readStringBinary(path, istr);
             if (!shouldSkipPath(path))
             {
+                /// The column has the same typed paths as the type, so the path is hashed once to look it up
+                /// in the typed and then in the dynamic paths of the column.
+                PrehashedStringView prehashed_path(path);
                 /// Check if we have this path in typed paths.
-                if (auto typed_it = typed_paths_serializations.find(path); typed_it != typed_paths_serializations.end())
+                if (auto typed_it = typed_paths.find(prehashed_path); typed_it != typed_paths.end())
                 {
-                    auto & typed_column = typed_paths[path];
+                    auto & typed_column = typed_it->second;
                     /// Check if we already had this path.
                     if (typed_column->size() > prev_size)
                     {
@@ -1403,11 +1403,11 @@ void SerializationObject::deserializeBinary(IColumn & col, ReadBuffer & istr, co
                     }
                     else
                     {
-                        typed_it->second->deserializeBinary(*typed_column, istr, settings);
+                        typed_paths_serializations.at(path)->deserializeBinary(*typed_column, istr, settings);
                     }
                 }
                 /// Check if we have this path in dynamic paths.
-                else if (auto dynamic_it = dynamic_paths.find(path); dynamic_it != dynamic_paths.end())
+                else if (auto dynamic_it = dynamic_paths.find(prehashed_path); dynamic_it != dynamic_paths.end())
                 {
                     /// Check if we already had this path.
                     if (dynamic_it->second->size() > prev_size)

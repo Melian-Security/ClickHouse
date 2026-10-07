@@ -10,6 +10,7 @@
 #include <Common/Arena.h>
 #include <atomic>
 #include <Common/HashTable/Hash.h>
+#include <Common/HashTable/HashMap.h>
 #include <Common/PODArray.h>
 #include <Common/SipHash.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
@@ -2650,16 +2651,42 @@ ColumnObject::StatisticsPtr ColumnObject::getOrCalculateStatistics() const
         calculated_statistics->dynamic_paths_statistics[path] = column->size() - column->getNumberOfDefaultRows();
 
     const auto [shared_data_paths, _] = getSharedDataPathsAndValues();
-    for (size_t i = 0; i != shared_data_paths->size(); ++i)
+    calculated_statistics->addSharedDataPaths(*shared_data_paths, 0, shared_data_paths->size());
+    return calculated_statistics;
+}
+
+void ColumnObject::Statistics::addSharedDataPaths(const ColumnString & shared_data_paths, size_t start, size_t end)
+{
+    /// The same paths repeat in many rows, so they are counted in a flat hash map first, and the statistics are
+    /// updated once per distinct path. Doing it in the order of the first occurrence of each path adds the same
+    /// paths in the same order as counting the paths one by one, so the iteration order of the statistics,
+    /// in which they are written, stays the same.
+    HashMapWithSavedHash<std::string_view, size_t> path_to_index;
+    std::vector<std::pair<std::string_view, size_t>> paths_and_counts;
+    for (size_t i = start; i != end; ++i)
     {
-        auto path = shared_data_paths->getDataAt(i);
-        if (auto it = calculated_statistics->shared_data_paths_statistics.find(path); it != calculated_statistics->shared_data_paths_statistics.end())
-            ++it->second;
-        else if (calculated_statistics->shared_data_paths_statistics.size() < ColumnObject::Statistics::MAX_SHARED_DATA_STATISTICS_SIZE)
-            calculated_statistics->shared_data_paths_statistics.emplace(path, 1);
+        auto path = shared_data_paths.getDataAt(i);
+        HashMapWithSavedHash<std::string_view, size_t>::LookupResult it;
+        bool inserted;
+        path_to_index.emplace(path, it, inserted);
+        if (inserted)
+        {
+            it->getMapped() = paths_and_counts.size();
+            paths_and_counts.emplace_back(path, 1);
+        }
+        else
+        {
+            ++paths_and_counts[it->getMapped()].second;
+        }
     }
 
-    return calculated_statistics;
+    for (const auto & [path, count] : paths_and_counts)
+    {
+        if (auto it = shared_data_paths_statistics.find(path); it != shared_data_paths_statistics.end())
+            it->second += count;
+        else if (shared_data_paths_statistics.size() < MAX_SHARED_DATA_STATISTICS_SIZE)
+            shared_data_paths_statistics.emplace(path, count);
+    }
 }
 
 void ColumnObject::takeOrCalculateStatisticsFrom(const VectorWithMemoryTracking<ColumnPtr> & source_columns)
