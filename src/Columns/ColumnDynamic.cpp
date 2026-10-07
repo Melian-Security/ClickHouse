@@ -506,7 +506,7 @@ void ColumnDynamic::doInsertFrom(const IColumn & src_, size_t n)
         src_offset);
 }
 
-void ColumnDynamic::insertFromWithCache(const ColumnDynamic & src, size_t n, InsertFromCache & cache)
+bool ColumnDynamic::insertsVariantDirectly(const ColumnDynamic & src, InsertFromCache & cache) const
 {
     if (cache.num_variants != variant_info.variant_names.size())
     {
@@ -518,7 +518,12 @@ void ColumnDynamic::insertFromWithCache(const ColumnDynamic & src, size_t n, Ins
         cache.global_discriminators_mapping = nullptr;
     }
 
-    if (cache.insert_variant_directly)
+    return cache.insert_variant_directly;
+}
+
+void ColumnDynamic::insertFromWithCache(const ColumnDynamic & src, size_t n, InsertFromCache & cache)
+{
+    if (insertsVariantDirectly(src, cache))
     {
         variant_column_ptr->insertFrom(*src.variant_column, n);
         return;

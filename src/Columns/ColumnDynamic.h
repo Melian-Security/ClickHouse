@@ -184,6 +184,10 @@ public:
     /// A cache must be used with one source column, which must not change while the cache is used.
     void insertFromWithCache(const ColumnDynamic & src, size_t n, InsertFromCache & cache);
 
+    /// Whether `insertFromWithCache(src, n, cache)` inserts the value into our Variant column with
+    /// `ColumnVariant::insertFrom`, which never adds variants. Updates the cache like `insertFromWithCache`.
+    bool insertsVariantDirectly(const ColumnDynamic & src, InsertFromCache & cache) const;
+
     void insertDefault() override
     {
         variant_column_ptr->insertDefault();
