@@ -9,6 +9,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Arena.h>
 #include <atomic>
+#include <optional>
 #include <Common/HashTable/Hash.h>
 #include <Common/HashTable/HashMap.h>
 #include <Common/PODArray.h>
@@ -843,7 +844,16 @@ struct ColumnObject::GatherState
     /// Our dynamic paths in a flat list, for the lookup of paths from source shared data and default filling.
     size_t num_dynamic_paths = std::numeric_limits<size_t>::max();
     VectorWithMemoryTracking<ColumnDynamic *> dynamic_columns;
-    UnorderedMapWithMemoryTracking<std::string_view, size_t, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> dynamic_column_index;
+    /// Looked up for each value in source shared data, so it is a flat hash map. Keys point to the paths in dynamic_paths_ptrs.
+    HashMapWithSavedHash<std::string_view, size_t> dynamic_column_index;
+
+    /// Index in dynamic_columns of our dynamic path, or nullopt.
+    std::optional<size_t> findDynamicColumn(std::string_view path) const
+    {
+        if (const auto * it = dynamic_column_index.find(path))
+            return it->getMapped();
+        return std::nullopt;
+    }
 
     /// The type of the last value read from source shared data into each of dynamic_columns.
     /// A cached global discriminator is valid only while the column has the same number of variants.
@@ -874,7 +884,10 @@ struct ColumnObject::GatherState
         dynamic_column_index.clear();
         for (const auto & [path, column] : object_dynamic_paths)
         {
-            dynamic_column_index.emplace(std::string_view(path), dynamic_columns.size());
+            HashMapWithSavedHash<std::string_view, size_t>::LookupResult it;
+            bool inserted;
+            dynamic_column_index.emplace(std::string_view(path), it, inserted);
+            it->getMapped() = dynamic_columns.size();
             dynamic_columns.push_back(column);
         }
         type_caches.assign(dynamic_columns.size(), SharedDataValueTypeCache{});
@@ -955,7 +968,7 @@ ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnO
     state.updateDynamicColumns(dynamic_paths_ptrs);
     plan.dynamic_path_by_column.assign(state.dynamic_columns.size(), -1);
     for (size_t i = 0; i != plan.dynamic_paths.size(); ++i)
-        plan.dynamic_path_by_column[state.dynamic_column_index.at(plan.dynamic_paths[i].path)] = static_cast<ssize_t>(i);
+        plan.dynamic_path_by_column[state.findDynamicColumn(plan.dynamic_paths[i].path).value()] = static_cast<ssize_t>(i);
 
     plan.insert_shared_data_directly = !canAddNewDynamicPath() && sorted_dynamic_paths == src.sorted_dynamic_paths;
     plan.num_dynamic_paths = dynamic_paths.size();
@@ -1287,23 +1300,23 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             /// Check if we have this path in dynamic paths.
             if (gather_state)
             {
-                if (auto it = gather_state->dynamic_column_index.find(path); it != gather_state->dynamic_column_index.end())
+                if (auto column_index = gather_state->findDynamicColumn(path))
                 {
                     if (gather_state->collect_values_from_shared_data)
                     {
-                        gather_state->values_from_shared_data[it->second].push_back({current_size, src_shared_data_values, i});
+                        gather_state->values_from_shared_data[*column_index].push_back({current_size, src_shared_data_values, i});
                         continue;
                     }
 
                     /// Dynamic paths are filled with defaults lazily while gathering, see below.
-                    auto * column = gather_state->dynamic_columns[it->second];
+                    auto * column = gather_state->dynamic_columns[*column_index];
                     if (column->size() > current_size)
                         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path {}: {} != {}", path, column->size(), current_size);
                     if (column->size() < current_size)
                         column->insertManyDefaults(current_size - column->size());
 
                     /// Deserialize binary value into dynamic column from shared data.
-                    gather_state->deserializeValue(src_shared_data_values, i, it->second);
+                    gather_state->deserializeValue(src_shared_data_values, i, *column_index);
                     continue;
                 }
             }
