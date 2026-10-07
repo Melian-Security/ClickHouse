@@ -5,6 +5,7 @@
 #include <Columns/ColumnVector.h>
 #include <Columns/IColumn.h>
 #include <DataTypes/IDataType.h>
+#include <Common/StringHashForHeterogeneousLookup.h>
 #include <Common/UnorderedMapWithMemoryTracking.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
 
@@ -53,16 +54,32 @@ public:
     using ComparatorDescendingStable = ComparatorDescendingStableImpl<ComparatorBase>;
     using ComparatorEqual = ComparatorEqualImpl<ComparatorBase>;
 
+    /// Map keyed by type names, which can be looked up by std::string_view and by PrehashedStringView.
+    template <typename V>
+    using TypeNameMap = UnorderedMapWithMemoryTracking<String, V, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal>;
+
     struct VariantInfo
     {
         DataTypePtr variant_type;
         /// Name of the whole variant to not call getName() every time.
         String variant_name;
+        /// Hash of variant_name as computed by PrehashedStringView, to look it up in maps without hashing it every time.
+        size_t variant_name_hash = 0;
         /// Names of variants to not call getName() every time on variants.
         Names variant_names;
+        /// Hashes of variant_names as computed by PrehashedStringView.
+        VectorWithMemoryTracking<size_t> variant_name_hashes;
         /// Mapping (variant name) -> (global discriminator).
         /// It's used during variant extension.
-        UnorderedMapWithMemoryTracking<String, UInt8> variant_name_to_discriminator;
+        TypeNameMap<UInt8> variant_name_to_discriminator;
+        /// The value of variant_name_to_discriminator for the shared variant, which is needed for most values.
+        UInt8 shared_variant_discriminator = 0;
+
+        PrehashedStringView getPrehashedVariantName() const { return PrehashedStringView(variant_name, variant_name_hash); }
+        PrehashedStringView getPrehashedVariantName(size_t global_discr) const
+        {
+            return PrehashedStringView(variant_names[global_discr], variant_name_hashes[global_discr]);
+        }
     };
 
 private:
@@ -430,7 +447,8 @@ public:
     const ColumnVariant & getVariantColumn() const { return *variant_column_ptr; }
     ColumnVariant & getVariantColumn() { return *variant_column_ptr; }
 
-    bool addNewVariant(const DataTypePtr & new_variant, const String & new_variant_name);
+    bool addNewVariant(const DataTypePtr & new_variant, PrehashedStringView new_variant_name);
+    bool addNewVariant(const DataTypePtr & new_variant, const String & new_variant_name) { return addNewVariant(new_variant, PrehashedStringView(new_variant_name)); }
     bool addNewVariant(const DataTypePtr & new_variant) { return addNewVariant(new_variant, new_variant->getName()); }
 
     bool hasDynamicStructure() const override { return true; }
@@ -469,7 +487,7 @@ public:
 
     ColumnVariant::Discriminator getSharedVariantDiscriminator() const
     {
-        return variant_info.variant_name_to_discriminator.at(getSharedVariantTypeName());
+        return variant_info.shared_variant_discriminator;
     }
 
     ColumnString & getSharedVariant()
@@ -486,9 +504,13 @@ public:
     static void serializeValueIntoSharedVariant(ColumnString & shared_variant, const IColumn & src, const DataTypePtr & type, const SerializationPtr & serialization, size_t n);
 
     /// Insert value into shared variant. Also updates Variant discriminators and offsets.
-    void insertValueIntoSharedVariant(const IColumn & src, const DataTypePtr & type, const String & type_name, size_t n);
+    void insertValueIntoSharedVariant(const IColumn & src, const DataTypePtr & type, PrehashedStringView type_name, size_t n);
+    void insertValueIntoSharedVariant(const IColumn & src, const DataTypePtr & type, const String & type_name, size_t n)
+    {
+        insertValueIntoSharedVariant(src, type, PrehashedStringView(type_name), n);
+    }
 
-    const SerializationPtr & getVariantSerialization(const DataTypePtr & variant_type, const String & variant_name)
+    const SerializationPtr & getVariantSerialization(const DataTypePtr & variant_type, PrehashedStringView variant_name)
     {
         /// Get serialization for provided data type.
         /// To avoid calling type->getDefaultSerialization() every time we use simple cache with max size.
@@ -499,7 +521,12 @@ public:
         if (auto it = serialization_cache.find(variant_name); it != serialization_cache.end())
             return it->second;
 
-        return serialization_cache.emplace(variant_name, variant_type->getDefaultSerialization()).first->second;
+        return serialization_cache.emplace(String(variant_name.value), variant_type->getDefaultSerialization()).first->second;
+    }
+
+    const SerializationPtr & getVariantSerialization(const DataTypePtr & variant_type, const String & variant_name)
+    {
+        return getVariantSerialization(variant_type, PrehashedStringView(variant_name));
     }
 
     const SerializationPtr & getVariantSerialization(const DataTypePtr & variant_type) { return getVariantSerialization(variant_type, variant_type->getName()); }
@@ -543,15 +570,15 @@ private:
 
     /// Cache (Variant name) -> (global discriminators mapping from this variant to current variant in Dynamic column).
     /// Used to avoid mappings recalculation in combineVariants for the same Variant types.
-    UnorderedMapWithMemoryTracking<String, VectorWithMemoryTracking<UInt8>> variant_mappings_cache;
+    TypeNameMap<VectorWithMemoryTracking<UInt8>> variant_mappings_cache;
     /// Cache of Variant types that couldn't be combined with current variant in Dynamic column.
     /// Used to avoid checking if combination is possible for the same Variant types.
-    UnorderedSetWithMemoryTracking<String> variants_with_failed_combination;
+    UnorderedSetWithMemoryTracking<String, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> variants_with_failed_combination;
 
     /// We can use serializations of different data types to serialize values into shared variant.
     /// To avoid creating the same serialization multiple times, use simple cache.
     static const size_t SERIALIZATION_CACHE_MAX_SIZE = 256;
-    UnorderedMapWithMemoryTracking<String, SerializationPtr> serialization_cache;
+    TypeNameMap<SerializationPtr> serialization_cache;
 };
 
 struct DynamicColumnCheckpoint : public ColumnCheckpoint
@@ -568,6 +595,6 @@ void extendVariantColumn(
     IColumn & variant_column,
     const DataTypePtr & old_variant_type,
     const DataTypePtr & new_variant_type,
-    const UnorderedMapWithMemoryTracking<String, UInt8> & old_variant_name_to_discriminator);
+    const ColumnDynamic::TypeNameMap<UInt8> & old_variant_name_to_discriminator);
 
 }

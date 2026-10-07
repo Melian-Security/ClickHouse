@@ -27,6 +27,10 @@ public:
         /// (is 10000 a good limit? It should not be expensive to store 10000 paths per part)
         static const size_t MAX_SHARED_DATA_STATISTICS_SIZE = 10000;
         UnorderedMapWithMemoryTracking<String, size_t, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> shared_data_paths_statistics;
+
+        /// Counts the paths at positions [start, end) of the shared data paths column in shared_data_paths_statistics.
+        /// A path that is not in the statistics yet is added while there are less than MAX_SHARED_DATA_STATISTICS_SIZE paths.
+        void addSharedDataPaths(const ColumnString & shared_data_paths, size_t start, size_t end);
     };
 
     using StatisticsPtr = std::shared_ptr<const Statistics>;
@@ -435,8 +439,10 @@ private:
     void insertGatheredRanges(const Ranges & ranges);
     static void sortDynamicPathsForSharedData(DynamicPathsForSharedData & paths);
 
-    /// serialization_caches, if not null, has a cache for each of src_dynamic_paths_for_shared_data.
-    void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length, SharedDataValueSerializationCache * serialization_caches = nullptr);
+    struct SharedDataSerializationState;
+    /// serialization_state, if not null, belongs to src_object_column and src_dynamic_paths_for_shared_data, which
+    /// must not change while it is used.
+    void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length, SharedDataSerializationState * serialization_state = nullptr);
     void serializePathAndValueIntoArena(Arena & arena, const char *& begin, std::string_view path, std::string_view value, std::string_view & res) const;
     void serializeDynamicPathsAndSharedDataIntoArena(size_t n, Arena & arena, const char *& begin, std::string_view & res) const;
     void deserializeDynamicPathsAndSharedDataFromArena(ReadBuffer & in);

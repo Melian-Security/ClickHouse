@@ -11,7 +11,9 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Arena.h>
 #include <atomic>
+#include <optional>
 #include <Common/HashTable/Hash.h>
+#include <Common/HashTable/HashMap.h>
 #include <Common/PODArray.h>
 #include <Common/SipHash.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
@@ -1057,6 +1059,63 @@ void insertVariantRows(ColumnVariant & column, std::span<const VariantRow> rows,
 
 }
 
+/// How the values of source dynamic paths that have no dynamic path here are written into our shared data,
+/// see `insertFromSharedDataAndFillRemainingDynamicPaths`.
+struct ColumnObject::SharedDataSerializationState
+{
+    /// A cache for each of these paths.
+    VectorWithMemoryTracking<SharedDataValueSerializationCache> caches;
+
+    /// The paths that have a value (are not NULL) in source rows [rows_begin, rows_end): those of row r are the
+    /// indexes path_indexes[row_offsets[r - rows_begin], row_offsets[r - rows_begin + 1]), ascending.
+    /// Most paths are NULL in most rows. Rows are requested a few at a time and in order, so they are
+    /// scanned path by path a window of rows at a time instead of reading every path in every row.
+    size_t rows_begin = 0;
+    size_t rows_end = 0;
+    PaddedPODArray<UInt32> row_offsets;
+    PaddedPODArray<UInt32> path_indexes;
+    PaddedPODArray<UInt32> positions;
+
+    static constexpr size_t min_window_rows = 128;
+
+    std::pair<const UInt32 *, const UInt32 *> getPathsWithValues(const DynamicPathsForSharedData & paths, size_t row, size_t end, size_t num_rows)
+    {
+        if (row < rows_begin || row >= rows_end)
+            scan(paths, row, std::min(num_rows, std::max(end, row + min_window_rows)));
+        const UInt32 * data = path_indexes.data();
+        return {data + row_offsets[row - rows_begin], data + row_offsets[row - rows_begin + 1]};
+    }
+
+private:
+    void scan(const DynamicPathsForSharedData & paths, size_t begin, size_t end)
+    {
+        const size_t num = end - begin;
+        row_offsets.assign(num + 1, 0U);
+        for (const auto & [_, column] : paths)
+        {
+            const UInt8 * discriminators = column->getVariantColumn().getLocalDiscriminators().data() + begin;
+            for (size_t i = 0; i != num; ++i)
+                row_offsets[i + 1] += discriminators[i] != ColumnVariant::NULL_DISCRIMINATOR;
+        }
+        for (size_t i = 0; i != num; ++i)
+            row_offsets[i + 1] += row_offsets[i];
+
+        path_indexes.resize(row_offsets[num]);
+        positions.assign(row_offsets.begin(), row_offsets.end() - 1);
+        for (size_t index = 0; index != paths.size(); ++index)
+        {
+            const UInt8 * discriminators = paths[index].second->getVariantColumn().getLocalDiscriminators().data() + begin;
+            for (size_t i = 0; i != num; ++i)
+            {
+                if (discriminators[i] != ColumnVariant::NULL_DISCRIMINATOR)
+                    path_indexes[positions[i]++] = static_cast<UInt32>(index);
+            }
+        }
+        rows_begin = begin;
+        rows_end = end;
+    }
+};
+
 /// How rows of one source column are inserted into this column, see `gather`.
 struct ColumnObject::GatherSourcePlan
 {
@@ -1080,7 +1139,7 @@ struct ColumnObject::GatherSourcePlan
     VectorWithMemoryTracking<ssize_t> dynamic_path_by_column;
     /// Source dynamic paths we have no dynamic path for, and how their values are written into our shared data.
     DynamicPathsForSharedData dynamic_paths_for_shared_data;
-    VectorWithMemoryTracking<SharedDataValueSerializationCache> shared_data_serialization_caches;
+    SharedDataSerializationState shared_data_serialization;
     /// Our dynamic paths are full and equal to the source ones, so shared data is copied as is.
     bool insert_shared_data_directly = false;
 };
@@ -1096,7 +1155,16 @@ struct ColumnObject::GatherState
     /// Our dynamic paths in a flat list, for the lookup of paths from source shared data and default filling.
     size_t num_dynamic_paths = std::numeric_limits<size_t>::max();
     VectorWithMemoryTracking<ColumnDynamic *> dynamic_columns;
-    UnorderedMapWithMemoryTracking<std::string_view, size_t, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> dynamic_column_index;
+    /// Looked up for each value in source shared data, so it is a flat hash map. Keys point to the paths in dynamic_paths_ptrs.
+    HashMapWithSavedHash<std::string_view, size_t> dynamic_column_index;
+
+    /// Index in dynamic_columns of our dynamic path, or nullopt.
+    std::optional<size_t> findDynamicColumn(std::string_view path) const
+    {
+        if (const auto * it = dynamic_column_index.find(path))
+            return it->getMapped();
+        return std::nullopt;
+    }
 
     /// The type of the last value read from source shared data into each of dynamic_columns.
     /// A cached global discriminator is valid only while the column has the same number of variants.
@@ -1132,7 +1200,10 @@ struct ColumnObject::GatherState
         dynamic_column_index.clear();
         for (const auto & [path, column] : object_dynamic_paths)
         {
-            dynamic_column_index.emplace(std::string_view(path), dynamic_columns.size());
+            HashMapWithSavedHash<std::string_view, size_t>::LookupResult it;
+            bool inserted;
+            dynamic_column_index.emplace(std::string_view(path), it, inserted);
+            it->getMapped() = dynamic_columns.size();
             dynamic_columns.push_back(column);
         }
         type_caches.assign(dynamic_columns.size(), SharedDataValueTypeCache{});
@@ -1208,12 +1279,13 @@ ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnO
             plan.dynamic_paths_for_shared_data.emplace_back(path, src_dynamic_column);
     }
     sortDynamicPathsForSharedData(plan.dynamic_paths_for_shared_data);
-    plan.shared_data_serialization_caches.assign(plan.dynamic_paths_for_shared_data.size(), SharedDataValueSerializationCache{});
+    plan.shared_data_serialization = {};
+    plan.shared_data_serialization.caches.assign(plan.dynamic_paths_for_shared_data.size(), SharedDataValueSerializationCache{});
 
     state.updateDynamicColumns(dynamic_paths_ptrs);
     plan.dynamic_path_by_column.assign(state.dynamic_columns.size(), -1);
     for (size_t i = 0; i != plan.dynamic_paths.size(); ++i)
-        plan.dynamic_path_by_column[state.dynamic_column_index.at(plan.dynamic_paths[i].path)] = static_cast<ssize_t>(i);
+        plan.dynamic_path_by_column[state.findDynamicColumn(plan.dynamic_paths[i].path).value()] = static_cast<ssize_t>(i);
 
     plan.insert_shared_data_directly = !canAddNewDynamicPath() && sorted_dynamic_paths == src.sorted_dynamic_paths;
     plan.num_dynamic_paths = dynamic_paths.size();
@@ -1244,7 +1316,7 @@ void ColumnObject::insertRangeFromWithPlan(GatherSourcePlan & plan, const Column
     }
 
     if (!plan.insert_shared_data_directly)
-        insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, start, length, plan.shared_data_serialization_caches.data());
+        insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, start, length, &plan.shared_data_serialization);
 }
 
 template <typename Ranges>
@@ -1283,7 +1355,7 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
         auto & plan = *plans[r];
         const auto & src = assert_cast<const ColumnObject &>(*range.column);
         if (!plan.insert_shared_data_directly)
-            insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, range.start, range.length, plan.shared_data_serialization_caches.data());
+            insertFromSharedDataAndFillRemainingDynamicPaths(src, plan.dynamic_paths_for_shared_data, range.start, range.length, &plan.shared_data_serialization);
         else if (range.length == 1)
             shared_data->insertFrom(*src.shared_data, range.start);
         else
@@ -1488,16 +1560,32 @@ void ColumnObject::doInsertRangeFrom(const IColumn & src, size_t start, size_t l
     }
 }
 
-void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length, SharedDataValueSerializationCache * serialization_caches)
+void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length, SharedDataSerializationState * serialization_state)
 {
     /// Writes the value of src_dynamic_paths_for_shared_data[index] in row n into our shared data.
     auto serialize_path_and_value = [&](ColumnString * shared_data_paths, ColumnString * shared_data_values, size_t index, size_t n)
     {
         const auto & [path, src_column] = src_dynamic_paths_for_shared_data[index];
-        if (serialization_caches)
-            serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, path, *src_column, n, serialization_caches[index]);
+        if (serialization_state)
+            serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, path, *src_column, n, serialization_state->caches[index]);
         else
             serializePathAndValueIntoSharedData(shared_data_paths, shared_data_values, path, *src_column, n);
+    };
+
+    /// The indexes in src_dynamic_paths_for_shared_data of the paths that can have a value in a row: with a state,
+    /// only the paths that have one, otherwise all of them.
+    PODArrayWithStackMemory<UInt32, 256> all_paths;
+    if (!serialization_state)
+    {
+        all_paths.resize(src_dynamic_paths_for_shared_data.size());
+        for (size_t index = 0; index != all_paths.size(); ++index)
+            all_paths[index] = static_cast<UInt32>(index);
+    }
+    auto get_row_paths = [&](size_t row) -> std::pair<const UInt32 *, const UInt32 *>
+    {
+        if (serialization_state)
+            return serialization_state->getPathsWithValues(src_dynamic_paths_for_shared_data, row, start + length, src_object_column.size());
+        return {all_paths.data(), all_paths.data() + all_paths.size()};
     };
 
     /// Paths in shared data are sorted, and src_dynamic_paths_for_shared_data is sorted by path,
@@ -1526,8 +1614,9 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             for (size_t i = start; i != start + length; ++i)
             {
                 /// Paths in src_dynamic_paths_for_shared_data are already sorted.
-                for (size_t index = 0; index != src_dynamic_paths_for_shared_data.size(); ++index)
-                    serialize_path_and_value(shared_data_paths, shared_data_values, index, i);
+                auto [row_paths_it, row_paths_end] = get_row_paths(i);
+                for (; row_paths_it != row_paths_end; ++row_paths_it)
+                    serialize_path_and_value(shared_data_paths, shared_data_values, *row_paths_it, i);
                 shared_data_offsets.push_back(shared_data_paths->size());
             }
         }
@@ -1560,11 +1649,26 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
     const auto [src_shared_data_paths, src_shared_data_values] = src_object_column.getSharedDataPathsAndValues();
     const auto [shared_data_paths, shared_data_values] = getSharedDataPathsAndValues();
     auto & shared_data_offsets = getSharedDataOffsets();
+
+    /// Source occurrences that are copied as they are form runs, also across rows. A run [copy_begin, copy_end)
+    /// is copied at once when a value from elsewhere has to be written after it, or at the end.
+    size_t copy_begin = 0;
+    size_t copy_end = 0;
+    auto flush_copied = [&]
+    {
+        if (copy_begin != copy_end)
+        {
+            shared_data_paths->insertRangeFrom(*src_shared_data_paths, copy_begin, copy_end - copy_begin);
+            shared_data_values->insertRangeFrom(*src_shared_data_values, copy_begin, copy_end - copy_begin);
+        }
+        copy_begin = copy_end = 0;
+    };
+
     for (size_t row = start; row != start + length; ++row)
     {
         size_t current_size = shared_data_offsets.size();
-        /// Use separate index to iterate over sorted src_dynamic_paths_for_shared_data.
-        size_t src_dynamic_paths_for_shared_data_index = 0;
+        /// Iterate separately over the paths of sorted src_dynamic_paths_for_shared_data that can have a value in this row.
+        auto [row_paths_it, row_paths_end] = get_row_paths(row);
         size_t offset = src_shared_data_offsets[static_cast<ssize_t>(row) - 1];
         size_t end = src_shared_data_offsets[row];
         for (size_t i = offset; i != end; ++i)
@@ -1573,23 +1677,23 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             /// Check if we have this path in dynamic paths.
             if (gather_state)
             {
-                if (auto it = gather_state->dynamic_column_index.find(path); it != gather_state->dynamic_column_index.end())
+                if (auto column_index = gather_state->findDynamicColumn(path))
                 {
                     if (gather_state->collect_values_from_shared_data)
                     {
-                        gather_state->values_from_shared_data[it->second].push_back({current_size, src_shared_data_values, i});
+                        gather_state->values_from_shared_data[*column_index].push_back({current_size, src_shared_data_values, i});
                         continue;
                     }
 
                     /// Dynamic paths are filled with defaults lazily while gathering, see below.
-                    auto * column = gather_state->dynamic_columns[it->second];
+                    auto * column = gather_state->dynamic_columns[*column_index];
                     if (column->size() > current_size)
                         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path {}: {} != {}", path, column->size(), current_size);
                     if (column->size() < current_size)
                         column->insertManyDefaults(current_size - column->size());
 
                     /// Deserialize binary value into dynamic column from shared data.
-                    gather_state->deserializeValue(src_shared_data_values, i, it->second);
+                    gather_state->deserializeValue(src_shared_data_values, i, *column_index);
                     continue;
                 }
             }
@@ -1613,24 +1717,30 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             {
                 /// Before inserting this path into shared data check if we need to
                 /// insert dynamic paths from src_dynamic_paths_for_shared_data before.
-                while (src_dynamic_paths_for_shared_data_index < src_dynamic_paths_for_shared_data.size()
-                       && src_dynamic_paths_for_shared_data[src_dynamic_paths_for_shared_data_index].first < path)
+                while (row_paths_it != row_paths_end && src_dynamic_paths_for_shared_data[*row_paths_it].first < path)
                 {
-                    serialize_path_and_value(shared_data_paths, shared_data_values, src_dynamic_paths_for_shared_data_index, row);
-                    ++src_dynamic_paths_for_shared_data_index;
+                    flush_copied();
+                    serialize_path_and_value(shared_data_paths, shared_data_values, *row_paths_it, row);
+                    ++row_paths_it;
                 }
 
                 /// Insert path and value from src shared data to our shared data.
-                shared_data_paths->insertFrom(*src_shared_data_paths, i);
-                shared_data_values->insertFrom(*src_shared_data_values, i);
+                if (copy_end != i)
+                {
+                    flush_copied();
+                    copy_begin = i;
+                }
+                copy_end = i + 1;
             }
         }
 
         /// Insert remaining dynamic paths from src_dynamic_paths_for_shared_data.
-        for (; src_dynamic_paths_for_shared_data_index != src_dynamic_paths_for_shared_data.size(); ++src_dynamic_paths_for_shared_data_index)
-            serialize_path_and_value(shared_data_paths, shared_data_values, src_dynamic_paths_for_shared_data_index, row);
+        if (row_paths_it != row_paths_end)
+            flush_copied();
+        for (; row_paths_it != row_paths_end; ++row_paths_it)
+            serialize_path_and_value(shared_data_paths, shared_data_values, *row_paths_it, row);
 
-        shared_data_offsets.push_back(shared_data_paths->size());
+        shared_data_offsets.push_back(shared_data_paths->size() + (copy_end - copy_begin));
 
         /// Insert default value in all remaining dynamic paths.
         /// While gathering, a dynamic path is filled with defaults only before its next value and after the range.
@@ -1643,6 +1753,7 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             }
         }
     }
+    flush_copied();
 
     if (gather_state && !gather_state->collect_values_from_shared_data)
     {
@@ -2937,16 +3048,42 @@ ColumnObject::StatisticsPtr ColumnObject::getOrCalculateStatistics() const
         calculated_statistics->dynamic_paths_statistics[path] = column->size() - column->getNumberOfDefaultRows();
 
     const auto [shared_data_paths, _] = getSharedDataPathsAndValues();
-    for (size_t i = 0; i != shared_data_paths->size(); ++i)
+    calculated_statistics->addSharedDataPaths(*shared_data_paths, 0, shared_data_paths->size());
+    return calculated_statistics;
+}
+
+void ColumnObject::Statistics::addSharedDataPaths(const ColumnString & shared_data_paths, size_t start, size_t end)
+{
+    /// The same paths repeat in many rows, so they are counted in a flat hash map first, and the statistics are
+    /// updated once per distinct path. Doing it in the order of the first occurrence of each path adds the same
+    /// paths in the same order as counting the paths one by one, so the iteration order of the statistics,
+    /// in which they are written, stays the same.
+    HashMapWithSavedHash<std::string_view, size_t> path_to_index;
+    std::vector<std::pair<std::string_view, size_t>> paths_and_counts;
+    for (size_t i = start; i != end; ++i)
     {
-        auto path = shared_data_paths->getDataAt(i);
-        if (auto it = calculated_statistics->shared_data_paths_statistics.find(path); it != calculated_statistics->shared_data_paths_statistics.end())
-            ++it->second;
-        else if (calculated_statistics->shared_data_paths_statistics.size() < ColumnObject::Statistics::MAX_SHARED_DATA_STATISTICS_SIZE)
-            calculated_statistics->shared_data_paths_statistics.emplace(path, 1);
+        auto path = shared_data_paths.getDataAt(i);
+        HashMapWithSavedHash<std::string_view, size_t>::LookupResult it;
+        bool inserted;
+        path_to_index.emplace(path, it, inserted);
+        if (inserted)
+        {
+            it->getMapped() = paths_and_counts.size();
+            paths_and_counts.emplace_back(path, 1);
+        }
+        else
+        {
+            ++paths_and_counts[it->getMapped()].second;
+        }
     }
 
-    return calculated_statistics;
+    for (const auto & [path, count] : paths_and_counts)
+    {
+        if (auto it = shared_data_paths_statistics.find(path); it != shared_data_paths_statistics.end())
+            it->second += count;
+        else if (shared_data_paths_statistics.size() < MAX_SHARED_DATA_STATISTICS_SIZE)
+            shared_data_paths_statistics.emplace(path, count);
+    }
 }
 
 void ColumnObject::takeOrCalculateStatisticsFrom(const VectorWithMemoryTracking<ColumnPtr> & source_columns)

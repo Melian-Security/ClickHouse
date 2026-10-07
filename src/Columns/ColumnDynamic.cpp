@@ -126,36 +126,37 @@ void ColumnDynamic::createVariantInfo(const DataTypePtr & variant_type)
 {
     variant_info.variant_type = variant_type;
     variant_info.variant_name = variant_type->getName();
+    variant_info.variant_name_hash = PrehashedStringView(variant_info.variant_name).hash;
     const auto & variants = assert_cast<const DataTypeVariant &>(*variant_type).getVariants();
     variant_info.variant_names.clear();
     variant_info.variant_names.reserve(variants.size());
+    variant_info.variant_name_hashes.clear();
+    variant_info.variant_name_hashes.reserve(variants.size());
     variant_info.variant_name_to_discriminator.clear();
     variant_info.variant_name_to_discriminator.reserve(variants.size());
     for (ColumnVariant::Discriminator discr = 0; discr != variants.size(); ++discr)
     {
         const auto & variant_name = variant_info.variant_names.emplace_back(variants[discr]->getName());
+        variant_info.variant_name_hashes.push_back(PrehashedStringView(variant_name).hash);
         variant_info.variant_name_to_discriminator[variant_name] = discr;
     }
 
-    if (!variant_info.variant_name_to_discriminator.contains(getSharedVariantTypeName()))
+    auto shared_variant_it = variant_info.variant_name_to_discriminator.find(getSharedVariantTypeName());
+    if (shared_variant_it == variant_info.variant_name_to_discriminator.end())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Variant in Dynamic column doesn't contain shared variant");
+    variant_info.shared_variant_discriminator = shared_variant_it->second;
 }
 
-bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, const String & new_variant_name)
+bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, PrehashedStringView new_variant_name)
 {
     /// Check if we already have such variant.
     if (variant_info.variant_name_to_discriminator.contains(new_variant_name))
         return true;
 
     /// Check if we reached maximum number of variants.
+    /// Dynamic column always has the shared variant, see createVariantInfo, so values can go there.
     if (!canAddNewVariant())
-    {
-        /// Dynamic column should always have shared variant.
-        if (!variant_info.variant_name_to_discriminator.contains(getSharedVariantTypeName()))
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Maximum number of variants reached, but no shared variant exists");
-
         return false;
-    }
 
     const DataTypes & current_variants = assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariants();
     const auto & current_names = variant_info.variant_names;
@@ -172,7 +173,7 @@ bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, const String 
         return true;
     }
 
-    const size_t new_discr = static_cast<size_t>(std::lower_bound(current_names.begin(), current_names.end(), new_variant_name) - current_names.begin());
+    const size_t new_discr = static_cast<size_t>(std::lower_bound(current_names.begin(), current_names.end(), new_variant_name.value) - current_names.begin());
 
     DataTypes new_variants;
     new_variants.reserve(current_variants.size() + 1);
@@ -190,13 +191,17 @@ bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, const String 
     variant_column_ptr->extend(current_to_new_discriminators, std::move(new_variant_columns));
 
     variant_info.variant_type = std::move(new_variant_type);
-    variant_info.variant_names.insert(variant_info.variant_names.begin() + new_discr, new_variant_name);
+    variant_info.variant_names.insert(variant_info.variant_names.begin() + new_discr, String(new_variant_name.value));
+    variant_info.variant_name_hashes.insert(variant_info.variant_name_hashes.begin() + new_discr, new_variant_name.hash);
     for (auto & [_, discr] : variant_info.variant_name_to_discriminator)
     {
         if (discr >= new_discr)
             ++discr;
     }
-    variant_info.variant_name_to_discriminator.emplace(new_variant_name, static_cast<ColumnVariant::Discriminator>(new_discr));
+    if (variant_info.shared_variant_discriminator >= new_discr)
+        ++variant_info.shared_variant_discriminator;
+    variant_info.variant_name_to_discriminator.emplace(String(new_variant_name.value), static_cast<ColumnVariant::Discriminator>(new_discr));
+    chassert(variant_info.shared_variant_discriminator == variant_info.variant_name_to_discriminator.at(getSharedVariantTypeName()));
 
     /// The same string as DataTypeVariant::getName.
     size_t variant_name_size = strlen("Variant()") + 2 * (variant_info.variant_names.size() - 1);
@@ -212,6 +217,7 @@ bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, const String 
         variant_info.variant_name += variant_info.variant_names[discr];
     }
     variant_info.variant_name += ")";
+    variant_info.variant_name_hash = PrehashedStringView(variant_info.variant_name).hash;
     chassert(variant_info.variant_name == variant_info.variant_type->getName());
 
     /// Clear mappings cache because now with new Variant we will have new mappings.
@@ -225,7 +231,7 @@ void extendVariantColumn(
     IColumn & variant_column,
     const DataTypePtr & old_variant_type,
     const DataTypePtr & new_variant_type,
-    const UnorderedMapWithMemoryTracking<String, UInt8> & old_variant_name_to_discriminator)
+    const ColumnDynamic::TypeNameMap<UInt8> & old_variant_name_to_discriminator)
 {
     const DataTypes & current_variants =  assert_cast<const DataTypeVariant *>(old_variant_type.get())->getVariants();
     const DataTypes & new_variants = assert_cast<const DataTypeVariant *>(new_variant_type.get())->getVariants();
@@ -262,12 +268,14 @@ VectorWithMemoryTracking<ColumnVariant::Discriminator> * ColumnDynamic::combineV
 {
     /// Check if we already have global discriminators mapping for other Variant in cache.
     /// It's used to not calculate the same mapping each call of insertFrom with the same columns.
-    auto cache_it = variant_mappings_cache.find(other_variant_info.variant_name);
+    /// The name of the other variant is long for many variants, so use its precomputed hash.
+    auto other_variant_name = other_variant_info.getPrehashedVariantName();
+    auto cache_it = variant_mappings_cache.find(other_variant_name);
     if (cache_it != variant_mappings_cache.end())
         return &cache_it->second;
 
     /// Check if we already tried to combine these variants but failed due to max_dynamic_types limit.
-    if (variants_with_failed_combination.contains(other_variant_info.variant_name))
+    if (variants_with_failed_combination.contains(other_variant_name))
         return nullptr;
 
     const DataTypes & other_variants = assert_cast<const DataTypeVariant &>(*other_variant_info.variant_type).getVariants();
@@ -459,12 +467,13 @@ void ColumnDynamic::doInsertFrom(const IColumn & src_, size_t n)
         ReadBufferFromMemory buf(value);
         auto type = decodeDataType(buf);
         auto type_name = type->getName();
+        PrehashedStringView prehashed_type_name(type_name);
         /// Check if we have this variant and deserialize value into variant from shared variant data.
-        if (auto it = variant_info.variant_name_to_discriminator.find(type_name); it != variant_info.variant_name_to_discriminator.end())
-            variant_col.deserializeBinaryIntoVariant(it->second, getVariantSerialization(type, type_name), buf, getFormatSettings());
+        if (auto it = variant_info.variant_name_to_discriminator.find(prehashed_type_name); it != variant_info.variant_name_to_discriminator.end())
+            variant_col.deserializeBinaryIntoVariant(it->second, getVariantSerialization(type, prehashed_type_name), buf, getFormatSettings());
         /// Try to add a new variant if there are available slots.
         else if (addNewVariant(type, type_name))
-            variant_col.deserializeBinaryIntoVariant(variant_info.variant_name_to_discriminator[type_name], getVariantSerialization(type, type_name), buf, getFormatSettings());
+            variant_col.deserializeBinaryIntoVariant(variant_info.variant_name_to_discriminator.find(prehashed_type_name)->second, getVariantSerialization(type, prehashed_type_name), buf, getFormatSettings());
         /// Otherwise just insert it into our shared variant.
         else
             variant_col.insertIntoVariantFrom(getSharedVariantDiscriminator(), src_shared_variant, src_offset);
@@ -490,20 +499,17 @@ void ColumnDynamic::doInsertFrom(const IColumn & src_, size_t n)
     }
 
     auto variant_type = assert_cast<const DataTypeVariant &>(*dynamic_src.variant_info.variant_type).getVariants()[src_global_discr];
-    if (addNewVariant(variant_type))
+    auto variant_name = dynamic_src.variant_info.getPrehashedVariantName(src_global_discr);
+    if (addNewVariant(variant_type, variant_name))
     {
-        auto discr = variant_info.variant_name_to_discriminator[dynamic_src.variant_info.variant_names[src_global_discr]];
+        auto discr = variant_info.variant_name_to_discriminator.find(variant_name)->second;
         variant_col.insertIntoVariantFrom(discr, src_variant_col.getVariantByGlobalDiscriminator(src_global_discr), src_variant_col.offsetAt(n));
         return;
     }
 
     /// We reached maximum number of variants and couldn't add new variant.
     /// Insert this value into shared variant.
-    insertValueIntoSharedVariant(
-        src_variant_col.getVariantByGlobalDiscriminator(src_global_discr),
-        variant_type,
-        dynamic_src.variant_info.variant_names[src_global_discr],
-        src_offset);
+    insertValueIntoSharedVariant(src_variant_col.getVariantByGlobalDiscriminator(src_global_discr), variant_type, variant_name, src_offset);
 }
 
 bool ColumnDynamic::insertsVariantDirectly(const ColumnDynamic & src, InsertFromCache & cache) const
@@ -606,13 +612,14 @@ void ColumnDynamic::doInsertRangeFrom(const IColumn & src_, size_t start, size_t
                 ReadBufferFromMemory buf(value);
                 auto type = decodeDataType(buf);
                 auto type_name = type->getName();
+                PrehashedStringView prehashed_type_name(type_name);
                 /// Check if we have variant with this type. In this case we should extract
                 /// the value from src shared variant and insert it into this variant.
-                if (auto it = variant_info.variant_name_to_discriminator.find(type_name); it != variant_info.variant_name_to_discriminator.end())
+                if (auto it = variant_info.variant_name_to_discriminator.find(prehashed_type_name); it != variant_info.variant_name_to_discriminator.end())
                 {
                     auto local_discr = variant_col.localDiscriminatorByGlobal(it->second);
                     auto & variant = variant_col.getVariantByLocalDiscriminator(local_discr);
-                    getVariantSerialization(type, type_name)->deserializeBinary(variant, buf, getFormatSettings());
+                    getVariantSerialization(type, prehashed_type_name)->deserializeBinary(variant, buf, getFormatSettings());
                     /// Local discriminators were already filled in ColumnVariant::insertRangeFrom and this row should contain
                     /// shared_variant_local_discr. Change it to local discriminator of the found variant and update offsets.
                     local_discriminators[prev_size + i] = local_discr;
@@ -622,9 +629,9 @@ void ColumnDynamic::doInsertRangeFrom(const IColumn & src_, size_t start, size_t
                 /// discriminators, so shared_variant_local_discr and the cached references stay valid.
                 else if (addNewVariant(type, type_name))
                 {
-                    auto local_discr = variant_col.localDiscriminatorByGlobal(variant_info.variant_name_to_discriminator[type_name]);
+                    auto local_discr = variant_col.localDiscriminatorByGlobal(variant_info.variant_name_to_discriminator.find(prehashed_type_name)->second);
                     auto & variant = variant_col.getVariantByLocalDiscriminator(local_discr);
-                    getVariantSerialization(type, type_name)->deserializeBinary(variant, buf, getFormatSettings());
+                    getVariantSerialization(type, prehashed_type_name)->deserializeBinary(variant, buf, getFormatSettings());
                     local_discriminators[prev_size + i] = local_discr;
                     offsets[prev_size + i] = variant.size() - 1;
                 }
@@ -733,12 +740,13 @@ void ColumnDynamic::doInsertRangeFrom(const IColumn & src_, size_t start, size_t
                 ReadBufferFromMemory buf(value);
                 auto type = decodeDataType(buf);
                 auto type_name = type->getName();
+                PrehashedStringView prehashed_type_name(type_name);
                 /// Check if we have variant with this type. In this case we should extract
                 /// the value from src shared variant and insert it into this variant.
-                if (auto it = variant_info.variant_name_to_discriminator.find(type_name); it != variant_info.variant_name_to_discriminator.end())
+                if (auto it = variant_info.variant_name_to_discriminator.find(prehashed_type_name); it != variant_info.variant_name_to_discriminator.end())
                 {
                     auto local_discr = variant_col.localDiscriminatorByGlobal(it->second);
-                    getVariantSerialization(type, type_name)->deserializeBinary(*variant_columns[local_discr], buf, getFormatSettings());
+                    getVariantSerialization(type, prehashed_type_name)->deserializeBinary(*variant_columns[local_discr], buf, getFormatSettings());
                     local_discriminators.push_back(local_discr);
                     offsets.push_back(variant_columns[local_discr]->size() - 1);
                 }
@@ -762,7 +770,7 @@ void ColumnDynamic::doInsertRangeFrom(const IColumn & src_, size_t start, size_t
                         shared_variant,
                         *src_variant_columns[src_local_discr],
                         src_variants[src_global_discr],
-                        getVariantSerialization(src_variants[src_global_discr], dynamic_src.variant_info.variant_names[src_global_discr]),
+                        getVariantSerialization(src_variants[src_global_discr], dynamic_src.variant_info.getPrehashedVariantName(src_global_discr)),
                         src_offset);
                     local_discriminators.push_back(shared_variant_local_discr);
                     offsets.push_back(shared_variant.size() - 1);
@@ -874,7 +882,7 @@ void ColumnDynamic::doInsertManyFrom(const IColumn & src_, size_t position, size
     variant_col.insertManyIntoVariantFrom(getSharedVariantDiscriminator(), *tmp_shared_variant, 0, length);
 }
 
-void ColumnDynamic::insertValueIntoSharedVariant(const IColumn & src, const DataTypePtr & type, const String & type_name, size_t n)
+void ColumnDynamic::insertValueIntoSharedVariant(const IColumn & src, const DataTypePtr & type, PrehashedStringView type_name, size_t n)
 {
     auto & variant_col = getVariantColumn();
     auto & shared_variant = getSharedVariant();

@@ -1,0 +1,90 @@
+parts
+1	42	Int64	true
+2	a	String	true
+3	[1,2]	Array(Int64)	true
+4	true	Bool	true
+5	3.5	Float64	true
+6	2020-01-01	Date	true
+7	b	String	true
+8	7	UInt8	true
+9	[3]	Array(Int64)	true
+10	[4,5,6]	Array(Int64)	true
+11	c	String	true
+merged
+1	42	Int64	true
+2	a	String	false
+3	[1,2]	Array(Int64)	false
+4	true	Bool	true
+5	3.5	Float64	true
+6	2020-01-01	Date	true
+7	b	String	false
+8	7	UInt8	false
+9	[3]	Array(Int64)	false
+10	[4,5,6]	Array(Int64)	false
+11	c	String	false
+insert select
+1	42	Int64	true
+2	a	String	false
+3	[1,2]	Array(Int64)	false
+4	true	Bool	true
+5	3.5	Float64	true
+6	2020-01-01	Date	true
+7	b	String	false
+8	7	UInt8	true
+9	[3]	Array(Int64)	false
+10	[4,5,6]	Array(Int64)	false
+11	c	String	false
+101	42	Int64	true
+102	a	String	false
+103	[1,2]	Array(Int64)	false
+104	true	Bool	true
+105	3.5	Float64	true
+106	2020-01-01	Date	true
+107	b	String	false
+108	7	UInt8	true
+109	[3]	Array(Int64)	false
+110	[4,5,6]	Array(Int64)	false
+111	c	String	false
+json
+0	{"a":0,"arr":[{"x":"0","y":"0"}],"b":"0","c0":0}	['b','c0']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+1	{"a":1,"arr":[{"x":"1","y":"2"}],"b":"1","c1":1}	['b','c1']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+2	{"a":2,"arr":[{"x":"2","y":"4"}],"b":"2","c2":2}	['b','c2']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+3	{"a":3,"arr":[{"x":"3","y":"6"}],"b":"3","c3":3}	['b','c3']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+4	{"a":4,"arr":[{"x":"4","y":"8"}],"b":"4","c4":4}	['b','c4']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+5	{"a":5,"arr":[{"x":"5","y":"10"}],"b":"5","c0":5}	['b','c0']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+6	{"a":6,"arr":[{"x":"6","y":"12"}],"b":"6","c1":6}	['b','c1']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+7	{"a":7,"arr":[{"x":"7","y":"14"}],"b":"7","c2":7}	['b','c2']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+8	{"a":8,"arr":[{"x":"8","y":"16"}],"b":"8","c3":8}	['b','c3']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+9	{"a":9,"arr":[{"x":"9","y":"18"}],"b":"9","c4":9}	['b','c4']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+10	{"a":10,"arr":[{"x":"10","y":"20"}],"b":"10","c0":10}	['b','c0']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+11	{"a":11,"arr":[{"x":"11","y":"22"}],"b":"11","c1":11}	['b','c1']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+12	{"a":12,"arr":[{"x":"12","y":"24"}],"b":"12","c2":12}	['b','c2']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+13	{"a":13,"arr":[{"x":"13","y":"26"}],"b":"13","c3":13}	['b','c3']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+14	{"a":14,"arr":[{"x":"14","y":"28"}],"b":"14","c4":14}	['b','c4']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+15	{"a":15,"arr":[{"x":"15","y":"30"}],"b":"15","c0":15}	['b','c0']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+16	{"a":16,"arr":[{"x":"16","y":"32"}],"b":"16","c1":16}	['b','c1']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+17	{"a":17,"arr":[{"x":"17","y":"34"}],"b":"17","c2":17}	['b','c2']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+18	{"a":18,"arr":[{"x":"18","y":"36"}],"b":"18","c3":18}	['b','c3']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+19	{"a":19,"arr":[{"x":"19","y":"38"}],"b":"19","c4":19}	['b','c4']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+20	{"arr":[{"x":0,"z":"0"}],"c0":"0","d":0}	['c0','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+21	{"arr":[{"x":1,"z":"1"}],"c1":"1","d":1}	['c1','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+22	{"arr":[{"x":2,"z":"2"}],"c2":"2","d":2}	['c2','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+23	{"arr":[{"x":3,"z":"3"}],"c3":"3","d":3}	['c3','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+24	{"arr":[{"x":4,"z":"4"}],"c4":"4","d":4}	['c4','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+25	{"arr":[{"x":5,"z":"5"}],"c5":"5","d":5}	['c5','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+26	{"arr":[{"x":6,"z":"6"}],"c6":"6","d":6}	['c6','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+27	{"arr":[{"x":7,"z":"7"}],"c0":"7","d":7}	['c0','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+28	{"arr":[{"x":8,"z":"8"}],"c1":"8","d":8}	['c1','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+29	{"arr":[{"x":9,"z":"9"}],"c2":"9","d":9}	['c2','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+30	{"arr":[{"x":10,"z":"10"}],"c3":"10","d":10}	['c3','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+31	{"arr":[{"x":11,"z":"11"}],"c4":"11","d":11}	['c4','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+32	{"arr":[{"x":12,"z":"12"}],"c5":"12","d":12}	['c5','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+33	{"arr":[{"x":13,"z":"13"}],"c6":"13","d":13}	['c6','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+34	{"arr":[{"x":14,"z":"14"}],"c0":"14","d":14}	['c0','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+35	{"arr":[{"x":15,"z":"15"}],"c1":"15","d":15}	['c1','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+36	{"arr":[{"x":16,"z":"16"}],"c2":"16","d":16}	['c2','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+37	{"arr":[{"x":17,"z":"17"}],"c3":"17","d":17}	['c3','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+38	{"arr":[{"x":18,"z":"18"}],"c4":"18","d":18}	['c4','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+39	{"arr":[{"x":19,"z":"19"}],"c5":"19","d":19}	['c5','d']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+40	{"a":[1,2],"arr":[{"w":[{"v":1}],"x":1.5}],"e":{"f":true}}	['e.f']	Array(JSON(max_dynamic_types=1, max_dynamic_paths=0))
+dynamic paths	['a','arr']
