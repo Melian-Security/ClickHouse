@@ -1797,12 +1797,10 @@ public:
         auto element_type_name = element_type->getName();
         if (column_dynamic.addNewVariant(element_type, element_type_name))
         {
-            auto it = json_extract_nodes_cache.find(element_type_name);
-            if (it == json_extract_nodes_cache.end())
-                it = json_extract_nodes_cache.emplace(element_type_name, buildJSONExtractTree<JSONParser>(element_type, "Dynamic inference")).first;
+            const auto & node = getNodeForType(element_type, element_type_name);
             auto global_discriminator = variant_info.variant_name_to_discriminator.at(element_type_name);
             auto & variant = variant_column.getVariantByGlobalDiscriminator(global_discriminator);
-            if (!it->second->insertResultToColumn(variant, element, insert_settings, format_settings, error))
+            if (!node.insertResultToColumn(variant, element, insert_settings, format_settings, error))
                 return false;
             variant_column.getLocalDiscriminators().push_back(variant_column.localDiscriminatorByGlobal(global_discriminator));
             variant_column.getOffsets().push_back(variant.size() - 1);
@@ -1817,6 +1815,15 @@ public:
 
         column_dynamic.insertValueIntoSharedVariant(*tmp_variant_column, element_type, element_type_name, 0);
         return true;
+    }
+
+    /// The node that inserts JSON elements into a column of `type`. `type_name` is the name of `type`.
+    const JSONExtractTreeNode<JSONParser> & getNodeForType(const DataTypePtr & type, const String & type_name) const
+    {
+        auto it = json_extract_nodes_cache.find(type_name);
+        if (it == json_extract_nodes_cache.end())
+            it = json_extract_nodes_cache.emplace(type_name, buildJSONExtractTree<JSONParser>(type, "Dynamic inference")).first;
+        return *it->second;
     }
 
     DataTypePtr elementToDataType(const typename JSONParser::Element & element, const FormatSettings & format_settings) const
@@ -1935,7 +1942,6 @@ public:
         , typed_path_nodes(std::move(typed_path_nodes_))
         , paths_to_skip(paths_to_skip_)
         , dynamic_node(std::make_unique<DynamicNode<JSONParser>>(type_of_nested_objects))
-        , dynamic_serialization(DataTypeDynamic().getDefaultSerialization())
     {
         sorted_paths_to_skip.assign(paths_to_skip.begin(), paths_to_skip.end());
         std::sort(sorted_paths_to_skip.begin(), sorted_paths_to_skip.end());
@@ -2022,7 +2028,7 @@ public:
         auto & shared_data_values_chars = shared_data_values->getChars();
         auto & shared_data_values_offsets = shared_data_values->getOffsets();
         shared_data_values_offsets.reserve(shared_data_values_offsets.size() + shared_data_entries.size());
-        MutableColumnPtr tmp_dynamic_column;
+        SharedDataValueColumns value_columns;
         for (size_t i = 0; i != shared_data_entries.size(); ++i)
         {
             const std::string_view path = get_entry_path(shared_data_entries[i]);
@@ -2041,7 +2047,7 @@ public:
             {
                 /// Serialize value directly into shared data chars.
                 WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag(), format_settings.json_max_string_column_growth_step);
-                if (!insertIntoSharedData(value_buf, value, insert_settings, format_settings, error, tmp_dynamic_column))
+                if (!insertIntoSharedData(value_buf, value, insert_settings, format_settings, error, value_columns))
                 {
                     error += fmt::format(" (while reading path {})", path);
                     SerializationObject::restoreColumnObject(column_object, prev_size);
@@ -2082,6 +2088,19 @@ public:
     }
 
 private:
+    /// Columns for the values of one object that go to shared data and are not of a simple type, one per inferred type.
+    /// They hold what the variants of a temporary Dynamic column, empty at the start of the object, would hold, so a
+    /// value is serialized exactly as such a Dynamic column would serialize it, without building the Dynamic column.
+    struct SharedDataValueColumn
+    {
+        String type_name;
+        DataTypePtr type;
+        SerializationPtr serialization;
+        const JSONExtractTreeNode<JSONParser> * node;
+        MutableColumnPtr column;
+    };
+    using SharedDataValueColumns = std::vector<SharedDataValueColumn>;
+
     struct SharedDataEntry
     {
         size_t path_offset;
@@ -2533,7 +2552,7 @@ private:
         return dynamic_node->insertResultToColumn(column_dynamic, element, insert_settings, format_settings, error);
     }
 
-    bool insertIntoSharedData(WriteBuffer & buf, const typename JSONParser::Element & element, const JSONExtractInsertSettings & insert_settings, const FormatSettings & format_settings, String & error, MutableColumnPtr & tmp_dynamic_column) const
+    bool insertIntoSharedData(WriteBuffer & buf, const typename JSONParser::Element & element, const JSONExtractInsertSettings & insert_settings, const FormatSettings & format_settings, String & error, SharedDataValueColumns & value_columns) const
     {
         /// Fast track where we process simple data types explicitly and serialize them into
         /// shared data without inserting value into Dynamic column with subsequent binary serialization.
@@ -2616,23 +2635,54 @@ private:
                 break;
         }
 
-        if (!tmp_dynamic_column)
-            tmp_dynamic_column = ColumnDynamic::create();
-
+        /// The value is serialized as a value of a Dynamic column: its inferred type, then the value in the binary format of
+        /// the type. The values of one object that have the same type go to one column, as they would go to one variant of
+        /// a Dynamic column, because the binary representation of a value with a JSON type depends on the other values of
+        /// its column (the order of its dynamic paths).
         JSONExtractInsertSettings insert_settings_for_shared_data = insert_settings;
-        /// We use single temporary Dynamic column for all shared data paths because
-        /// creating it every time is very slow. And so we need to always infer
-        /// new type for new value and don't reuse existing variants.
+        /// Always infer the type of a value, do not try the types of the previous values first.
         insert_settings_for_shared_data.try_existing_variants_in_dynamic_first = false;
-        if (dynamic_node->insertResultToColumn(*tmp_dynamic_column, element, insert_settings_for_shared_data, format_settings, error))
+
+        auto element_type = removeNullable(dynamic_node->elementToDataType(element, format_settings));
+        if (!checkIfTypeIsComplete(element_type))
         {
-            /// Use default format settings for binary serialization. Non-default settings may change
-            /// the binary representation of the values and break the future deserialization.
-            dynamic_serialization->serializeBinary(*tmp_dynamic_column, tmp_dynamic_column->size() - 1, buf, getDefaultFormatSettings());
-            return true;
+            error = fmt::format(
+                "Cannot infer the type of JSON element {}, because it contains only nulls. To use String type for elements with incomplete "
+                "type, enable setting input_format_json_infer_incomplete_types_as_strings",
+                jsonElementToString<JSONParser>(element, format_settings));
+            return false;
         }
 
-        return false;
+        auto element_type_name = element_type->getName();
+        auto it = std::find_if(value_columns.begin(), value_columns.end(), [&](const auto & value_column) { return value_column.type_name == element_type_name; });
+        if (it == value_columns.end())
+        {
+            /// A Dynamic column cannot have more types than this. Further types of values go to its shared variant,
+            /// where each value is serialized from a column of its own.
+            if (value_columns.size() >= ColumnDynamic::MAX_DYNAMIC_TYPES_LIMIT)
+            {
+                auto column = element_type->createColumn();
+                if (!dynamic_node->getNodeForType(element_type, element_type_name).insertResultToColumn(*column, element, insert_settings_for_shared_data, format_settings, error))
+                    return false;
+                encodeDataType(element_type, buf);
+                getDataTypesCache().getSerialization(PrehashedStringView(element_type_name), element_type)->serializeBinary(*column, 0, buf, getDefaultFormatSettings());
+                return true;
+            }
+
+            const auto & node = dynamic_node->getNodeForType(element_type, element_type_name);
+            auto serialization = getDataTypesCache().getSerialization(PrehashedStringView(element_type_name), element_type);
+            auto column = element_type->createColumn();
+            it = value_columns.insert(value_columns.end(), SharedDataValueColumn{std::move(element_type_name), std::move(element_type), std::move(serialization), &node, std::move(column)});
+        }
+
+        if (!it->node->insertResultToColumn(*it->column, element, insert_settings_for_shared_data, format_settings, error))
+            return false;
+
+        /// Use default format settings for binary serialization. Non-default settings may change
+        /// the binary representation of the values and break the future deserialization.
+        encodeDataType(it->type, buf);
+        it->serialization->serializeBinary(*it->column, it->column->size() - 1, buf, getDefaultFormatSettings());
+        return true;
     }
 
     /// Global discriminator of the variant named `name`, if the Dynamic column has it.
@@ -2806,7 +2856,6 @@ private:
     std::vector<String> sorted_paths_to_skip;
     std::list<re2::RE2> path_regexps_to_skip;
     std::unique_ptr<DynamicNode<JSONParser>> dynamic_node;
-    SerializationPtr dynamic_serialization;
     const DateLUTImpl & time_zone_for_schema_inference = DateLUT::instance();
     const DateLUTImpl & utc_time_zone_for_schema_inference = DateLUT::instance("UTC");
 

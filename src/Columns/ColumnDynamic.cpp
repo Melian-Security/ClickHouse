@@ -78,8 +78,35 @@ const DataTypePtr & ColumnDynamic::getSharedVariantDataType()
 
 ColumnDynamic::ColumnDynamic(size_t max_dynamic_types_) : max_dynamic_types(max_dynamic_types_), global_max_dynamic_types(max_dynamic_types)
 {
-    /// Create Variant with shared variant.
-    setVariantType(std::make_shared<DataTypeVariant>(DataTypes{getSharedVariantDataType()}));
+    /// Create Variant with shared variant only. Its type and names are the same for every new Dynamic column,
+    /// so they are built once per thread instead of for every column (a JSON column creates one for every new path).
+    struct EmptyVariant
+    {
+        DataTypePtr type;
+        String name;
+        size_t name_hash;
+        size_t shared_variant_name_hash;
+    };
+    static thread_local const EmptyVariant empty_variant = []
+    {
+        EmptyVariant result;
+        result.type = std::make_shared<DataTypeVariant>(DataTypes{getSharedVariantDataType()});
+        result.name = result.type->getName();
+        result.name_hash = PrehashedStringView(result.name).hash;
+        result.shared_variant_name_hash = PrehashedStringView(getSharedVariantTypeName()).hash;
+        return result;
+    }();
+
+    variant_column = empty_variant.type->createColumn();
+    variant_column_ptr = assert_cast<ColumnVariant *>(variant_column.get());
+    /// The same as createVariantInfo(empty_variant.type).
+    variant_info.variant_type = empty_variant.type;
+    variant_info.variant_name = empty_variant.name;
+    variant_info.variant_name_hash = empty_variant.name_hash;
+    variant_info.variant_names.push_back(getSharedVariantTypeName());
+    variant_info.variant_name_hashes.push_back(empty_variant.shared_variant_name_hash);
+    variant_info.variant_name_to_discriminator.emplace(getSharedVariantTypeName(), 0);
+    variant_info.shared_variant_discriminator = 0;
 }
 
 ColumnDynamic::ColumnDynamic(
