@@ -966,10 +966,47 @@ void insertSourceRanges(IColumn & column, std::span<const SourceRange> ranges)
     }
 }
 
-/// `length` rows of a source Variant column from `start`, or `length` default values if column is null.
+/// A source Variant column with the same variants as the column its rows go to, with what insertVariantRows
+/// needs of it resolved once instead of for every row.
+struct VariantRowsSource
+{
+    /// The number of variants of the column the source was resolved for. Variants are only added by inserts.
+    size_t num_variants = 0;
+    const ColumnVariant::Discriminator * discriminators = nullptr;
+    const ColumnVariant::Offset * offsets = nullptr;
+    /// Indexed by the local discriminators of the source: the local discriminator in the column, and the variant
+    /// of the source.
+    VectorWithMemoryTracking<ColumnVariant::Discriminator> local_discriminators;
+    VectorWithMemoryTracking<const IColumn *> variants;
+
+    /// Resolves the source for the column, unless it is resolved for the current variants of the column.
+    void update(const ColumnVariant & src, const ColumnVariant & column)
+    {
+        size_t column_num_variants = column.getNumVariants();
+        if (num_variants == column_num_variants && discriminators)
+            return;
+
+        if (src.getNumVariants() != column_num_variants)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot insert value of Variant type with different number of types");
+
+        discriminators = src.getLocalDiscriminators().data();
+        offsets = src.getOffsets().data();
+        local_discriminators.resize(column_num_variants);
+        variants.resize(column_num_variants);
+        for (size_t src_local_discr = 0; src_local_discr != column_num_variants; ++src_local_discr)
+        {
+            auto discr = static_cast<ColumnVariant::Discriminator>(src_local_discr);
+            local_discriminators[src_local_discr] = column.localDiscriminatorByGlobal(src.globalDiscriminatorByLocal(discr));
+            variants[src_local_discr] = &src.getVariantByLocalDiscriminator(src_local_discr);
+        }
+        num_variants = column_num_variants;
+    }
+};
+
+/// `length` rows of a source Variant column from `start`, or `length` default values if source is null.
 struct VariantRows
 {
-    const ColumnVariant * column;
+    const VariantRowsSource * source;
     size_t start;
     size_t length;
 };
@@ -1019,7 +1056,7 @@ void insertVariantRows(ColumnVariant & column, std::span<const VariantRows> rows
 
     for (const auto & row : rows)
     {
-        if (!row.column)
+        if (!row.source)
         {
             memset(discriminators_pos, null_discriminator, row.length);
             memset(offsets_pos, 0, row.length * sizeof(*offsets_pos));
@@ -1028,22 +1065,22 @@ void insertVariantRows(ColumnVariant & column, std::span<const VariantRows> rows
             continue;
         }
 
-        const auto & src = *row.column;
-        if (src.getNumVariants() != num_variants)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot insert value of Variant type with different number of types");
-
-        const auto * src_discriminators = src.getLocalDiscriminators().data();
-        const auto * src_offsets = src.getOffsets().data();
+        const auto & src = *row.source;
+        const auto * src_discriminators = src.discriminators;
+        const auto * src_offsets = src.offsets;
+        const auto * src_local_discriminators = src.local_discriminators.data();
         for (size_t i = row.start; i != row.start + row.length; ++i)
         {
             auto src_local_discr = src_discriminators[i];
-            auto local_discr = column.localDiscriminatorByGlobal(src.globalDiscriminatorByLocal(src_local_discr));
-            *discriminators_pos++ = local_discr;
-            if (local_discr == null_discriminator)
+            if (src_local_discr == null_discriminator)
             {
+                *discriminators_pos++ = null_discriminator;
                 *offsets_pos++ = 0;
                 continue;
             }
+
+            auto local_discr = src_local_discriminators[src_local_discr];
+            *discriminators_pos++ = local_discr;
 
             auto & variant_size = variant_sizes[local_discr];
             auto & ranges = variant_ranges[local_discr];
@@ -1055,7 +1092,7 @@ void insertVariantRows(ColumnVariant & column, std::span<const VariantRows> rows
             }
             *offsets_pos++ = variant_size++;
 
-            const auto * src_variant = &src.getVariantByLocalDiscriminator(src_local_discr);
+            const auto * src_variant = src.variants[src_local_discr];
             size_t src_offset = src_offsets[i];
             if (!ranges.empty() && ranges.back().column == src_variant && ranges.back().start + ranges.back().length == src_offset)
                 ++ranges.back().length;
@@ -1146,6 +1183,8 @@ struct ColumnObject::GatherSourcePlan
         const ColumnDynamic * src_column;
         std::string_view path;
         ColumnDynamic::InsertFromCache cache;
+        /// The Variant column of the source, used while `cache` says its rows go into our Variant column as they are.
+        VariantRowsSource variant_rows_source;
     };
     VectorWithMemoryTracking<DynamicPath> dynamic_paths;
     /// For each of GatherState::dynamic_columns, its index in dynamic_paths, or -1 if the source has no such dynamic path.
@@ -1311,9 +1350,9 @@ ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnO
     {
         const auto * src_dynamic_column = assert_cast<const ColumnDynamic *>(column.get());
         if (auto it = dynamic_paths_ptrs.find(path); it != dynamic_paths_ptrs.end())
-            plan.dynamic_paths.push_back({it->second, src_dynamic_column, path, {}});
+            plan.dynamic_paths.push_back({it->second, src_dynamic_column, path, {}, {}});
         else if (auto * dynamic_path_column = tryToAddNewDynamicPath(path))
-            plan.dynamic_paths.push_back({dynamic_path_column, src_dynamic_column, path, {}});
+            plan.dynamic_paths.push_back({dynamic_path_column, src_dynamic_column, path, {}, {}});
         else
             plan.dynamic_paths_for_shared_data.emplace_back(path, src_dynamic_column);
     }
@@ -1447,7 +1486,8 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
                 insert_defaults_up_to(row);
                 if (column.insertsVariantDirectly(*dynamic_path.src_column, dynamic_path.cache))
                 {
-                    pending_rows.push_back({&dynamic_path.src_column->getVariantColumn(), range.start, range.length});
+                    dynamic_path.variant_rows_source.update(dynamic_path.src_column->getVariantColumn(), column.getVariantColumn());
+                    pending_rows.push_back({&dynamic_path.variant_rows_source, range.start, range.length});
                     column_size += range.length;
                 }
                 else
