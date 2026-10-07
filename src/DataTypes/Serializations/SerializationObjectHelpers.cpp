@@ -227,18 +227,18 @@ ColumnPtr SharedDataBucketsSplitter::extractBucket(size_t bucket) const
     bucket_values->getOffsets().reserve_exact(bucket_num_paths[bucket]);
     bucket_offsets->reserve_exact(end - start);
 
-    size_t path_index = 0;
+    /// Visit only the occurrences of this bucket: they are in traversal order, so they are walked together with the rows.
+    const size_t first_occurrence = (*shared_data_offsets)[ssize_t(start) - 1];
+    size_t position = bucket_occurrences_begin[bucket];
+    const size_t bucket_end = bucket_occurrences_begin[bucket + 1];
     for (size_t i = start; i != end; ++i)
     {
-        size_t offset_start = (*shared_data_offsets)[ssize_t(i) - 1];
-        size_t offset_end = (*shared_data_offsets)[ssize_t(i)];
-        for (size_t j = offset_start; j != offset_end; ++j, ++path_index)
+        size_t row_end = (*shared_data_offsets)[ssize_t(i)] - first_occurrence;
+        for (; position != bucket_end && bucket_occurrences[position] < row_end; ++position)
         {
-            if (id_to_bucket[path_ids[path_index]] == bucket)
-            {
-                bucket_paths->insertFrom(*shared_data_paths, j);
-                bucket_values->insertFrom(*shared_data_values, j);
-            }
+            size_t j = first_occurrence + bucket_occurrences[position];
+            bucket_paths->insertFrom(*shared_data_paths, j);
+            bucket_values->insertFrom(*shared_data_values, j);
         }
 
         bucket_offsets->push_back(bucket_paths->size());

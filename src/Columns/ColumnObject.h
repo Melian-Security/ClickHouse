@@ -435,8 +435,10 @@ private:
     void insertGatheredRanges(const Ranges & ranges);
     static void sortDynamicPathsForSharedData(DynamicPathsForSharedData & paths);
 
-    /// serialization_caches, if not null, has a cache for each of src_dynamic_paths_for_shared_data.
-    void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length, SharedDataValueSerializationCache * serialization_caches = nullptr);
+    struct SharedDataSerializationState;
+    /// serialization_state, if not null, belongs to src_object_column and src_dynamic_paths_for_shared_data, which
+    /// must not change while it is used.
+    void insertFromSharedDataAndFillRemainingDynamicPaths(const ColumnObject & src_object_column, const DynamicPathsForSharedData & src_dynamic_paths_for_shared_data, size_t start, size_t length, SharedDataSerializationState * serialization_state = nullptr);
     void serializePathAndValueIntoArena(Arena & arena, const char *& begin, std::string_view path, std::string_view value, std::string_view & res) const;
     void serializeDynamicPathsAndSharedDataIntoArena(size_t n, Arena & arena, const char *& begin, std::string_view & res) const;
     void deserializeDynamicPathsAndSharedDataFromArena(ReadBuffer & in);
