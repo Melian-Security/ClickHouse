@@ -370,6 +370,9 @@ private:
     void initIdentityGlobalToLocalDiscriminatorsMapping();
     void constructOffsetsFromDiscriminators();
 
+    /// Returns true if every row's offset is within its variant and the size of every variant equals the number of rows that refer to it.
+    bool isStateConsistent() const;
+
     /// When `offset` is given, `null_map` covers the suffix `[offset, size())` (the range must end at the
     /// last row); otherwise it must cover the whole column.
     template <bool inverted>
