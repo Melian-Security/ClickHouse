@@ -1,0 +1,20 @@
+<test>
+    <settings>
+        <enable_json_type>1</enable_json_type>
+    </settings>
+
+    <!-- Objects whose arrays of objects do not fit into the dynamic paths and go to shared data. -->
+    <create_query>CREATE TABLE json_arrays_of_objects_src (s String) ENGINE = Memory</create_query>
+    <fill_query>
+        INSERT INTO json_arrays_of_objects_src SELECT
+            '{"a":' || toString(number) ||
+            ',"b' || toString(number % 7) || '":[{"k":"k' || toString(number % 50) || '","v":' || toString(number % 1000) || '}]' ||
+            ',"c' || toString(number % 5) || '":[{"x":1,"y":"y' || toString(number % 13) || '"},{"x":2,"z":[1,2]}]' ||
+            ',"d' || toString(number % 3) || '":["t' || toString(number % 300) || '"]}'
+        FROM numbers(300000)
+    </fill_query>
+
+    <query>SELECT s::JSON(max_dynamic_paths = 1) FROM json_arrays_of_objects_src FORMAT Null</query>
+
+    <drop_query>DROP TABLE IF EXISTS json_arrays_of_objects_src</drop_query>
+</test>
