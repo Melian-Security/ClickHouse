@@ -4,6 +4,8 @@
 #include <DataTypes/DataTypeVariant.h>
 #include <Columns/ColumnObject.h>
 #include <Columns/ColumnCompressed.h>
+#include <Columns/ColumnConst.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnVariant.h>
 #include <IO/Operators.h>
 #include <IO/WriteBufferFromString.h>
@@ -16,6 +18,8 @@
 #include <Common/SipHash.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
 #include <Common/logger_useful.h>
+#include <Common/memcpySmall.h>
+#include <Common/typeid_cast.h>
 #include <Processors/Transforms/ColumnGathererTransform.h>
 #include <base/scope_guard.h>
 
@@ -805,6 +809,256 @@ bool ColumnObject::tryInsert(const Field & x)
     return true;
 }
 
+namespace
+{
+
+/// Consecutive rows of a source column.
+struct SourceRange
+{
+    const IColumn * column;
+    size_t start;
+    size_t length;
+};
+
+void insertSourceRanges(IColumn & column, std::span<const SourceRange> ranges);
+
+void insertStringRanges(ColumnString & column, std::span<const SourceRange> ranges)
+{
+    size_t num_rows = 0;
+    size_t num_bytes = 0;
+    for (const auto & range : ranges)
+    {
+        const auto & src_offsets = assert_cast<const ColumnString &>(*range.column).getOffsets();
+        num_rows += range.length;
+        /// Offsets have a padding element before the first one, which is 0.
+        num_bytes += src_offsets[range.start + range.length - 1] - src_offsets[static_cast<ssize_t>(range.start) - 1];
+    }
+
+    auto & chars = column.getChars();
+    auto & offsets = column.getOffsets();
+    chars.reserve(chars.size() + num_bytes);
+    offsets.reserve(offsets.size() + num_rows);
+    size_t chars_pos = chars.size();
+    size_t row = offsets.size();
+    chars.resize(chars_pos + num_bytes);
+    offsets.resize(row + num_rows);
+
+    for (const auto & range : ranges)
+    {
+        const auto & src = assert_cast<const ColumnString &>(*range.column);
+        const auto & src_offsets = src.getOffsets();
+        size_t src_begin = src_offsets[static_cast<ssize_t>(range.start) - 1];
+        if (range.length == 1)
+        {
+            size_t size = src_offsets[range.start] - src_begin;
+            memcpySmallAllowReadWriteOverflow15(chars.data() + chars_pos, src.getChars().data() + src_begin, size);
+            chars_pos += size;
+            offsets[row++] = chars_pos;
+        }
+        else
+        {
+            size_t size = src_offsets[range.start + range.length - 1] - src_begin;
+            memcpy(chars.data() + chars_pos, src.getChars().data() + src_begin, size);
+            for (size_t i = range.start; i != range.start + range.length; ++i)
+                offsets[row++] = chars_pos + src_offsets[i] - src_begin;
+            chars_pos += size;
+        }
+    }
+}
+
+template <size_t value_size>
+void insertFixedSizeRanges(IColumn & column, size_t num_rows, std::span<const SourceRange> ranges)
+{
+    char * pos = column.insertRawUninitialized(num_rows).data();
+    /// The raw data of the sources seen so far. A batch has ranges of a few sources only.
+    std::array<std::pair<const IColumn *, const char *>, 16> sources{};
+    size_t num_sources = 0;
+    for (const auto & range : ranges)
+    {
+        const char * data = nullptr;
+        for (size_t i = 0; i != num_sources; ++i)
+        {
+            if (sources[i].first == range.column)
+            {
+                data = sources[i].second;
+                break;
+            }
+        }
+        if (!data)
+        {
+            data = range.column->getRawData().data();
+            if (num_sources != sources.size())
+                sources[num_sources++] = {range.column, data};
+        }
+
+        if (range.length == 1)
+            memcpy(pos, data + range.start * value_size, value_size);
+        else
+            memcpy(pos, data + range.start * value_size, range.length * value_size);
+        pos += range.length * value_size;
+    }
+}
+
+bool tryInsertFixedSizeRanges(IColumn & column, std::span<const SourceRange> ranges)
+{
+    if (!column.isFixedAndContiguous() || isColumnConst(column))
+        return false;
+
+    size_t num_rows = 0;
+    for (const auto & range : ranges)
+        num_rows += range.length;
+
+    switch (column.sizeOfValueIfFixed())
+    {
+        case 1: insertFixedSizeRanges<1>(column, num_rows, ranges); return true;
+        case 2: insertFixedSizeRanges<2>(column, num_rows, ranges); return true;
+        case 4: insertFixedSizeRanges<4>(column, num_rows, ranges); return true;
+        case 8: insertFixedSizeRanges<8>(column, num_rows, ranges); return true;
+        case 16: insertFixedSizeRanges<16>(column, num_rows, ranges); return true;
+        default: return false;
+    }
+}
+
+void insertNullableRanges(ColumnNullable & column, std::span<const SourceRange> ranges)
+{
+    VectorWithMemoryTracking<SourceRange> nested_ranges;
+    VectorWithMemoryTracking<SourceRange> null_map_ranges;
+    nested_ranges.reserve(ranges.size());
+    null_map_ranges.reserve(ranges.size());
+    for (const auto & range : ranges)
+    {
+        const auto & src = assert_cast<const ColumnNullable &>(*range.column);
+        nested_ranges.push_back({&src.getNestedColumn(), range.start, range.length});
+        null_map_ranges.push_back({&src.getNullMapColumn(), range.start, range.length});
+    }
+    insertSourceRanges(column.getNestedColumn(), nested_ranges);
+    insertSourceRanges(column.getNullMapColumn(), null_map_ranges);
+}
+
+/// Same result as inserting the ranges in order with insertFrom (ranges of one row) and insertRangeFrom.
+/// Columns of strings, of fixed-size values and Nullable of them are copied without a virtual call per range.
+/// Like insertFrom, it expects the source columns to have the class of the column.
+void insertSourceRanges(IColumn & column, std::span<const SourceRange> ranges)
+{
+    const IColumn * first_src = ranges.empty() ? nullptr : ranges.front().column;
+    if (first_src && typeid(*first_src) == typeid(column))
+    {
+        if (auto * string_column = typeid_cast<ColumnString *>(&column))
+        {
+            insertStringRanges(*string_column, ranges);
+            return;
+        }
+        if (auto * nullable_column = typeid_cast<ColumnNullable *>(&column))
+        {
+            insertNullableRanges(*nullable_column, ranges);
+            return;
+        }
+        if (tryInsertFixedSizeRanges(column, ranges))
+            return;
+    }
+
+    for (const auto & range : ranges)
+    {
+        if (range.length == 1)
+            column.insertFrom(*range.column, range.start);
+        else
+            column.insertRangeFrom(*range.column, range.start, range.length);
+    }
+}
+
+/// A row of a source Variant column, or `row` default values if column is null.
+struct VariantRow
+{
+    const ColumnVariant * column;
+    size_t row;
+};
+
+/// Same result as ColumnVariant::insertFrom of each row and insertManyDefaults, in order: discriminators and offsets
+/// are written row by row, and the values of each variant are inserted together, in the order of rows.
+/// Buffers of insertVariantRows, kept between calls.
+struct VariantRowsScratch
+{
+    VectorWithMemoryTracking<size_t> variant_sizes;
+    VectorWithMemoryTracking<VectorWithMemoryTracking<SourceRange>> variant_ranges;
+};
+
+/// The sources must have the same variants as the column.
+void insertVariantRows(ColumnVariant & column, std::span<const VariantRow> rows, VariantRowsScratch & scratch)
+{
+    size_t num_rows = 0;
+    size_t num_values = 0;
+    for (const auto & row : rows)
+    {
+        num_rows += row.column ? 1 : row.row;
+        num_values += row.column != nullptr;
+    }
+
+    /// For a few values, collecting them per variant costs more than it saves.
+    static constexpr size_t min_values_to_collect = 16;
+    if (num_values < min_values_to_collect)
+    {
+        for (const auto & row : rows)
+        {
+            if (row.column)
+                column.insertFrom(*row.column, row.row);
+            else
+                column.insertManyDefaults(row.row);
+        }
+        return;
+    }
+
+    auto & local_discriminators = column.getLocalDiscriminators();
+    auto & offsets = column.getOffsets();
+    local_discriminators.reserve(local_discriminators.size() + num_rows);
+    offsets.reserve(offsets.size() + num_rows);
+
+    size_t num_variants = column.getNumVariants();
+    auto & variant_sizes = scratch.variant_sizes;
+    auto & variant_ranges = scratch.variant_ranges;
+    variant_sizes.resize(num_variants);
+    if (variant_ranges.size() < num_variants)
+        variant_ranges.resize(num_variants);
+    for (size_t i = 0; i != num_variants; ++i)
+    {
+        variant_sizes[i] = column.getVariantByLocalDiscriminator(i).size();
+        variant_ranges[i].clear();
+    }
+
+    for (const auto & row : rows)
+    {
+        if (!row.column)
+        {
+            local_discriminators.resize_fill(local_discriminators.size() + row.row, ColumnVariant::NULL_DISCRIMINATOR);
+            offsets.resize_fill(offsets.size() + row.row);
+            continue;
+        }
+
+        const auto & src = *row.column;
+        if (src.getNumVariants() != num_variants)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot insert value of Variant type with different number of types");
+
+        auto src_local_discr = src.localDiscriminatorAt(row.row);
+        auto local_discr = column.localDiscriminatorByGlobal(src.globalDiscriminatorByLocal(src_local_discr));
+        local_discriminators.push_back(local_discr);
+        if (local_discr == ColumnVariant::NULL_DISCRIMINATOR)
+        {
+            offsets.push_back(0);
+            continue;
+        }
+
+        offsets.push_back(variant_sizes[local_discr]++);
+        variant_ranges[local_discr].push_back({&src.getVariantByLocalDiscriminator(src_local_discr), src.offsetAt(row.row), 1});
+    }
+
+    for (size_t i = 0; i != num_variants; ++i)
+    {
+        if (!variant_ranges[i].empty())
+            insertSourceRanges(column.getVariantByLocalDiscriminator(i), variant_ranges[i]);
+    }
+}
+
+}
+
 /// How the values of source dynamic paths that have no dynamic path here are written into our shared data,
 /// see `insertFromSharedDataAndFillRemainingDynamicPaths`.
 struct ColumnObject::SharedDataSerializationState
@@ -931,6 +1185,11 @@ struct ColumnObject::GatherState
 
     /// The plan of each range of the batch.
     VectorWithMemoryTracking<GatherSourcePlan *> range_plans;
+    /// The ranges of the batch in the source columns of one path.
+    VectorWithMemoryTracking<SourceRange> path_ranges;
+    /// Rows for one of dynamic_columns that are not inserted yet, see `insertGatheredRanges`.
+    VectorWithMemoryTracking<VariantRow> pending_variant_rows;
+    VariantRowsScratch variant_rows_scratch;
 
     void updateDynamicColumns(const PathToDynamicColumnPtrMap & object_dynamic_paths)
     {
@@ -1074,18 +1333,13 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
     }
 
     /// Typed paths, one at a time.
+    auto & path_ranges = state.path_ranges;
     for (size_t i = 0; i != typed_paths.size(); ++i)
     {
-        IColumn & column = *plans.front()->typed_paths[i].first;
+        path_ranges.clear();
         for (size_t r = 0; r != ranges.size(); ++r)
-        {
-            const auto & range = ranges[r];
-            const IColumn & src_column = *plans[r]->typed_paths[i].second;
-            if (range.length == 1)
-                column.insertFrom(src_column, range.start);
-            else
-                column.insertRangeFrom(src_column, range.start, range.length);
-        }
+            path_ranges.push_back({plans[r]->typed_paths[i].second, ranges[r].start, ranges[r].length});
+        insertSourceRanges(*plans.front()->typed_paths[i].first, path_ranges);
     }
 
     /// Shared data, row by row. Values for our dynamic paths found in source shared data are collected.
@@ -1112,9 +1366,32 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
 
     /// Dynamic paths, one at a time: values from source dynamic paths and from source shared data in the order
     /// of rows, and defaults for the rows without a value.
+    /// Defaults and single values that go into the Variant column as they are wait in pending_rows, and are
+    /// inserted together before any other insert into the column, which can change its variants.
+    auto & pending_rows = state.pending_variant_rows;
     for (size_t i = 0; i != state.dynamic_columns.size(); ++i)
     {
         ColumnDynamic & column = *state.dynamic_columns[i];
+        /// The size of the column with the pending rows.
+        size_t column_size = column.size();
+        pending_rows.clear();
+        auto insert_defaults_up_to = [&](size_t new_size)
+        {
+            if (column_size < new_size)
+            {
+                pending_rows.push_back({nullptr, new_size - column_size});
+                column_size = new_size;
+            }
+        };
+        auto insert_pending_rows = [&]
+        {
+            if (!pending_rows.empty())
+            {
+                insertVariantRows(column.getVariantColumn(), pending_rows, state.variant_rows_scratch);
+                pending_rows.clear();
+            }
+        };
+
         const auto & values = state.values_from_shared_data[i];
         auto value_it = values.begin();
         size_t row = start_row;
@@ -1128,27 +1405,37 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
                     throw Exception(ErrorCodes::LOGICAL_ERROR, "Path {} is both a dynamic path and in shared data of the source Object column", plans[r]->dynamic_paths[index].path);
 
                 auto & dynamic_path = plans[r]->dynamic_paths[index];
-                if (column.size() < row)
-                    column.insertManyDefaults(row - column.size());
-                if (range.length == 1)
-                    column.insertFromWithCache(*dynamic_path.src_column, range.start, dynamic_path.cache);
+                insert_defaults_up_to(row);
+                if (range.length == 1 && column.insertsVariantDirectly(*dynamic_path.src_column, dynamic_path.cache))
+                {
+                    pending_rows.push_back({&dynamic_path.src_column->getVariantColumn(), range.start});
+                    ++column_size;
+                }
                 else
-                    column.insertRangeFrom(*dynamic_path.src_column, range.start, range.length);
+                {
+                    insert_pending_rows();
+                    if (range.length == 1)
+                        column.insertFromWithCache(*dynamic_path.src_column, range.start, dynamic_path.cache);
+                    else
+                        column.insertRangeFrom(*dynamic_path.src_column, range.start, range.length);
+                    column_size = column.size();
+                }
             }
             else
             {
                 for (; value_it != values.end() && value_it->row < range_end_row; ++value_it)
                 {
-                    if (column.size() < value_it->row)
-                        column.insertManyDefaults(value_it->row - column.size());
+                    insert_defaults_up_to(value_it->row);
+                    insert_pending_rows();
                     state.deserializeValue(value_it->src_shared_data_values, value_it->n, i);
+                    column_size = column.size();
                 }
             }
             row = range_end_row;
         }
 
-        if (column.size() < end_row)
-            column.insertManyDefaults(end_row - column.size());
+        insert_defaults_up_to(end_row);
+        insert_pending_rows();
         if (column.size() != end_row)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path column: {} != {}", column.size(), end_row);
     }
