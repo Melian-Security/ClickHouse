@@ -1130,6 +1130,8 @@ private:
 /// How rows of one source column are inserted into this column, see `gather`.
 struct ColumnObject::GatherSourcePlan
 {
+    /// The source column. Holding it keeps another column from taking its address while the plan is kept.
+    ColumnPtr source;
     bool is_built = false;
     /// The plan stays valid while these two do not change: inserting from other sources can add dynamic paths
     /// to this column or lower its limit on dynamic paths.
@@ -1155,13 +1157,25 @@ struct ColumnObject::GatherSourcePlan
     bool insert_shared_data_directly = false;
 };
 
-/// The source columns of a gather stay alive and unchanged until it returns, so the per-source plans and the
-/// cached value types, which point into them, can be kept for its duration.
+/// The state of `gather` while it fills one block. The per-source plans hold their source columns, which do not
+/// change while they are shared, so a plan stays valid for its source across the calls of `gather` for the block.
+/// The cached value types point into the sources without holding them, so they are kept for one call only.
 struct ColumnObject::GatherState
 {
     UnorderedMapWithMemoryTracking<const ColumnObject *, GatherSourcePlan> plans;
     const ColumnObject * last_source = nullptr;
     GatherSourcePlan * last_plan = nullptr;
+
+    /// Called at the start of each call of `gather`. Between calls the gatherer replaces sources by their next
+    /// blocks, so the plans of the sources that only the plans still hold are not needed anymore.
+    void startGatherCall()
+    {
+        std::erase_if(plans, [](const auto & entry) { return entry.second.source->use_count() == 1; });
+        last_source = nullptr;
+        last_plan = nullptr;
+        type_caches.assign(type_caches.size(), SharedDataValueTypeCache{});
+        type_cache_num_variants.assign(type_cache_num_variants.size(), 0);
+    }
 
     /// Our dynamic paths in a flat list, for the lookup of paths from source shared data and default filling.
     size_t num_dynamic_paths = std::numeric_limits<size_t>::max();
@@ -1236,11 +1250,23 @@ struct ColumnObject::GatherState
     }
 };
 
+void ColumnObject::GatherStateDeleter::operator()(GatherState * state) const
+{
+    delete state;
+}
+
 void ColumnObject::gather(ColumnGathererStream & gatherer)
 {
-    GatherState state;
-    gather_state = &state;
-    SCOPE_EXIT({ gather_state = nullptr; });
+    if (!gather_state_holder)
+        gather_state_holder.reset(new GatherState);
+    gather_state_holder->startGatherCall();
+    gather_state = gather_state_holder.get();
+    SCOPE_EXIT({
+        gather_state = nullptr;
+        /// Unless the gatherer continues this block after the next block of a source, release the sources.
+        if (!gatherer.waitsForSourceBlock())
+            gather_state_holder.reset();
+    });
 
     /// When no dynamic paths can be added, as in merges, where the structure of the result is chosen in advance,
     /// rows from all sources can be inserted path by path: each path column still gets the same values in the
@@ -1261,6 +1287,8 @@ ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnO
     }
 
     auto & plan = *state.last_plan;
+    if (!plan.source)
+        plan.source = src.getPtr();
     if (plan.is_built && plan.num_dynamic_paths == dynamic_paths.size() && plan.max_dynamic_paths == max_dynamic_paths)
         return plan;
 

@@ -90,6 +90,10 @@ public:
     template <typename Column, typename InsertRanges>
     void gatherInBatches(Column & column_res, InsertRanges && insert_ranges);
 
+    /// Whether the last `gather` or `gatherInBatches` stopped to wait for the next block of a source, so that the
+    /// next call continues filling the same column.
+    bool waitsForSourceBlock() const { return next_required_source != -1; }
+
     MergedStats getMergedStats() const override { return {.bytes = merged_bytes, .rows = merged_rows, .blocks = merged_blocks}; }
 
 private:
