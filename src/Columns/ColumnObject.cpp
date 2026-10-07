@@ -966,70 +966,65 @@ void insertSourceRanges(IColumn & column, std::span<const SourceRange> ranges)
     }
 }
 
-/// A row of a source Variant column, or `row` default values if column is null.
-struct VariantRow
+/// `length` rows of a source Variant column from `start`, or `length` default values if column is null.
+struct VariantRows
 {
     const ColumnVariant * column;
-    size_t row;
+    size_t start;
+    size_t length;
 };
 
-/// Same result as ColumnVariant::insertFrom of each row and insertManyDefaults, in order: discriminators and offsets
-/// are written row by row, and the values of each variant are inserted together, in the order of rows.
 /// Buffers of insertVariantRows, kept between calls.
 struct VariantRowsScratch
 {
+    /// Size of each variant of the column with the values collected so far, or `unused_variant` if no value
+    /// was collected for it yet.
+    static constexpr size_t unused_variant = std::numeric_limits<size_t>::max();
     VectorWithMemoryTracking<size_t> variant_sizes;
     VectorWithMemoryTracking<VectorWithMemoryTracking<SourceRange>> variant_ranges;
+    /// Local discriminators of the variants that got values, in the order of their first value.
+    VectorWithMemoryTracking<ColumnVariant::Discriminator> used_variants;
 };
 
+/// Same result as ColumnVariant::insertRangeFrom of each source range (for a source with the same variants, which is
+/// insertFrom for a range of one row) and insertManyDefaults, in order: discriminators and offsets are written row by row,
+/// and the values of each variant are inserted together, in the order of rows. Consecutive values of a source variant
+/// are copied as one range.
 /// The sources must have the same variants as the column.
-void insertVariantRows(ColumnVariant & column, std::span<const VariantRow> rows, VariantRowsScratch & scratch)
+void insertVariantRows(ColumnVariant & column, std::span<const VariantRows> rows, VariantRowsScratch & scratch)
 {
-    size_t num_rows = 0;
-    size_t num_values = 0;
-    for (const auto & row : rows)
-    {
-        num_rows += row.column ? 1 : row.row;
-        num_values += row.column != nullptr;
-    }
+    static constexpr auto null_discriminator = ColumnVariant::NULL_DISCRIMINATOR;
+    static constexpr auto unused_variant = VariantRowsScratch::unused_variant;
 
-    /// For a few values, collecting them per variant costs more than it saves.
-    static constexpr size_t min_values_to_collect = 16;
-    if (num_values < min_values_to_collect)
-    {
-        for (const auto & row : rows)
-        {
-            if (row.column)
-                column.insertFrom(*row.column, row.row);
-            else
-                column.insertManyDefaults(row.row);
-        }
-        return;
-    }
+    size_t num_rows = 0;
+    for (const auto & row : rows)
+        num_rows += row.length;
 
     auto & local_discriminators = column.getLocalDiscriminators();
     auto & offsets = column.getOffsets();
-    local_discriminators.reserve(local_discriminators.size() + num_rows);
-    offsets.reserve(offsets.size() + num_rows);
+    size_t prev_size = local_discriminators.size();
+    local_discriminators.resize(prev_size + num_rows);
+    offsets.resize(prev_size + num_rows);
+    auto * discriminators_pos = local_discriminators.data() + prev_size;
+    auto * offsets_pos = offsets.data() + prev_size;
 
     size_t num_variants = column.getNumVariants();
     auto & variant_sizes = scratch.variant_sizes;
     auto & variant_ranges = scratch.variant_ranges;
-    variant_sizes.resize(num_variants);
+    auto & used_variants = scratch.used_variants;
+    variant_sizes.assign(num_variants, unused_variant);
     if (variant_ranges.size() < num_variants)
         variant_ranges.resize(num_variants);
-    for (size_t i = 0; i != num_variants; ++i)
-    {
-        variant_sizes[i] = column.getVariantByLocalDiscriminator(i).size();
-        variant_ranges[i].clear();
-    }
+    used_variants.clear();
 
     for (const auto & row : rows)
     {
         if (!row.column)
         {
-            local_discriminators.resize_fill(local_discriminators.size() + row.row, ColumnVariant::NULL_DISCRIMINATOR);
-            offsets.resize_fill(offsets.size() + row.row);
+            memset(discriminators_pos, null_discriminator, row.length);
+            memset(offsets_pos, 0, row.length * sizeof(*offsets_pos));
+            discriminators_pos += row.length;
+            offsets_pos += row.length;
             continue;
         }
 
@@ -1037,24 +1032,40 @@ void insertVariantRows(ColumnVariant & column, std::span<const VariantRow> rows,
         if (src.getNumVariants() != num_variants)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot insert value of Variant type with different number of types");
 
-        auto src_local_discr = src.localDiscriminatorAt(row.row);
-        auto local_discr = column.localDiscriminatorByGlobal(src.globalDiscriminatorByLocal(src_local_discr));
-        local_discriminators.push_back(local_discr);
-        if (local_discr == ColumnVariant::NULL_DISCRIMINATOR)
+        const auto * src_discriminators = src.getLocalDiscriminators().data();
+        const auto * src_offsets = src.getOffsets().data();
+        for (size_t i = row.start; i != row.start + row.length; ++i)
         {
-            offsets.push_back(0);
-            continue;
+            auto src_local_discr = src_discriminators[i];
+            auto local_discr = column.localDiscriminatorByGlobal(src.globalDiscriminatorByLocal(src_local_discr));
+            *discriminators_pos++ = local_discr;
+            if (local_discr == null_discriminator)
+            {
+                *offsets_pos++ = 0;
+                continue;
+            }
+
+            auto & variant_size = variant_sizes[local_discr];
+            auto & ranges = variant_ranges[local_discr];
+            if (variant_size == unused_variant)
+            {
+                variant_size = column.getVariantByLocalDiscriminator(local_discr).size();
+                ranges.clear();
+                used_variants.push_back(local_discr);
+            }
+            *offsets_pos++ = variant_size++;
+
+            const auto * src_variant = &src.getVariantByLocalDiscriminator(src_local_discr);
+            size_t src_offset = src_offsets[i];
+            if (!ranges.empty() && ranges.back().column == src_variant && ranges.back().start + ranges.back().length == src_offset)
+                ++ranges.back().length;
+            else
+                ranges.push_back({src_variant, src_offset, 1});
         }
-
-        offsets.push_back(variant_sizes[local_discr]++);
-        variant_ranges[local_discr].push_back({&src.getVariantByLocalDiscriminator(src_local_discr), src.offsetAt(row.row), 1});
     }
 
-    for (size_t i = 0; i != num_variants; ++i)
-    {
-        if (!variant_ranges[i].empty())
-            insertSourceRanges(column.getVariantByLocalDiscriminator(i), variant_ranges[i]);
-    }
+    for (auto local_discr : used_variants)
+        insertSourceRanges(column.getVariantByLocalDiscriminator(local_discr), variant_ranges[local_discr]);
 }
 
 }
@@ -1188,7 +1199,7 @@ struct ColumnObject::GatherState
     /// The ranges of the batch in the source columns of one path.
     VectorWithMemoryTracking<SourceRange> path_ranges;
     /// Rows for one of dynamic_columns that are not inserted yet, see `insertGatheredRanges`.
-    VectorWithMemoryTracking<VariantRow> pending_variant_rows;
+    VectorWithMemoryTracking<VariantRows> pending_variant_rows;
     VariantRowsScratch variant_rows_scratch;
 
     void updateDynamicColumns(const PathToDynamicColumnPtrMap & object_dynamic_paths)
@@ -1366,7 +1377,7 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
 
     /// Dynamic paths, one at a time: values from source dynamic paths and from source shared data in the order
     /// of rows, and defaults for the rows without a value.
-    /// Defaults and single values that go into the Variant column as they are wait in pending_rows, and are
+    /// Defaults and ranges of values that go into the Variant column as they are wait in pending_rows, and are
     /// inserted together before any other insert into the column, which can change its variants.
     auto & pending_rows = state.pending_variant_rows;
     for (size_t i = 0; i != state.dynamic_columns.size(); ++i)
@@ -1379,7 +1390,7 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
         {
             if (column_size < new_size)
             {
-                pending_rows.push_back({nullptr, new_size - column_size});
+                pending_rows.push_back({nullptr, 0, new_size - column_size});
                 column_size = new_size;
             }
         };
@@ -1406,10 +1417,10 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
 
                 auto & dynamic_path = plans[r]->dynamic_paths[index];
                 insert_defaults_up_to(row);
-                if (range.length == 1 && column.insertsVariantDirectly(*dynamic_path.src_column, dynamic_path.cache))
+                if (column.insertsVariantDirectly(*dynamic_path.src_column, dynamic_path.cache))
                 {
-                    pending_rows.push_back({&dynamic_path.src_column->getVariantColumn(), range.start});
-                    ++column_size;
+                    pending_rows.push_back({&dynamic_path.src_column->getVariantColumn(), range.start, range.length});
+                    column_size += range.length;
                 }
                 else
                 {
