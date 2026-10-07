@@ -457,23 +457,34 @@ static bool isPossibleOffsetsOfNested(const ISerialization::SubstreamPath & path
     return false;
 }
 
+namespace
+{
+
+void makeFileNameForStream(const String & name_in_storage, const ISerialization::SubstreamPath & path, const ISerialization::StreamFileNameSettings & settings, String & stream_name)
+{
+    stream_name.clear();
+
+    /// Offsets of Nested columns are shared by all columns of the Nested.
+    if (settings.share_nested_offsets && isPossibleOffsetsOfNested(path))
+        appendEscapedForFileName(stream_name, Nested::extractTableName(name_in_storage));
+    else
+        appendEscapedForFileName(stream_name, name_in_storage);
+
+    stream_name = getNameForSubstreamPath(std::move(stream_name), path.begin(), path.end(), true, false, settings.escape_variant_substreams);
+}
+
+}
+
 String ISerialization::getFileNameForStream(const String & name_in_storage, const SubstreamPath & path, const StreamFileNameSettings & settings)
 {
     String stream_name;
-    if (settings.share_nested_offsets)
-    {
-        auto nested_storage_name = Nested::extractTableName(name_in_storage);
-        if (name_in_storage != nested_storage_name && isPossibleOffsetsOfNested(path))
-            stream_name = escapeForFileName(nested_storage_name);
-        else
-            stream_name = escapeForFileName(name_in_storage);
-    }
-    else
-    {
-        stream_name = escapeForFileName(name_in_storage);
-    }
+    makeFileNameForStream(name_in_storage, path, settings, stream_name);
+    return stream_name;
+}
 
-    return getNameForSubstreamPath(std::move(stream_name), path.begin(), path.end(), true, false, settings.escape_variant_substreams);
+void ISerialization::getFileNameForStream(const NameAndTypePair & column, const SubstreamPath & path, const StreamFileNameSettings & settings, String & stream_name)
+{
+    makeFileNameForStream(column.getNameInStorage(), path, settings, stream_name);
 }
 
 String ISerialization::getFileNameForRenamedColumnStream(const String & name_from, const String & name_to, const String & file_name)
