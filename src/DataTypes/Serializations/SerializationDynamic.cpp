@@ -859,19 +859,18 @@ void SerializationDynamic::deserializeBinary(IColumn & column, ReadBuffer & istr
     deserializeBinary(assert_cast<ColumnDynamic &>(column), istr, settings);
 }
 
-void SerializationDynamic::deserializeBinary(ColumnDynamic & dynamic_column, ReadBuffer & istr, const FormatSettings & settings) const
+namespace
 {
-    /// See the comment in the Field overload: this is the same recursion on the column-building path.
-    checkStackSize();
 
-    auto variant_type = decodeDataType(istr, settings.binary.max_binary_type_complexity);
+/// Reads a value of type `variant_type` into the Dynamic column.
+void deserializeBinaryValue(ColumnDynamic & dynamic_column, const DataTypePtr & variant_type, const String & variant_type_name, ReadBuffer & istr, const FormatSettings & settings)
+{
     if (isNothing(variant_type))
     {
         dynamic_column.insertDefault();
         return;
     }
 
-    auto variant_type_name = variant_type->getName();
     /// The name is hashed once for all lookups below.
     PrehashedStringView prehashed_variant_type_name(variant_type_name);
     const auto & variant_serialization = dynamic_column.getVariantSerialization(variant_type, prehashed_variant_type_name);
@@ -896,6 +895,32 @@ void SerializationDynamic::deserializeBinary(ColumnDynamic & dynamic_column, Rea
     auto tmp_variant_column = variant_type->createColumn();
     variant_serialization->deserializeBinary(*tmp_variant_column, istr, settings);
     dynamic_column.insertValueIntoSharedVariant(*tmp_variant_column, variant_type, prehashed_variant_type_name, 0);
+}
+
+}
+
+void SerializationDynamic::deserializeBinary(ColumnDynamic & dynamic_column, ReadBuffer & istr, const FormatSettings & settings) const
+{
+    /// See the comment in the Field overload: this is the same recursion on the column-building path.
+    checkStackSize();
+
+    /// A type without parameters is encoded by its index alone. It is taken with its name from the cache of such
+    /// types, the same one decodeDataType returns it from, without copying the type and building its name for each value.
+    if (!istr.eof())
+    {
+        const auto & simple_types = getSimpleDataTypesCache();
+        auto binary_type_index = static_cast<BinaryTypeIndex>(*istr.position());
+        if (simple_types.hasElement(binary_type_index))
+        {
+            istr.ignore();
+            const auto & element = simple_types.getElement(binary_type_index);
+            deserializeBinaryValue(dynamic_column, element.type, element.name, istr, settings);
+            return;
+        }
+    }
+
+    auto variant_type = decodeDataType(istr, settings.binary.max_binary_type_complexity);
+    deserializeBinaryValue(dynamic_column, variant_type, variant_type->getName(), istr, settings);
 }
 
 template <typename ReadFieldFunc, typename TryDeserializeVariantFunc, typename DeserializeVariant>

@@ -46,6 +46,34 @@ static void checkDiscriminatorValue(ColumnVariant::Discriminator discr, size_t n
             static_cast<UInt32>(discr), num_variants);
 }
 
+/// Writes the global discriminators of rows [offset, offset + limit) of the column, a block of rows at a time.
+/// Same bytes as writeBinaryLittleEndian of each global discriminator.
+static void writeGlobalDiscriminators(const ColumnVariant & col, size_t offset, size_t limit, WriteBuffer & ostr)
+{
+    const auto & local_discriminators = col.getLocalDiscriminators();
+    if (col.hasGlobalVariantsOrder())
+    {
+        SerializationNumber<ColumnVariant::Discriminator>::serializeBinaryBulk(local_discriminators, ostr, offset, limit);
+        return;
+    }
+
+    std::array<ColumnVariant::Discriminator, ColumnVariant::MAX_NESTED_COLUMNS + 1> global_by_local;
+    global_by_local.fill(ColumnVariant::NULL_DISCRIMINATOR);
+    for (size_t i = 0; i != col.getNumVariants(); ++i)
+        global_by_local[i] = col.globalDiscriminatorByLocal(static_cast<ColumnVariant::Discriminator>(i));
+
+    std::array<ColumnVariant::Discriminator, 4096> buffer;
+    static_assert(sizeof(ColumnVariant::Discriminator) == 1);
+    for (size_t begin = offset, end = offset + limit; begin != end;)
+    {
+        size_t size = std::min(buffer.size(), end - begin);
+        for (size_t i = 0; i != size; ++i)
+            buffer[i] = global_by_local[local_discriminators[begin + i]];
+        ostr.write(reinterpret_cast<const char *>(buffer.data()), size);
+        begin += size;
+    }
+}
+
 UInt128 SerializationVariant::getHash(const VariantSerializations & variant_serializations_, const String & variant_name_)
 {
     SipHash hash;
@@ -307,6 +335,18 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
     UnorderedMapWithMemoryTracking<String, size_t> & variants_statistics,
     size_t & total_size_of_variants) const
 {
+    serializeBinaryBulkWithMultipleStreamsImpl(column, offset, limit, settings, state, &variants_statistics, total_size_of_variants);
+}
+
+void SerializationVariant::serializeBinaryBulkWithMultipleStreamsImpl(
+    const IColumn & column,
+    size_t offset,
+    size_t limit,
+    SerializeBinaryBulkSettings & settings,
+    SerializeBinaryBulkStatePtr & state,
+    UnorderedMapWithMemoryTracking<String, size_t> * variants_statistics,
+    size_t & total_size_of_variants) const
+{
     const ColumnVariant & col = assert_cast<const ColumnVariant &>(column);
     if (offset == 0)
         col.validateState();
@@ -382,7 +422,8 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
             }
             settings.path.pop_back();
         }
-        variants_statistics[variant_names[non_empty_global_discr]] += limit;
+        if (variants_statistics)
+            (*variants_statistics)[variant_names[non_empty_global_discr]] += limit;
         total_size_of_variants += limit;
         settings.path.pop_back();
         return;
@@ -423,18 +464,9 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
         if (variant_state->discriminators_mode.value == DiscriminatorsSerializationMode::COMPACT)
             writeBinaryLittleEndian(UInt8(CompactDiscriminatorsGranuleFormat::PLAIN), *discriminators_stream);
 
-        /// If local and global discriminators are the same, just serialize the column as is.
-        if (col.hasGlobalVariantsOrder())
-        {
-            SerializationNumber<ColumnVariant::Discriminator>::create()->serializeBinaryBulk(col.getLocalDiscriminatorsColumn(), *discriminators_stream, offset, limit);
-        }
-        /// If local and global discriminators are different, we should convert local to global before serializing (because we don't serialize the mapping).
-        else
-        {
-            const auto & local_discriminators = col.getLocalDiscriminators();
-            for (size_t i = offset; i != offset + limit; ++i)
-                writeBinaryLittleEndian(col.globalDiscriminatorByLocal(local_discriminators[i]), *discriminators_stream);
-        }
+        /// If local and global discriminators are the same, the column is serialized as is. Otherwise local discriminators
+        /// are converted to global ones before serializing (because we don't serialize the mapping).
+        writeGlobalDiscriminators(col, offset, limit, *discriminators_stream);
 
         /// Second, serialize variants in global order.
         settings.path.push_back(Substream::VariantElements);
@@ -443,7 +475,8 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
             addVariantElementToPath(settings.path, i);
             variant_serializations[i]->serializeBinaryBulkWithMultipleStreams(col.getVariantByGlobalDiscriminator(i), 0, 0, settings, variant_state->variant_states[i]);
             size_t variant_size = col.getVariantByGlobalDiscriminator(i).size();
-            variants_statistics[variant_names[i]] += variant_size;
+            if (variants_statistics)
+                (*variants_statistics)[variant_names[i]] += variant_size;
             total_size_of_variants += variant_size;
             settings.path.pop_back();
         }
@@ -476,8 +509,7 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
     /// In basic mode just serialize discriminators as is row by row.
     if (variant_state->discriminators_mode.value == DiscriminatorsSerializationMode::BASIC)
     {
-        for (size_t i = offset; i < end; ++i)
-            writeBinaryLittleEndian(col.globalDiscriminatorByLocal(local_discriminators[i]), *discriminators_stream);
+        writeGlobalDiscriminators(col, offset, limit, *discriminators_stream);
     }
     /// In compact mode check if we have the same discriminator for all rows in this granule.
     /// First, check if all values in granule are NULLs.
@@ -496,8 +528,7 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
     else
     {
         writeBinaryLittleEndian(UInt8(CompactDiscriminatorsGranuleFormat::PLAIN), *discriminators_stream);
-        for (size_t i = offset; i < end; ++i)
-            writeBinaryLittleEndian(col.globalDiscriminatorByLocal(local_discriminators[i]), *discriminators_stream);
+        writeGlobalDiscriminators(col, offset, limit, *discriminators_stream);
     }
 
     /// Serialize variants in global order.
@@ -515,7 +546,8 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreamsAndUpdateVarian
             variant_offsets_and_limits[i].second,
             settings,
             variant_state->variant_states[i]);
-        variants_statistics[variant_names[i]] += variant_offsets_and_limits[i].second;
+        if (variants_statistics)
+            (*variants_statistics)[variant_names[i]] += variant_offsets_and_limits[i].second;
         total_size_of_variants += variant_offsets_and_limits[i].second;
         settings.path.pop_back();
     }
@@ -529,9 +561,8 @@ void SerializationVariant::serializeBinaryBulkWithMultipleStreams(
     DB::ISerialization::SerializeBinaryBulkSettings & settings,
     DB::ISerialization::SerializeBinaryBulkStatePtr & state) const
 {
-    UnorderedMapWithMemoryTracking<String, size_t> tmp_statistics;
     size_t tmp_size = 0;
-    serializeBinaryBulkWithMultipleStreamsAndUpdateVariantStatistics(column, offset, limit, settings, state, tmp_statistics, tmp_size);
+    serializeBinaryBulkWithMultipleStreamsImpl(column, offset, limit, settings, state, nullptr, tmp_size);
 }
 
 void SerializationVariant::deserializeBinaryBulkWithMultipleStreams(

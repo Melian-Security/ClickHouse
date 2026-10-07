@@ -1,0 +1,25 @@
+before merge
+13493	5475918092326075650
+12561820492450340644
+13493	5475918092326075650
+after merge
+13493	5475918092326075650
+12561820492450340644
+13493	5475918092326075650
+['a','b','c','d']	['x0','x1','x2','x3','x4','x5','x6','y0','y1','y2','z']
+0	{"b":0,"c":[{"k":0,"v":"w0"}],"d":0,"s":"s0","x0":0,"z":[{"f":0,"m":0,"n":"q0","t":true}]}
+1	{"b":"b0","d":0,"s":"","y0":"v0","z":[{"m":"0","u":0},{"t":false}]}
+10	{"a":"a1","b":1,"c":true,"d":0.25,"s":"s1","x1":1}
+11	{"a":9,"b":"b9","c":[{"k":9}],"d":9,"s":"rrrrrrrrr"}
+30	{"a":"a3","b":3,"c":[{"k":3,"v":"w3"}],"d":0.75,"s":"s3","x3":3}
+31	{"b":"b27","c":[{"k":27}],"d":27,"s":"rrrrrrrrrrrrrrrrrrrrrrrrrrr"}
+60	{"a":6,"b":6,"c":[{"k":6,"v":"w6"}],"d":1.5,"s":"s6","x6":6}
+100000	{"a":0,"b":[0],"s":"e0","z":[{"m":1.5}]}
+101499	{"a":1499,"b":[1499],"s":"e1499","z":[{"m":1.5}]}
+0	None	Int64	Array(JSON(max_dynamic_types=1, max_dynamic_paths=1))	Int64	['{"f":0,"m":0,"n":"q0","t":true}']
+1	None	String	None	Int64	['{"m":"0","u":0}','{"t":false}']
+40	Int64	Int64	Bool	Int64	['{"f":0.5,"m":4,"n":"q4","t":true}']
+41	None	String	Bool	Int64	['{"m":"36","u":36}','{"t":false}']
+100001	Int64	Array(Nullable(Int64))	None	None	['{"m":1.5}']
+test_json_variant_ranges	Vertical
+test_json_variant_ranges_basic	Vertical
