@@ -4,6 +4,7 @@
 #include <DataTypes/Serializations/SerializationArray.h>
 #include <DataTypes/Serializations/SerializationString.h>
 #include <DataTypes/Serializations/SerializationDynamic.h>
+#include <DataTypes/Serializations/SubstreamPathMap.h>
 #include <DataTypes/DataTypesBinaryEncoding.h>
 #include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypeVariant.h>
@@ -285,75 +286,21 @@ private:
 };
 
 /// The file names of the substreams of path columns, which `serializeChunkBucketData` lists for every path. A name
-/// depends only on the fields of the substream path compared below, and the same few substream paths are written for
-/// every path of every granule, so each name is built once per part instead of once per substream.
+/// depends only on the fields of the substream path that `SubstreamPathMap` compares, and the same few substream paths
+/// are written for every path of every granule, so each name is built once per part instead of once per substream.
+/// The returned references stay valid as long as this object.
 class SubstreamFileNames
 {
 public:
     const String & get(const ISerialization::SubstreamPath & path, const ISerialization::StreamFileNameSettings & settings)
     {
-        /// Most substreams have no names, so only the names that are set are hashed.
-        UInt64 hash = path.size();
-        auto combine = [&](UInt64 value) { hash = CityHash_v1_0_2::Hash128to64({hash, value}); };
-        for (const auto & substream : path)
-        {
-            combine((static_cast<UInt64>(substream.type) << 32) ^ substream.bucket);
-            for (const String * str : {&substream.variant_element_name, &substream.name_of_substream, &substream.object_path_name})
-                combine(str->empty() ? 0 : StringViewHash64()(*str));
-        }
-
-        auto [it, inserted] = names.try_emplace(hash);
-        auto & entry = it->second;
-        if (inserted)
-        {
-            entry.path.reserve(path.size());
-            for (const auto & substream : path)
-                entry.path.push_back({substream.type, substream.bucket, substream.variant_element_name, substream.name_of_substream, substream.object_path_name});
-            entry.name = ISerialization::getFileNameForStream(String{}, path, settings);
-        }
-        else if (!entry.matches(path))
-        {
-            /// Another substream path with the same hash.
-            uncached_name = ISerialization::getFileNameForStream(String{}, path, settings);
-            return uncached_name;
-        }
-
-        return entry.name;
+        if (const auto * name = names.find(path))
+            return *name;
+        return names.insert(path, ISerialization::getFileNameForStream(String{}, path, settings));
     }
 
 private:
-    struct Substream
-    {
-        ISerialization::Substream::Type type;
-        size_t bucket;
-        String variant_element_name;
-        String name_of_substream;
-        String object_path_name;
-    };
-
-    struct Entry
-    {
-        std::vector<Substream> path;
-        String name;
-
-        bool matches(const ISerialization::SubstreamPath & other) const
-        {
-            if (path.size() != other.size())
-                return false;
-            for (size_t i = 0; i != path.size(); ++i)
-            {
-                if (path[i].type != other[i].type || path[i].bucket != other[i].bucket
-                    || path[i].variant_element_name != other[i].variant_element_name
-                    || path[i].name_of_substream != other[i].name_of_substream
-                    || path[i].object_path_name != other[i].object_path_name)
-                    return false;
-            }
-            return true;
-        }
-    };
-
-    std::unordered_map<UInt64, Entry> names;
-    String uncached_name;
+    SubstreamPathMap<String> names;
 };
 
 }
@@ -511,8 +458,15 @@ struct ChunkBucketSerializationMetadata
 {
     MarkInCompressedFile data_stream_mark{};
     std::vector<MarkInCompressedFile> paths_marks;
-    std::vector<std::vector<String>> paths_substreams;
-    std::vector<std::vector<MarkInCompressedFile>> paths_substreams_marks;
+    /// The names and marks of the substreams of all paths in order. The substreams of path `i` are
+    /// [paths_substreams_ends[i - 1], paths_substreams_ends[i]). The names are owned by `SubstreamFileNames`.
+    std::vector<const String *> substreams_names;
+    std::vector<MarkInCompressedFile> substreams_marks;
+    std::vector<size_t> paths_substreams_ends;
+
+    size_t numPaths() const { return paths_substreams_ends.size(); }
+    size_t substreamsBegin(size_t path) const { return path ? paths_substreams_ends[path - 1] : 0; }
+    size_t substreamsEnd(size_t path) const { return paths_substreams_ends[path]; }
 };
 
 /// Decompose a shared data column (Array(Tuple(String, String))) into its parts.
@@ -696,8 +650,7 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
 
     const size_t num_paths = bucket_paths.paths.size();
     metadata.paths_marks.reserve(num_paths);
-    metadata.paths_substreams.reserve(num_paths);
-    metadata.paths_substreams_marks.reserve(num_paths);
+    metadata.paths_substreams_ends.reserve(num_paths);
 
     /// Configure serialization settings as in Compact part.
     /// `serializeSingleTypeDynamicColumn` writes the Dynamic structure for exactly these settings.
@@ -729,16 +682,13 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
         if (data_stream.offset() >= settings.min_compress_block_size)
             data_stream.next();
         /// Add new substream and its mark for current path.
-        metadata.paths_substreams.back().push_back(substream_file_names.get(substream_path, stream_file_name_settings));
-        metadata.paths_substreams_marks.back().push_back(get_data_stream_mark());
+        metadata.substreams_names.push_back(&substream_file_names.get(substream_path, stream_file_name_settings));
+        metadata.substreams_marks.push_back(get_data_stream_mark());
         return &data_stream;
     };
 
     for (size_t path_index = 0; path_index != num_paths; ++path_index)
     {
-        metadata.paths_substreams.emplace_back();
-        metadata.paths_substreams_marks.emplace_back();
-
         /// Same at the path boundary.
         if (data_stream.offset() >= settings.min_compress_block_size)
             data_stream.next();
@@ -749,14 +699,17 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
         if (auto variant_column = value_types.tryCopyValues(buckets_splitter, bucket_paths, path_index, type))
         {
             serializeSingleTypeDynamicColumn(*type, *variant_column, data_serialization_settings);
-            continue;
+        }
+        else
+        {
+            auto path_column = buckets_splitter.flattenPath(bucket_paths, path_index, dynamic_type_);
+            ISerialization::SerializeBinaryBulkStatePtr path_state;
+            dynamic_serialization_->serializeBinaryBulkStatePrefix(*path_column, data_serialization_settings, path_state);
+            dynamic_serialization_->serializeBinaryBulkWithMultipleStreams(*path_column, 0, 0, data_serialization_settings, path_state);
+            dynamic_serialization_->serializeBinaryBulkStateSuffix(data_serialization_settings, path_state);
         }
 
-        auto path_column = buckets_splitter.flattenPath(bucket_paths, path_index, dynamic_type_);
-        ISerialization::SerializeBinaryBulkStatePtr path_state;
-        dynamic_serialization_->serializeBinaryBulkStatePrefix(*path_column, data_serialization_settings, path_state);
-        dynamic_serialization_->serializeBinaryBulkWithMultipleStreams(*path_column, 0, 0, data_serialization_settings, path_state);
-        dynamic_serialization_->serializeBinaryBulkStateSuffix(data_serialization_settings, path_state);
+        metadata.paths_substreams_ends.push_back(metadata.substreams_names.size());
     }
 
     return metadata;
@@ -785,14 +738,16 @@ std::vector<MarkInCompressedFile> writePathsSubstreams(
     ISerialization::SerializeBinaryBulkSettings & settings)
 {
     std::vector<MarkInCompressedFile> marks_of_paths_substreams;
-    marks_of_paths_substreams.reserve(metadata.paths_substreams.size());
+    marks_of_paths_substreams.reserve(metadata.numPaths());
     StreamMarks stream_marks(stream, settings);
-    for (const auto & path_substreams : metadata.paths_substreams)
+    for (size_t path = 0; path != metadata.numPaths(); ++path)
     {
         marks_of_paths_substreams.push_back(stream_marks.get());
-        writeVarUInt(path_substreams.size(), stream);
-        for (const auto & substream : path_substreams)
-            writeStringBinary(substream, stream);
+        size_t begin = metadata.substreamsBegin(path);
+        size_t end = metadata.substreamsEnd(path);
+        writeVarUInt(end - begin, stream);
+        for (size_t i = begin; i != end; ++i)
+            writeStringBinary(*metadata.substreams_names[i], stream);
     }
     return marks_of_paths_substreams;
 }
@@ -803,15 +758,15 @@ std::vector<MarkInCompressedFile> writeSubstreamsMarks(
     ISerialization::SerializeBinaryBulkSettings & settings)
 {
     std::vector<MarkInCompressedFile> marks_of_paths_substreams_marks;
-    marks_of_paths_substreams_marks.reserve(metadata.paths_substreams_marks.size());
+    marks_of_paths_substreams_marks.reserve(metadata.numPaths());
     StreamMarks stream_marks(stream, settings);
-    for (const auto & substreams_marks : metadata.paths_substreams_marks)
+    for (size_t path = 0; path != metadata.numPaths(); ++path)
     {
         marks_of_paths_substreams_marks.push_back(stream_marks.get());
-        for (const auto & mark : substreams_marks)
+        for (size_t i = metadata.substreamsBegin(path); i != metadata.substreamsEnd(path); ++i)
         {
-            writeBinaryLittleEndian(mark.offset_in_compressed_file, stream);
-            writeBinaryLittleEndian(mark.offset_in_decompressed_block, stream);
+            writeBinaryLittleEndian(metadata.substreams_marks[i].offset_in_compressed_file, stream);
+            writeBinaryLittleEndian(metadata.substreams_marks[i].offset_in_decompressed_block, stream);
         }
     }
     return marks_of_paths_substreams_marks;

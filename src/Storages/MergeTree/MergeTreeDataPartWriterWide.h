@@ -2,6 +2,7 @@
 
 #include <Storages/MergeTree/MergeTreeDataPartWriterOnDisk.h>
 #include <Formats/MarkInCompressedFile.h>
+#include <DataTypes/Serializations/SubstreamPathMap.h>
 
 
 namespace DB
@@ -143,6 +144,15 @@ private:
     /// hash lookup by the full stream name, and does not need the disk to decide whether the name is replaced to a hash.
     const StreamEntry * getStream(const NameAndTypePair & column, const ISerialization::SubstreamPath & substream_path) const;
 
+    /// The streams of the substreams of a column found by getStream, by substream path. Serializations request a stream for
+    /// every substream of every granule, so it is found without making the stream name.
+    using StreamsBySubstreamPath = SubstreamPathMap<const StreamEntry *>;
+    StreamsBySubstreamPath & getStreamsBySubstreamPath(const NameAndTypePair & column) const;
+
+    /// The same as getStream, but remembers the stream in `streams`.
+    const StreamEntry * getStream(
+        const NameAndTypePair & column, const ISerialization::SubstreamPath & substream_path, StreamsBySubstreamPath & streams) const;
+
     /// A non-ephemeral substream of a column, in the order the serialization enumerates them.
     struct ColumnSubstream
     {
@@ -174,6 +184,8 @@ private:
     std::unordered_map<String, String> stream_name_to_full_name;
 
     std::unordered_map<String, ColumnSubstreams> column_substreams_cache;
+
+    mutable std::unordered_map<String, StreamsBySubstreamPath> streams_by_substream_path;
 
     /// Non written marks to disk (for each column). Waiting until all rows for
     /// this marks will be written to disk.
