@@ -21,7 +21,7 @@ SELECT arrayJoin(json.a.:`Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))
 DROP TABLE test_json_arrays_of_objects;
 
 SELECT '-- many objects, read back after the insert';
-SELECT count(), sum(cityHash64(toString(j))), groupUniqArray(arrayJoin(JSONAllPathsWithTypes(j)))
+SELECT count(), sum(cityHash64(toString(j))), arraySort(groupUniqArray(arrayJoin(JSONAllPathsWithTypes(j))))
 FROM
 (
     SELECT CAST('{"b3":0,"b4":0,"b5":0,"b6":0,"a":[' || arrayStringConcat(arrayMap(i -> '{"k' || toString(i % 3) || '":' || multiIf(i % 4 = 0, 'true', i % 4 = 1, toString(i), i % 4 = 2, '"s' || toString(i) || '"', '0.5') || '}', range(number % 5 + 1)), ',') || '], "b' || toString(number % 3) || '":' || toString(number) || '}', 'JSON(max_dynamic_paths = 4)') AS j
