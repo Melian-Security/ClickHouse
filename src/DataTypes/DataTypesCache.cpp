@@ -62,6 +62,13 @@ void SimpleDataTypesCache::addSimpleType(BinaryTypeIndex index, const String & t
     Element element{type_name, type, withThreadLocalCounter(type->getDefaultSerialization())};
     by_index[static_cast<uint8_t>(index)] = element;
     by_name.emplace(type_name, std::move(element));
+    if (!type->hasCustomName())
+    {
+        auto & element_by_type_index = by_type_index[static_cast<size_t>(type->getTypeId())];
+        if (element_by_type_index)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Simple types {} and {} have the same type index", element_by_type_index->name, type_name);
+        element_by_type_index = &by_index[static_cast<uint8_t>(index)];
+    }
 }
 
 bool SimpleDataTypesCache::hasElement(BinaryTypeIndex index) const
@@ -106,6 +113,14 @@ const SimpleDataTypesCache::Element * SimpleDataTypesCache::findByName(Prehashed
 {
     auto it = by_name.find(type_name);
     return it != by_name.end() ? &it->second : nullptr;
+}
+
+const SimpleDataTypesCache::Element * SimpleDataTypesCache::findByType(const IDataType & type) const
+{
+    /// Bool is the only simple type with a custom name.
+    if (type.hasCustomName())
+        return type.getName() == "Bool" ? &by_index[static_cast<uint8_t>(BinaryTypeIndex::Bool)] : nullptr;
+    return by_type_index[static_cast<size_t>(type.getTypeId())];
 }
 
 DataTypePtr SimpleDataTypesCache::getType(const String & type_name) const
@@ -162,8 +177,8 @@ SerializationPtr DataTypesCache::getSerialization(const String & type_name, cons
 
 SerializationPtr DataTypesCache::getSerialization(PrehashedStringView type_name, const DataTypePtr & type)
 {
-    /// Check the thread-local cache of simple types first.
-    if (const auto * elem = getSimpleDataTypesCache().findByName(type_name))
+    /// Check the thread-local cache of simple types first. The type is at hand, so it is found by its type index.
+    if (const auto * elem = getSimpleDataTypesCache().findByType(*type))
         return elem->serialization;
 
     return getCacheElement(type_name, &type).serialization;

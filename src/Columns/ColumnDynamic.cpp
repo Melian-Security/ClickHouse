@@ -6,6 +6,7 @@
 #include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeVariant.h>
+#include <DataTypes/DataTypesCache.h>
 #include <DataTypes/DataTypesBinaryEncoding.h>
 #include <DataTypes/FieldToDataType.h>
 #include <DataTypes/Serializations/SerializationString.h>
@@ -76,27 +77,72 @@ const DataTypePtr & ColumnDynamic::getSharedVariantDataType()
     return type;
 }
 
-ColumnDynamic::ColumnDynamic(size_t max_dynamic_types_) : max_dynamic_types(max_dynamic_types_), global_max_dynamic_types(max_dynamic_types)
+namespace
 {
-    /// Create Variant with shared variant only. Its type and names are the same for every new Dynamic column,
-    /// so they are built once per thread instead of for every column (a JSON column creates one for every new path).
-    struct EmptyVariant
-    {
-        DataTypePtr type;
-        String name;
-        size_t name_hash;
-        size_t shared_variant_name_hash;
-    };
+
+/// The Variant of a new Dynamic column, with the shared variant only. Its type and names are the same for every new
+/// Dynamic column, so they are built once per thread instead of for every column (a JSON column creates one for every
+/// new path).
+struct EmptyVariant
+{
+    DataTypePtr type;
+    String name;
+    size_t name_hash;
+    size_t shared_variant_name_hash;
+};
+
+const EmptyVariant & getEmptyVariant()
+{
     static thread_local const EmptyVariant empty_variant = []
     {
         EmptyVariant result;
-        result.type = std::make_shared<DataTypeVariant>(DataTypes{getSharedVariantDataType()});
+        result.type = std::make_shared<DataTypeVariant>(DataTypes{ColumnDynamic::getSharedVariantDataType()});
         result.name = result.type->getName();
         result.name_hash = PrehashedStringView(result.name).hash;
-        result.shared_variant_name_hash = PrehashedStringView(getSharedVariantTypeName()).hash;
+        result.shared_variant_name_hash = PrehashedStringView(ColumnDynamic::getSharedVariantTypeName()).hash;
         return result;
     }();
+    return empty_variant;
+}
 
+/// The Variant of the shared variant and one more type, which a new Dynamic column gets with its first value.
+struct VariantWithOneType
+{
+    /// The added type. Entries are found by the identity of this object, so the Variant has exactly this type.
+    DataTypePtr added_type;
+    DataTypePtr type;
+    String name;
+    size_t name_hash;
+};
+
+/// Most new Dynamic columns get a value of a simple type first, and callers usually pass the type object of
+/// getSimpleDataTypesCache(), so the Variant types for them are kept per thread instead of being built every time.
+/// Returns the entry for `added_type`, adding one without a Variant type, which the caller fills, if there is none.
+/// Returns nullptr for other type objects: they may be created for every value, so an entry would rarely be found.
+VariantWithOneType * getVariantWithOneType(const DataTypePtr & added_type)
+{
+    static thread_local std::vector<VariantWithOneType> entries;
+
+    for (auto & entry : entries)
+    {
+        if (entry.added_type == added_type)
+            return &entry;
+    }
+
+    /// There is one type object per simple type, so the number of entries is bounded by the number of simple types.
+    const auto * simple_type = getSimpleDataTypesCache().findByType(*added_type);
+    if (!simple_type || simple_type->type != added_type)
+        return nullptr;
+
+    return &entries.emplace_back(VariantWithOneType{.added_type = added_type, .type = nullptr, .name = {}, .name_hash = 0});
+}
+
+}
+
+ColumnDynamic::ColumnDynamic(size_t max_dynamic_types_) : max_dynamic_types(max_dynamic_types_), global_max_dynamic_types(max_dynamic_types)
+{
+    /// Create Variant with shared variant only.
+    const auto & empty_variant = getEmptyVariant();
     variant_column = empty_variant.type->createColumn();
     variant_column_ptr = assert_cast<ColumnVariant *>(variant_column.get());
     /// The same as createVariantInfo(empty_variant.type).
@@ -202,12 +248,25 @@ bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, PrehashedStri
 
     const size_t new_discr = static_cast<size_t>(std::lower_bound(current_names.begin(), current_names.end(), new_variant_name.value) - current_names.begin());
 
-    DataTypes new_variants;
-    new_variants.reserve(current_variants.size() + 1);
-    new_variants.insert(new_variants.end(), current_variants.begin(), current_variants.begin() + new_discr);
-    new_variants.push_back(new_variant);
-    new_variants.insert(new_variants.end(), current_variants.begin() + new_discr, current_variants.end());
-    auto new_variant_type = std::make_shared<DataTypeVariant>(std::move(new_variants), DataTypeVariant::AlreadySorted{});
+    /// A column with the shared variant only (the Variant type of every new column is the same object) gets the same
+    /// Variant type for the same added type object, so it can be reused.
+    const bool has_shared_variant_only = variant_info.variant_type == getEmptyVariant().type;
+    VariantWithOneType * variant_with_one_type = has_shared_variant_only ? getVariantWithOneType(new_variant) : nullptr;
+
+    DataTypePtr new_variant_type;
+    if (variant_with_one_type && variant_with_one_type->type)
+    {
+        new_variant_type = variant_with_one_type->type;
+    }
+    else
+    {
+        DataTypes new_variants;
+        new_variants.reserve(current_variants.size() + 1);
+        new_variants.insert(new_variants.end(), current_variants.begin(), current_variants.begin() + new_discr);
+        new_variants.push_back(new_variant);
+        new_variants.insert(new_variants.end(), current_variants.begin() + new_discr, current_variants.end());
+        new_variant_type = std::make_shared<DataTypeVariant>(std::move(new_variants), DataTypeVariant::AlreadySorted{});
+    }
 
     /// The variants after the new one move by one position.
     VectorWithMemoryTracking<ColumnVariant::Discriminator> current_to_new_discriminators(current_variants.size());
@@ -230,21 +289,36 @@ bool ColumnDynamic::addNewVariant(const DataTypePtr & new_variant, PrehashedStri
     variant_info.variant_name_to_discriminator.emplace(String(new_variant_name.value), static_cast<ColumnVariant::Discriminator>(new_discr));
     chassert(variant_info.shared_variant_discriminator == variant_info.variant_name_to_discriminator.at(getSharedVariantTypeName()));
 
-    /// The same string as DataTypeVariant::getName.
-    size_t variant_name_size = strlen("Variant()") + 2 * (variant_info.variant_names.size() - 1);
-    for (const auto & name : variant_info.variant_names)
-        variant_name_size += name.size();
-    variant_info.variant_name.clear();
-    variant_info.variant_name.reserve(variant_name_size);
-    variant_info.variant_name += "Variant(";
-    for (size_t discr = 0; discr != variant_info.variant_names.size(); ++discr)
+    if (variant_with_one_type && variant_with_one_type->type)
     {
-        if (discr != 0)
-            variant_info.variant_name += ", ";
-        variant_info.variant_name += variant_info.variant_names[discr];
+        variant_info.variant_name = variant_with_one_type->name;
+        variant_info.variant_name_hash = variant_with_one_type->name_hash;
     }
-    variant_info.variant_name += ")";
-    variant_info.variant_name_hash = PrehashedStringView(variant_info.variant_name).hash;
+    else
+    {
+        /// The same string as DataTypeVariant::getName.
+        size_t variant_name_size = strlen("Variant()") + 2 * (variant_info.variant_names.size() - 1);
+        for (const auto & name : variant_info.variant_names)
+            variant_name_size += name.size();
+        variant_info.variant_name.clear();
+        variant_info.variant_name.reserve(variant_name_size);
+        variant_info.variant_name += "Variant(";
+        for (size_t discr = 0; discr != variant_info.variant_names.size(); ++discr)
+        {
+            if (discr != 0)
+                variant_info.variant_name += ", ";
+            variant_info.variant_name += variant_info.variant_names[discr];
+        }
+        variant_info.variant_name += ")";
+        variant_info.variant_name_hash = PrehashedStringView(variant_info.variant_name).hash;
+
+        if (variant_with_one_type)
+        {
+            variant_with_one_type->type = variant_info.variant_type;
+            variant_with_one_type->name = variant_info.variant_name;
+            variant_with_one_type->name_hash = variant_info.variant_name_hash;
+        }
+    }
     chassert(variant_info.variant_name == variant_info.variant_type->getName());
 
     /// Clear mappings cache because now with new Variant we will have new mappings.
