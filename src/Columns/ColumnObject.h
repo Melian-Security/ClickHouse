@@ -145,19 +145,6 @@ public:
     /// resolved once per source column instead of once per inserted row or range.
     void gather(ColumnGathererStream & gatherer) override;
 
-    /// Consecutive rows of a source column.
-    struct SourceRange
-    {
-        const IColumn * column;
-        size_t start;
-        size_t length;
-    };
-
-    /// Same result as inserting the ranges in order with insertFrom (ranges of one row) and insertRangeFrom.
-    /// When no dynamic paths can be added, as for JSON values inside other columns in merges, the rows of all
-    /// ranges are inserted path by path, with the paths of each source column resolved once.
-    void insertRanges(std::span<const SourceRange> ranges);
-
     void popBack(size_t n) override;
 
     std::string_view serializeValueIntoArena(size_t n, Arena & arena, char const *& begin, const IColumn::SerializationSettings * settings) const override;

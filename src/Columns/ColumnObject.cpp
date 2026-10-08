@@ -4,7 +4,6 @@
 #include <DataTypes/DataTypeVariant.h>
 #include <DataTypes/Serializations/SerializationString.h>
 #include <Columns/ColumnObject.h>
-#include <Columns/ColumnArray.h>
 #include <Columns/ColumnCompressed.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnNullable.h>
@@ -817,7 +816,13 @@ bool ColumnObject::tryInsert(const Field & x)
 namespace
 {
 
-using SourceRange = ColumnObject::SourceRange;
+/// Consecutive rows of a source column.
+struct SourceRange
+{
+    const IColumn * column;
+    size_t start;
+    size_t length;
+};
 
 void insertSourceRanges(IColumn & column, std::span<const SourceRange> ranges);
 
@@ -973,8 +978,7 @@ void insertArrayRanges(ColumnArray & column, std::span<const SourceRange> ranges
 }
 
 /// Same result as inserting the ranges in order with insertFrom (ranges of one row) and insertRangeFrom.
-/// Columns of strings, of fixed-size values, Nullable and arrays of them are copied without a virtual call per range,
-/// and JSON columns path by path.
+/// Columns of strings, of fixed-size values, Nullable and arrays of them are copied without a virtual call per range.
 /// Like insertFrom, it expects the source columns to have the class of the column.
 void insertSourceRanges(IColumn & column, std::span<const SourceRange> ranges)
 {
@@ -994,11 +998,6 @@ void insertSourceRanges(IColumn & column, std::span<const SourceRange> ranges)
         if (auto * array_column = typeid_cast<ColumnArray *>(&column))
         {
             insertArrayRanges(*array_column, ranges);
-            return;
-        }
-        if (auto * object_column = typeid_cast<ColumnObject *>(&column))
-        {
-            object_column->insertRanges(ranges);
             return;
         }
         if (tryInsertFixedSizeRanges(column, ranges))
@@ -1372,28 +1371,6 @@ void ColumnObject::gather(ColumnGathererStream & gatherer)
         gatherer.gather(*this);
     else
         gatherer.gatherInBatches(*this, [this](const auto & ranges) { insertGatheredRanges(ranges); });
-}
-
-void ColumnObject::insertRanges(std::span<const SourceRange> ranges)
-{
-    /// A single range is inserted as is. While dynamic paths can be added, they are added in the order of rows.
-    /// While this column gathers, its rows are inserted with the plans of the gather.
-    if (ranges.size() < 2 || canAddNewDynamicPath() || gather_state)
-    {
-        for (const auto & range : ranges)
-        {
-            if (range.length == 1)
-                insertFrom(*range.column, range.start);
-            else
-                insertRangeFrom(*range.column, range.start, range.length);
-        }
-        return;
-    }
-
-    GatherState state;
-    gather_state = &state;
-    SCOPE_EXIT({ gather_state = nullptr; });
-    insertGatheredRanges(ranges);
 }
 
 ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnObject & src)

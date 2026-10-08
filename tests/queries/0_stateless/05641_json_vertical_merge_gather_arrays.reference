@@ -1,0 +1,14 @@
+1
+9000	9000
+0	{"arr":["a0",null],"objs":[],"p0":0}
+1	{"arr":[],"objs":[{"x":"str0","z":[1,2]},{"y":"t"}],"q0":[{"k":0}]}
+2	{"arr":["c0"],"objs":[{"w":{"v":[{"u":"0"}]},"x":0}],"p0":"s0"}
+3	{"arr":["a1",null],"objs":[{"x":1,"y":"s1"}],"p1":1}
+4	{"arr":[],"objs":[{"x":"str1","z":[1,2]},{"y":"t"}],"q1":[{"k":1}]}
+5	{"arr":[],"objs":[{"w":{"v":[{"u":"1"}]},"x":1}],"p1":"s1"}
+15	{"arr":["a5",null],"objs":[],"p5":5}
+16	{"arr":[],"objs":[{"x":"str5","z":[1,2]},{"y":"t"}],"q1":[{"k":5}]}
+17	{"arr":[],"objs":[{"w":{"v":[{"u":"2"}]},"x":5}],"p5":"s5"}
+{'arr':'Array(Nullable(String))','objs':'Array(Nullable(String))','p0':'Int64'}
+{'arr':'Array(Nullable(String))','objs':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))','q0':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))'}
+{'arr':'Array(Nullable(String))','objs':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))','p0':'String'}
