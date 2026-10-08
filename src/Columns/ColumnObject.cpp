@@ -2,15 +2,18 @@
 #include <DataTypes/DataTypesCache.h>
 #include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypeVariant.h>
+#include <DataTypes/Serializations/SerializationString.h>
 #include <Columns/ColumnObject.h>
 #include <Columns/ColumnCompressed.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnVariant.h>
 #include <IO/Operators.h>
+#include <IO/VarInt.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Arena.h>
 #include <atomic>
+#include <bit>
 #include <optional>
 #include <Common/HashTable/Hash.h>
 #include <Common/HashTable/HashMap.h>
@@ -1098,13 +1101,23 @@ struct ColumnObject::SharedDataSerializationState
     }
 
 private:
+    /// The local discriminators of each of the paths, which do not change while the state is used.
+    VectorWithMemoryTracking<const UInt8 *> paths_discriminators;
+
     void scan(const DynamicPathsForSharedData & paths, size_t begin, size_t end)
     {
+        if (paths_discriminators.size() != paths.size())
+        {
+            paths_discriminators.resize(paths.size());
+            for (size_t index = 0; index != paths.size(); ++index)
+                paths_discriminators[index] = paths[index].second->getVariantColumn().getLocalDiscriminators().data();
+        }
+
         const size_t num = end - begin;
         row_offsets.assign(num + 1, 0U);
-        for (const auto & [_, column] : paths)
+        for (const UInt8 * path_discriminators : paths_discriminators)
         {
-            const UInt8 * discriminators = column->getVariantColumn().getLocalDiscriminators().data() + begin;
+            const UInt8 * discriminators = path_discriminators + begin;
             for (size_t i = 0; i != num; ++i)
                 row_offsets[i + 1] += discriminators[i] != ColumnVariant::NULL_DISCRIMINATOR;
         }
@@ -1115,7 +1128,7 @@ private:
         positions.assign(row_offsets.begin(), row_offsets.end() - 1);
         for (size_t index = 0; index != paths.size(); ++index)
         {
-            const UInt8 * discriminators = paths[index].second->getVariantColumn().getLocalDiscriminators().data() + begin;
+            const UInt8 * discriminators = paths_discriminators[index] + begin;
             for (size_t i = 0; i != num; ++i)
             {
                 if (discriminators[i] != ColumnVariant::NULL_DISCRIMINATOR)
@@ -1804,38 +1817,73 @@ void ColumnObject::serializePathAndValueIntoSharedData(ColumnString * shared_dat
     if (!cache.is_initialized)
     {
         cache.shared_variant_discriminator = column.getSharedVariantDiscriminator();
+        cache.max_string_size = getFormatSettings().binary.max_binary_string_size;
         cache.encoded_types.resize(column.getVariantInfo().variant_names.size());
         cache.serializations.resize(column.getVariantInfo().variant_names.size());
+        cache.value_formats.resize(column.getVariantInfo().variant_names.size());
         cache.is_initialized = true;
     }
 
     shared_data_paths->insertData(path.data(), path.size());
     auto & shared_data_values_chars = shared_data_values->getChars();
     const auto & variant = variant_column.getVariantByGlobalDiscriminator(global_discr);
+    const size_t variant_row = variant_column.offsetAt(n);
     /// The same bytes as SerializationDynamic::serializeBinary writes: a value of the shared variant is already
     /// a binary-encoded type and value, other values are written as the encoded variant type and the value.
     if (global_discr == cache.shared_variant_discriminator)
     {
-        auto value = assert_cast<const ColumnString &>(variant).getDataAt(variant_column.offsetAt(n));
+        auto value = assert_cast<const ColumnString &>(variant).getDataAt(variant_row);
         shared_data_values_chars.insert(value.data(), value.data() + value.size());
     }
     else
     {
+        using ValueFormat = SharedDataValueSerializationCache::ValueFormat;
         auto & serialization = cache.serializations[global_discr];
         if (!serialization)
         {
             const auto & variant_info = column.getVariantInfo();
+            const auto & variant_type = assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariant(global_discr);
             WriteBufferFromString type_buf(cache.encoded_types[global_discr]);
-            encodeDataType(assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariant(global_discr), type_buf);
+            encodeDataType(variant_type, type_buf);
             type_buf.finalize();
             serialization = getDataTypesCache().getSerialization(variant_info.variant_names[global_discr]);
+
+            /// SerializationString::serializeBinary and SerializationNumber::serializeBinary (little-endian) write these.
+            if (typeid_cast<const SerializationString *>(serialization.get()))
+                cache.value_formats[global_discr] = ValueFormat::String;
+            else if (std::endian::native == std::endian::little && WhichDataType(variant_type).isNativeNumber())
+                cache.value_formats[global_discr] = ValueFormat::FixedSize;
+            else
+                cache.value_formats[global_discr] = ValueFormat::Serialization;
         }
 
         const auto & encoded_type = cache.encoded_types[global_discr];
         shared_data_values_chars.insert(encoded_type.data(), encoded_type.data() + encoded_type.size());
-        WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag());
-        serialization->serializeBinary(variant, variant_column.offsetAt(n), value_buf, getFormatSettings());
-        value_buf.finalize();
+        auto value_format = cache.value_formats[global_discr];
+        std::string_view value;
+        if (value_format != ValueFormat::Serialization)
+        {
+            value = variant.getDataAt(variant_row);
+            if (value_format == ValueFormat::String && cache.max_string_size && value.size() > cache.max_string_size)
+                value_format = ValueFormat::Serialization;
+        }
+
+        if (value_format == ValueFormat::Serialization)
+        {
+            WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag());
+            serialization->serializeBinary(variant, variant_row, value_buf, getFormatSettings());
+            value_buf.finalize();
+        }
+        else
+        {
+            if (value_format == ValueFormat::String)
+            {
+                char size_buf[16];
+                const char * size_end = writeVarUInt(value.size(), size_buf);
+                shared_data_values_chars.insert(size_buf, size_end);
+            }
+            shared_data_values_chars.insert(value.data(), value.data() + value.size());
+        }
     }
     shared_data_values->getOffsets().push_back(shared_data_values_chars.size());
 }
