@@ -2451,7 +2451,7 @@ private:
         {
             case ElementType::BOOL:
             {
-                if (auto discr = findOrAddVariant(column_dynamic, "Bool"))
+                if (auto discr = findOrAddVariant(column_dynamic, BinaryTypeIndex::Bool))
                 {
                     insertValueIntoNumericVariant<ColumnUInt8, UInt8>(variant_column, element.getBool(), *discr);
                     return true;
@@ -2461,7 +2461,7 @@ private:
             }
             case ElementType::INT64:
             {
-                if (auto discr = findOrAddVariant(column_dynamic, "Int64"))
+                if (auto discr = findOrAddVariant(column_dynamic, BinaryTypeIndex::Int64))
                 {
                     insertValueIntoNumericVariant<ColumnInt64, Int64>(variant_column, element.getInt64(), *discr);
                     return true;
@@ -2471,7 +2471,7 @@ private:
             }
             case ElementType::UINT64:
             {
-                if (auto discr = findOrAddVariant(column_dynamic, "UInt64"))
+                if (auto discr = findOrAddVariant(column_dynamic, BinaryTypeIndex::UInt64))
                 {
                     insertValueIntoNumericVariant<ColumnUInt64, UInt64>(variant_column, element.getUInt64(), *discr);
                     return true;
@@ -2481,7 +2481,7 @@ private:
             }
             case ElementType::DOUBLE:
             {
-                if (auto discr = findOrAddVariant(column_dynamic, "Float64"))
+                if (auto discr = findOrAddVariant(column_dynamic, BinaryTypeIndex::Float64))
                 {
                     insertValueIntoNumericVariant<ColumnFloat64, Float64>(variant_column, element.getDouble(), *discr);
                     return true;
@@ -2497,7 +2497,7 @@ private:
                 /// If inference is disabled, just insert String.
                 if (!format_settings.try_infer_dates && !format_settings.try_infer_datetimes)
                 {
-                    if (auto discr = findOrAddVariant(column_dynamic, "String"))
+                    if (auto discr = findOrAddVariant(column_dynamic, BinaryTypeIndex::String))
                     {
                         insertValueIntoStringVariant(variant_column, data, *discr);
                         return true;
@@ -2708,17 +2708,18 @@ private:
         return std::nullopt;
     }
 
-    /// Global discriminator of the simple type variant named `type_name`. Adds the variant if the column
+    /// Global discriminator of the variant of the simple type `type_index`. Adds the variant if the column
     /// does not have it yet; returns nothing if it cannot be added.
-    static std::optional<ColumnVariant::Discriminator> findOrAddVariant(ColumnDynamic & column_dynamic, std::string_view type_name)
+    static std::optional<ColumnVariant::Discriminator> findOrAddVariant(ColumnDynamic & column_dynamic, BinaryTypeIndex type_index)
     {
-        if (auto discr = findVariant(column_dynamic.getVariantInfo(), type_name))
+        /// The type object and the name of a simple type are taken from the thread-local cache by index, which needs no lookup by name.
+        const auto & simple_type = getSimpleDataTypesCache().getElement(type_index);
+        if (auto discr = findVariant(column_dynamic.getVariantInfo(), simple_type.name))
             return discr;
 
-        const String name(type_name);
-        if (!column_dynamic.addNewVariant(getDataTypesCache().getType(name), name))
+        if (!column_dynamic.addNewVariant(simple_type.type, simple_type.name))
             return std::nullopt;
-        return findVariant(column_dynamic.getVariantInfo(), type_name);
+        return findVariant(column_dynamic.getVariantInfo(), simple_type.name);
     }
 
     template <typename ColumnType, typename ElementType>

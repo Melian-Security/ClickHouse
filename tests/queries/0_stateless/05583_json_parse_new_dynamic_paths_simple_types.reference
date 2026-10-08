@@ -1,0 +1,21 @@
+-- the first value of a new dynamic path, of each simple type, then values of other types
+{"a":true,"b":-1,"c":18446744073709551615,"d":1.5,"e":"s"}	{'a':'Bool','b':'Int64','c':'UInt64','d':'Float64','e':'String'}	{}
+{"a":1,"b":"x","c":false,"d":2,"e":2.5}	{'a':'Int64','b':'String','c':'Bool','d':'Int64','e':'Float64'}	{}
+{"a":"y","b":0.25,"c":-3,"d":true,"e":18446744073709551615}	{'a':'String','b':'Float64','c':'Int64','d':'Bool','e':'UInt64'}	{}
+Bool	Int64	UInt64	Float64	String
+Int64	String	Bool	Int64	Float64
+String	Float64	Int64	Bool	UInt64
+-- arrays of objects in shared data: every object gets new dynamic paths
+{"a":[{"k":true,"l":-1,"m":18446744073709551615,"n":0.5,"o":"t"},{"k":1,"l":"u","p":{"q":false}}],"c1":1,"c2":2,"c3":3,"c4":4,"c5":5,"c6":6,"c7":7,"c8":8}	{'a':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))'}
+{"a":[{"k":"v","o":2}],"b":[{"k":1.5},{"k":true}],"c1":1,"c2":2,"c3":3,"c4":4,"c5":5,"c6":6,"c7":7,"c8":8}	{'a':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))','b':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))'}
+{"b":[{"x":[1,2],"y":[{"z":"w"}]}],"c1":1,"c2":2,"c3":3,"c4":4,"c5":5,"c6":6,"c7":7,"c8":8}	{'b':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))'}
+Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))	[{'k':'Bool','l':'Int64'},{'k':'Int64','l':'String'}]
+Array(JSON(max_dynamic_types=16, max_dynamic_paths=2))	[{'k':'String'}]
+None	[]
+{"k":true,"l":-1,"m":18446744073709551615,"n":0.5,"o":"t"}	Bool	Int64	UInt64	Float64	String
+{"k":1,"l":"u","p":{"q":false}}	Int64	String	None	None	None
+{"k":"v","o":2}	String	None	None	None	Int64
+-- many objects, read back after the insert
+6000	12653173071724987162	[('a','Array(JSON(max_dynamic_types=16, max_dynamic_paths=1))'),('b0','Int64'),('b1','Int64'),('b2','Int64'),('b3','Int64'),('b4','Int64'),('b5','Int64'),('b6','Int64')]
+-- date inference: Date is a simple type, DateTime64 is not
+{"a":[{"d":"2020-01-01","s":"x","t":"2020-01-01 00:00:00.123000000"}],"b":"2020-01-02","c1":0,"c2":0,"c3":0,"c4":0}	{'a':'Array(JSON(max_dynamic_types=16, max_dynamic_paths=1))','b':'Date'}	[{'d':'Date'}]

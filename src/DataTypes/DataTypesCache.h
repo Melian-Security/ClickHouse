@@ -6,6 +6,8 @@
 #include <Common/StringHashForHeterogeneousLookup.h>
 
 #include <array>
+#include <limits>
+#include <type_traits>
 #include <unordered_map>
 
 namespace DB
@@ -42,6 +44,9 @@ public:
     const Element * findByName(const String & type_name) const;
     const Element * findByName(PrehashedStringView type_name) const;
 
+    /// Same as findByName(type.getName()), without building the name or a hash table lookup.
+    const Element * findByType(const IDataType & type) const;
+
     /// Lookup by type name. Returns pre-cached type for simple types,
     /// falls back to DataTypeFactory for others.
     DataTypePtr getType(const String & type_name) const;
@@ -51,11 +56,15 @@ public:
     SerializationPtr getSerialization(const String & type_name) const;
 
     SimpleDataTypesCache();
+    SimpleDataTypesCache(const SimpleDataTypesCache &) = delete;
+    SimpleDataTypesCache & operator=(const SimpleDataTypesCache &) = delete;
 
 private:
     void addSimpleType(BinaryTypeIndex index, const String & type_name);
 
     std::array<Element, BINARY_TYPE_INDEX_SIZE> by_index{};
+    /// Elements of simple types without a custom name by TypeIndex. A simple type is the only type with its TypeIndex.
+    std::array<const Element *, std::numeric_limits<std::underlying_type_t<TypeIndex>>::max() + 1> by_type_index{};
     std::unordered_map<String, Element, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> by_name;
 };
 
