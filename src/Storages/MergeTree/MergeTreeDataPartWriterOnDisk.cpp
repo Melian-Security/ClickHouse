@@ -47,6 +47,26 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+namespace
+{
+
+/// Like `IColumn::mutate`, but makes exclusive only the column objects that hold statistics (see `hasStatistics`)
+/// and the columns above them. All other subcolumns stay shared with the source column, so their data is not copied.
+/// The result may only be used to change statistics, not data.
+MutableColumnPtr mutateForStatistics(ColumnPtr column)
+{
+    /// `COW::mutate` is shallow: it copies only this column object if it is shared, its subcolumns stay shared.
+    MutableColumnPtr res = COW<IColumn>::mutate(std::move(column));
+    res->forEachMutableSubcolumn([](IColumn::WrappedPtr & subcolumn)
+    {
+        if (subcolumn->hasStatistics())
+            subcolumn = mutateForStatistics(std::move(subcolumn).detach());
+    });
+    return res;
+}
+
+}
+
 MergeTreeDataPartWriterOnDisk::MergeTreeDataPartWriterOnDisk(
     const String & data_part_name_,
     const String & logger_name_,
@@ -679,10 +699,11 @@ void MergeTreeDataPartWriterOnDisk::prepareBlockForWriting(Block & block)
                 column.column = std::move(new_column);
             }
 
-            /// Take statistics from sample column.
+            /// Take statistics from sample column. The column is usually still referenced by the caller's block,
+            /// so a full `IColumn::mutate` would copy all of its data.
             if (column.column->hasStatistics())
             {
-                auto mutable_column = IColumn::mutate(std::move(column.column));
+                auto mutable_column = mutateForStatistics(std::move(column.column));
                 mutable_column->takeOrCalculateStatisticsFrom({sample_column.column});
                 column.column = std::move(mutable_column);
             }

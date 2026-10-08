@@ -5,6 +5,8 @@
 #include <DataTypes/NestedUtils.h>
 #include <Compression/CachedCompressedReadBuffer.h>
 
+#include <algorithm>
+
 namespace DB
 {
 
@@ -115,7 +117,35 @@ try
     if (initialized)
         return;
 
+    /// Only the stripes of the columns that are read matter for the size of the read buffer. Estimating it
+    /// over all columns would cost a pass over the marks of every column of the part for every reader, and
+    /// e.g. a Vertical merge reads each column of a part with a separate reader.
+    std::vector<size_t> columns_to_read_in_marks;
+    for (const auto & position : column_positions)
+    {
+        if (!position)
+            continue;
+
+        if (!has_substream_marks)
+        {
+            columns_to_read_in_marks.push_back(*position);
+            continue;
+        }
+
+        size_t num_substreams = columns_substreams.getColumnSubstreams(*position).size();
+        if (num_substreams == 0)
+            continue;
+
+        size_t first_substream_position = columns_substreams.getFirstSubstreamPosition(*position);
+        for (size_t i = 0; i != num_substreams; ++i)
+            columns_to_read_in_marks.push_back(first_substream_position + i);
+    }
+
+    std::ranges::sort(columns_to_read_in_marks);
+    columns_to_read_in_marks.erase(std::unique(columns_to_read_in_marks.begin(), columns_to_read_in_marks.end()), columns_to_read_in_marks.end());
+
     stream = std::make_unique<MergeTreeReaderStreamAllOfMultipleColumns>(
+        std::move(columns_to_read_in_marks),
         data_part_info_for_read->getDataPartStorage(), MergeTreeDataPartCompact::DATA_FILE_NAME,
         MergeTreeDataPartCompact::DATA_FILE_EXTENSION, data_part_info_for_read->getMarksCount(),
         all_mark_ranges, settings, uncompressed_cache,

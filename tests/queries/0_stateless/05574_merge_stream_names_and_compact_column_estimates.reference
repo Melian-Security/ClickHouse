@@ -1,0 +1,37 @@
+id	['id']	['id']
+json	['json.object_structure','json.a%2Db.dynamic_structure','json.a%2Db.variant_discr','json.c%20d.dynamic_structure','json.c%20d.variant_discr','json.x%2Ey%2Ez%25.dynamic_structure','json.x%2Ey%2Ez%25.variant_discr','json.typed%2Dpath','json.typed%2Epath.size0','json.typed%2Epath.null','json.typed%2Epath','json.a%2Db.Int64','json.a%2Db.SharedVariant','json.a%2Db.String','json.c%20d.SharedVariant','json.c%20d.String','json.x%2Ey%2Ez%25.Array%28Nullable%28Int64%29%29.size0','json.x%2Ey%2Ez%25.Array%28Nullable%28Int64%29%29.null','json.x%2Ey%2Ez%25.Array%28Nullable%28Int64%29%29','json.x%2Ey%2Ez%25.SharedVariant','json.object_shared_data.0.structure','json.object_shared_data.0.data','json.object_shared_data.0.paths_marks','json.object_shared_data.0.substreams','json.object_shared_data.0.substreams_marks','json.object_shared_data.0.paths_substreams_metadata','json.object_shared_data.1.structure','json.object_shared_data.1.data','json.object_shared_data.1.paths_marks','json.object_shared_data.1.substreams','json.object_shared_data.1.substreams_marks','json.object_shared_data.1.paths_substreams_metadata','json.object_shared_data.copy.sizes','json.object_shared_data.copy.paths_indexes','json.object_shared_data.copy.values']	['json.object_structure','json.a%2Db.dynamic_structure','json.a%2Db.variant_discr','json.c%20d.dynamic_structure','json.c%20d.variant_discr','json.x%2Ey%2Ez%25.dynamic_structure','json.x%2Ey%2Ez%25.variant_discr','json.typed%2Dpath','json.typed%2Epath.size0','json.typed%2Epath.null','json.typed%2Epath','json.a%2Db.Int64','json.a%2Db.SharedVariant','json.a%2Db.String','json.c%20d.SharedVariant','json.c%20d.String','json.x%2Ey%2Ez%25.Array%28Nullable%28Int64%29%29.size0','json.x%2Ey%2Ez%25.Array%28Nullable%28Int64%29%29.null','json.x%2Ey%2Ez%25.Array%28Nullable%28Int64%29%29','json.x%2Ey%2Ez%25.SharedVariant','json.object_shared_data.0.structure','json.object_shared_data.0.data','json.object_shared_data.0.paths_marks','json.object_shared_data.0.substreams','json.object_shared_data.0.substreams_marks','json.object_shared_data.0.paths_substreams_metadata','json.object_shared_data.1.structure','json.object_shared_data.1.data','json.object_shared_data.1.paths_marks','json.object_shared_data.1.substreams','json.object_shared_data.1.substreams_marks','json.object_shared_data.1.paths_substreams_metadata','json.object_shared_data.copy.sizes','json.object_shared_data.copy.paths_indexes','json.object_shared_data.copy.values']
+t	['t%2Ep%2Eq','t%2Er%20s']	['t%2Ep%2Eq','t%2Er%20s']
+v	['v.variant_discr','v.Array%28UInt32%29.size0','v.Array%28UInt32%29','v.Map%28String%2C%20UInt64%29.size0','v.Map%28String%2C%20UInt64%29%2Ekeys','v.Map%28String%2C%20UInt64%29%2Evalues','v.String']	['v.variant_discr','v.Array%28UInt32%29.size0','v.Array%28UInt32%29','v.Map%28String%2C%20UInt64%29.size0','v.Map%28String%2C%20UInt64%29%2Ekeys','v.Map%28String%2C%20UInt64%29%2Evalues','v.String']
+0	(0,'x y')	str	{"a-b":1,"c d":"e","q\\/w":true,"typed-path":"a","typed":{"path":["b",null]},"u":{"v":[{"w":1}]},"x":{"y":{"z%":42}},"é":[1,2]}
+1	(1,'x y')	[1,2]	{"a-b":1,"c d":"e","q\\/w":true,"typed-path":"a","typed":{"path":["b",null]},"u":{"v":[{"w":1}]},"x":{"y":{"z%":42}},"é":[1,2]}
+2	(2,'x y')	{'k':2}	{"a-b":1,"c d":"e","q\\/w":true,"typed-path":"a","typed":{"path":["b",null]},"u":{"v":[{"w":1}]},"x":{"y":{"z%":42}},"é":[1,2]}
+3	(3,'x y')	str	{"a-b":1,"c d":"e","q\\/w":true,"typed-path":"a","typed":{"path":["b",null]},"u":{"v":[{"w":1}]},"x":{"y":{"z%":42}},"é":[1,2]}
+4	(4,'x y')	[1,2]	{"a-b":1,"c d":"e","q\\/w":true,"typed-path":"a","typed":{"path":["b",null]},"u":{"v":[{"w":1}]},"x":{"y":{"z%":42}},"é":[1,2]}
+5	(0,'z')	str2	{"a-b":"string now","k$":1.5,"typed-path":"c","typed":{"path":[]},"x":{"y":{"z%":[1]}}}
+6	(1,'z')	str2	{"a-b":"string now","k$":1.5,"typed-path":"c","typed":{"path":[]},"x":{"y":{"z%":[1]}}}
+7	(2,'z')	str2	{"a-b":"string now","k$":1.5,"typed-path":"c","typed":{"path":[]},"x":{"y":{"z%":[1]}}}
+8	(3,'z')	str2	{"a-b":"string now","k$":1.5,"typed-path":"c","typed":{"path":[]},"x":{"y":{"z%":[1]}}}
+9	(4,'z')	str2	{"a-b":"string now","k$":1.5,"typed-path":"c","typed":{"path":[]},"x":{"y":{"z%":[1]}}}
+1	e	[1,2]	42	true	\N	['{"w":1}']
+1	e	[1,2]	42	true	\N	['{"w":1}']
+1	e	[1,2]	42	true	\N	['{"w":1}']
+1	e	[1,2]	42	true	\N	['{"w":1}']
+1	e	[1,2]	42	true	\N	['{"w":1}']
+string now	\N	\N	[1]	\N	1.5	\N
+string now	\N	\N	[1]	\N	1.5	\N
+string now	\N	\N	[1]	\N	1.5	\N
+string now	\N	\N	[1]	\N	1.5	\N
+string now	\N	\N	[1]	\N	1.5	\N
+Compact	8	1200
+2158200	2400	1200	1800	1200	102258
+15	['0']	5
+1797	['0','1','2']	\N
+1800	[]	600
+3597	['0','1','2']	\N
+Wide	1	1200
+Vertical	8
+2158200	2400	1200	1800	1200	102258
+15	['0']	5
+1797	['0','1','2']	\N
+1800	[]	600
+3597	['0','1','2']	\N

@@ -192,6 +192,9 @@ private:
     std::optional<size_t> streams_to_open_in_part;
 
     String already_written_stream_holder;
+
+    /// Used by getStream to make stream names.
+    mutable String stream_name_buffer;
 };
 
 }

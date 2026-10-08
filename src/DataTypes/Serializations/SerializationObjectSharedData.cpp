@@ -21,6 +21,8 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 #include <IO/VarInt.h>
+#include <base/StringViewHash.h>
+#include <city.h>
 #include <algorithm>
 #include <numeric>
 
@@ -166,12 +168,23 @@ public:
         if (!type)
             return nullptr;
 
+        /// The values of one path are spread over the values column, so the ones a few iterations ahead are prefetched.
+        static constexpr size_t prefetch_distance = 8;
+        const auto & values_offsets = values.getOffsets();
+        const auto * values_chars = values.getChars().data();
+        auto prefetch_value = [&](size_t i)
+        {
+            if (i + prefetch_distance < end)
+                __builtin_prefetch(values_chars + values_offsets[ssize_t(bucket_paths.values[i + prefetch_distance]) - 1]);
+        };
+
         auto column = type->type->createColumn();
         column->reserve(end - begin);
         if (type->value_size)
         {
             for (size_t i = begin; i != end; ++i)
             {
+                prefetch_value(i);
                 auto value = values.getDataAt(bucket_paths.values[i]);
                 if (value.size() != 1 + type->value_size || static_cast<UInt8>(value[0]) != type->encoded_type)
                     return nullptr;
@@ -183,6 +196,7 @@ public:
             auto & column_string = assert_cast<ColumnString &>(*column);
             for (size_t i = begin; i != end; ++i)
             {
+                prefetch_value(i);
                 auto value = values.getDataAt(bucket_paths.values[i]);
                 if (value.empty() || static_cast<UInt8>(value[0]) != type->encoded_type)
                     return nullptr;
@@ -270,12 +284,85 @@ private:
     std::array<bool, 256> checked{};
 };
 
+/// The file names of the substreams of path columns, which `serializeChunkBucketData` lists for every path. A name
+/// depends only on the fields of the substream path compared below, and the same few substream paths are written for
+/// every path of every granule, so each name is built once per part instead of once per substream.
+class SubstreamFileNames
+{
+public:
+    const String & get(const ISerialization::SubstreamPath & path, const ISerialization::StreamFileNameSettings & settings)
+    {
+        /// Most substreams have no names, so only the names that are set are hashed.
+        UInt64 hash = path.size();
+        auto combine = [&](UInt64 value) { hash = CityHash_v1_0_2::Hash128to64({hash, value}); };
+        for (const auto & substream : path)
+        {
+            combine((static_cast<UInt64>(substream.type) << 32) ^ substream.bucket);
+            for (const String * str : {&substream.variant_element_name, &substream.name_of_substream, &substream.object_path_name})
+                combine(str->empty() ? 0 : StringViewHash64()(*str));
+        }
+
+        auto [it, inserted] = names.try_emplace(hash);
+        auto & entry = it->second;
+        if (inserted)
+        {
+            entry.path.reserve(path.size());
+            for (const auto & substream : path)
+                entry.path.push_back({substream.type, substream.bucket, substream.variant_element_name, substream.name_of_substream, substream.object_path_name});
+            entry.name = ISerialization::getFileNameForStream(String{}, path, settings);
+        }
+        else if (!entry.matches(path))
+        {
+            /// Another substream path with the same hash.
+            uncached_name = ISerialization::getFileNameForStream(String{}, path, settings);
+            return uncached_name;
+        }
+
+        return entry.name;
+    }
+
+private:
+    struct Substream
+    {
+        ISerialization::Substream::Type type;
+        size_t bucket;
+        String variant_element_name;
+        String name_of_substream;
+        String object_path_name;
+    };
+
+    struct Entry
+    {
+        std::vector<Substream> path;
+        String name;
+
+        bool matches(const ISerialization::SubstreamPath & other) const
+        {
+            if (path.size() != other.size())
+                return false;
+            for (size_t i = 0; i != path.size(); ++i)
+            {
+                if (path[i].type != other[i].type || path[i].bucket != other[i].bucket
+                    || path[i].variant_element_name != other[i].variant_element_name
+                    || path[i].name_of_substream != other[i].name_of_substream
+                    || path[i].object_path_name != other[i].object_path_name)
+                    return false;
+            }
+            return true;
+        }
+    };
+
+    std::unordered_map<UInt64, Entry> names;
+    String uncached_name;
+};
+
 }
 
 struct SerializeBinaryBulkStateObjectSharedData : public ISerialization::SerializeBinaryBulkState
 {
     /// Kept for the whole part, so the types of shared data values are resolved once per part.
     std::unique_ptr<SharedDataValueTypes> value_types;
+    SubstreamFileNames substream_file_names;
     ISerialization::SerializeBinaryBulkStatePtr map_state;
     std::vector<ISerialization::SerializeBinaryBulkStatePtr> bucket_map_states;
 };
@@ -527,6 +614,37 @@ WriteBuffer & getCopyValuesStream(ISerialization::SerializeBinaryBulkSettings & 
     return *stream;
 }
 
+/// The marks of one stream while only this stream is written and `settings.path` is its path. A mark is the position of
+/// the current compressed block of the stream in the file and the offset in that block, which is the offset in the
+/// stream's buffer. The position only changes when the stream writes the block, which changes
+/// `stream.count() - stream.offset()`, so the mark getter, which finds the stream by its name, is only called after that.
+class StreamMarks
+{
+public:
+    StreamMarks(WriteBuffer & stream_, const ISerialization::SerializeBinaryBulkSettings & settings_)
+        : stream(stream_), settings(settings_)
+    {
+    }
+
+    MarkInCompressedFile get()
+    {
+        size_t current_block_start = stream.count() - stream.offset();
+        if (current_block_start != block_start)
+        {
+            block_mark = settings.stream_mark_getter(settings.path);
+            block_start = current_block_start;
+            return block_mark;
+        }
+        return {block_mark.offset_in_compressed_file, stream.offset()};
+    }
+
+private:
+    WriteBuffer & stream;
+    const ISerialization::SerializeBinaryBulkSettings & settings;
+    MarkInCompressedFile block_mark;
+    size_t block_start = std::numeric_limits<size_t>::max();
+};
+
 /// Write what SerializationDynamic writes, with the settings of `serializeChunkBucketData`, for a Dynamic
 /// column whose only variant besides the shared variant is `type`.
 void serializeSingleTypeDynamicColumn(
@@ -561,6 +679,7 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
     const DataTypePtr & dynamic_type_,
     const SerializationPtr & dynamic_serialization_,
     SharedDataValueTypes & value_types,
+    SubstreamFileNames & substream_file_names,
     MergeTreeObjectSharedDataSerializationVersion nested_shared_data_version)
 {
     ChunkBucketSerializationMetadata metadata;
@@ -568,8 +687,12 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
     if (!settings.stream_mark_getter)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Mark getter is not set for ADVANCED shared data serialization");
 
+    /// Everything below, also the data of nested serializations, is written into the ObjectSharedDataData stream.
+    StreamMarks data_stream_marks(data_stream, settings);
+    auto get_data_stream_mark = [&] { return data_stream_marks.get(); };
+
     /// Remember the mark of the ObjectSharedDataData stream.
-    metadata.data_stream_mark = settings.stream_mark_getter(settings.path);
+    metadata.data_stream_mark = get_data_stream_mark();
 
     const size_t num_paths = bucket_paths.paths.size();
     metadata.paths_marks.reserve(num_paths);
@@ -591,18 +714,13 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
     data_serialization_settings.object_shared_data_target_chunk_rows = settings.object_shared_data_target_chunk_rows;
     /// Don't write any dynamic statistics.
     data_serialization_settings.write_statistics = ISerialization::SerializeBinaryBulkSettings::StatisticsMode::NONE;
-    data_serialization_settings.stream_mark_getter = [&](const ISerialization::SubstreamPath &) -> MarkInCompressedFile { return settings.stream_mark_getter(settings.path); };
+    data_serialization_settings.stream_mark_getter = [&](const ISerialization::SubstreamPath &) -> MarkInCompressedFile { return get_data_stream_mark(); };
     /// Inherit the min_compress_block_size setting.
     data_serialization_settings.min_compress_block_size = settings.min_compress_block_size;
 
+    /// Substream names of a path are stored without the column name.
     ISerialization::StreamFileNameSettings stream_file_name_settings;
     stream_file_name_settings.escape_variant_substreams = false;
-
-    /// Substream names of a path are stored without the column name, so the name is empty. It is passed as a
-    /// string rather than as NameAndTypePair("", type): copying a type pointer is an atomic increment and decrement
-    /// of a reference counter shared by all threads that serialize this type, and the getter below is called
-    /// for every substream of every path of every granule.
-    const String empty_column_name;
 
     data_serialization_settings.getter = [&](const ISerialization::SubstreamPath & substream_path) -> WriteBuffer *
     {
@@ -611,8 +729,8 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
         if (data_stream.offset() >= settings.min_compress_block_size)
             data_stream.next();
         /// Add new substream and its mark for current path.
-        metadata.paths_substreams.back().push_back(ISerialization::getFileNameForStream(empty_column_name, substream_path, stream_file_name_settings));
-        metadata.paths_substreams_marks.back().push_back(settings.stream_mark_getter(settings.path));
+        metadata.paths_substreams.back().push_back(substream_file_names.get(substream_path, stream_file_name_settings));
+        metadata.paths_substreams_marks.back().push_back(get_data_stream_mark());
         return &data_stream;
     };
 
@@ -625,7 +743,7 @@ ChunkBucketSerializationMetadata serializeChunkBucketData(
         if (data_stream.offset() >= settings.min_compress_block_size)
             data_stream.next();
         /// Remember the mark of ObjectSharedDataData stream for this path before writing any data.
-        metadata.paths_marks.push_back(settings.stream_mark_getter(settings.path));
+        metadata.paths_marks.push_back(get_data_stream_mark());
 
         const SharedDataValueTypes::Type * type = nullptr;
         if (auto variant_column = value_types.tryCopyValues(buckets_splitter, bucket_paths, path_index, type))
@@ -668,9 +786,10 @@ std::vector<MarkInCompressedFile> writePathsSubstreams(
 {
     std::vector<MarkInCompressedFile> marks_of_paths_substreams;
     marks_of_paths_substreams.reserve(metadata.paths_substreams.size());
+    StreamMarks stream_marks(stream, settings);
     for (const auto & path_substreams : metadata.paths_substreams)
     {
-        marks_of_paths_substreams.push_back(settings.stream_mark_getter(settings.path));
+        marks_of_paths_substreams.push_back(stream_marks.get());
         writeVarUInt(path_substreams.size(), stream);
         for (const auto & substream : path_substreams)
             writeStringBinary(substream, stream);
@@ -685,9 +804,10 @@ std::vector<MarkInCompressedFile> writeSubstreamsMarks(
 {
     std::vector<MarkInCompressedFile> marks_of_paths_substreams_marks;
     marks_of_paths_substreams_marks.reserve(metadata.paths_substreams_marks.size());
+    StreamMarks stream_marks(stream, settings);
     for (const auto & substreams_marks : metadata.paths_substreams_marks)
     {
-        marks_of_paths_substreams_marks.push_back(settings.stream_mark_getter(settings.path));
+        marks_of_paths_substreams_marks.push_back(stream_marks.get());
         for (const auto & mark : substreams_marks)
         {
             writeBinaryLittleEndian(mark.offset_in_compressed_file, stream);
@@ -898,7 +1018,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
             /// Serialize data and collect metadata, then write metadata substreams + structure suffix.
             auto & data_stream = getDataStream(settings);
             auto metadata = serializeChunkBucketData(
-                buckets_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types,
+                buckets_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types, shared_data_state->substream_file_names,
                 MergeTreeObjectSharedDataSerializationVersion::ADVANCED);
             settings.path.pop_back();
             writeAllChunkBucketMetadata(metadata, settings);
@@ -991,7 +1111,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                     const auto & chunk_splitter = *chunk_splitters[chunk_idx];
                     auto bucket_paths = chunk_splitter.getBucketPaths(bucket);
                     chunk_metadata.push_back(serializeChunkBucketData(
-                        chunk_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types,
+                        chunk_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types, shared_data_state->substream_file_names,
                         MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED));
                 }
                 settings.path.pop_back();
@@ -1116,7 +1236,7 @@ void SerializationObjectSharedData::serializeBinaryBulkWithMultipleStreams(
                     /// Serialize data and write metadata.
                     auto & data_stream = getDataStream(settings);
                     auto metadata = serializeChunkBucketData(
-                        buckets_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types,
+                        buckets_splitter, bucket_paths, data_stream, settings, dynamic_type, dynamic_serialization, *shared_data_state->value_types, shared_data_state->substream_file_names,
                         MergeTreeObjectSharedDataSerializationVersion::ADVANCED_CHUNKED);
                     settings.path.pop_back();
                     writeAllChunkBucketMetadata(metadata, settings);

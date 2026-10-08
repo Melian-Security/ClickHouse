@@ -2,15 +2,18 @@
 #include <DataTypes/DataTypesCache.h>
 #include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypeVariant.h>
+#include <DataTypes/Serializations/SerializationString.h>
 #include <Columns/ColumnObject.h>
 #include <Columns/ColumnCompressed.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnVariant.h>
 #include <IO/Operators.h>
+#include <IO/VarInt.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Arena.h>
 #include <atomic>
+#include <bit>
 #include <optional>
 #include <Common/HashTable/Hash.h>
 #include <Common/HashTable/HashMap.h>
@@ -966,10 +969,47 @@ void insertSourceRanges(IColumn & column, std::span<const SourceRange> ranges)
     }
 }
 
-/// `length` rows of a source Variant column from `start`, or `length` default values if column is null.
+/// A source Variant column with the same variants as the column its rows go to, with what insertVariantRows
+/// needs of it resolved once instead of for every row.
+struct VariantRowsSource
+{
+    /// The number of variants of the column the source was resolved for. Variants are only added by inserts.
+    size_t num_variants = 0;
+    const ColumnVariant::Discriminator * discriminators = nullptr;
+    const ColumnVariant::Offset * offsets = nullptr;
+    /// Indexed by the local discriminators of the source: the local discriminator in the column, and the variant
+    /// of the source.
+    VectorWithMemoryTracking<ColumnVariant::Discriminator> local_discriminators;
+    VectorWithMemoryTracking<const IColumn *> variants;
+
+    /// Resolves the source for the column, unless it is resolved for the current variants of the column.
+    void update(const ColumnVariant & src, const ColumnVariant & column)
+    {
+        size_t column_num_variants = column.getNumVariants();
+        if (num_variants == column_num_variants && discriminators)
+            return;
+
+        if (src.getNumVariants() != column_num_variants)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot insert value of Variant type with different number of types");
+
+        discriminators = src.getLocalDiscriminators().data();
+        offsets = src.getOffsets().data();
+        local_discriminators.resize(column_num_variants);
+        variants.resize(column_num_variants);
+        for (size_t src_local_discr = 0; src_local_discr != column_num_variants; ++src_local_discr)
+        {
+            auto discr = static_cast<ColumnVariant::Discriminator>(src_local_discr);
+            local_discriminators[src_local_discr] = column.localDiscriminatorByGlobal(src.globalDiscriminatorByLocal(discr));
+            variants[src_local_discr] = &src.getVariantByLocalDiscriminator(src_local_discr);
+        }
+        num_variants = column_num_variants;
+    }
+};
+
+/// `length` rows of a source Variant column from `start`, or `length` default values if source is null.
 struct VariantRows
 {
-    const ColumnVariant * column;
+    const VariantRowsSource * source;
     size_t start;
     size_t length;
 };
@@ -1019,7 +1059,7 @@ void insertVariantRows(ColumnVariant & column, std::span<const VariantRows> rows
 
     for (const auto & row : rows)
     {
-        if (!row.column)
+        if (!row.source)
         {
             memset(discriminators_pos, null_discriminator, row.length);
             memset(offsets_pos, 0, row.length * sizeof(*offsets_pos));
@@ -1028,22 +1068,22 @@ void insertVariantRows(ColumnVariant & column, std::span<const VariantRows> rows
             continue;
         }
 
-        const auto & src = *row.column;
-        if (src.getNumVariants() != num_variants)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot insert value of Variant type with different number of types");
-
-        const auto * src_discriminators = src.getLocalDiscriminators().data();
-        const auto * src_offsets = src.getOffsets().data();
+        const auto & src = *row.source;
+        const auto * src_discriminators = src.discriminators;
+        const auto * src_offsets = src.offsets;
+        const auto * src_local_discriminators = src.local_discriminators.data();
         for (size_t i = row.start; i != row.start + row.length; ++i)
         {
             auto src_local_discr = src_discriminators[i];
-            auto local_discr = column.localDiscriminatorByGlobal(src.globalDiscriminatorByLocal(src_local_discr));
-            *discriminators_pos++ = local_discr;
-            if (local_discr == null_discriminator)
+            if (src_local_discr == null_discriminator)
             {
+                *discriminators_pos++ = null_discriminator;
                 *offsets_pos++ = 0;
                 continue;
             }
+
+            auto local_discr = src_local_discriminators[src_local_discr];
+            *discriminators_pos++ = local_discr;
 
             auto & variant_size = variant_sizes[local_discr];
             auto & ranges = variant_ranges[local_discr];
@@ -1055,7 +1095,7 @@ void insertVariantRows(ColumnVariant & column, std::span<const VariantRows> rows
             }
             *offsets_pos++ = variant_size++;
 
-            const auto * src_variant = &src.getVariantByLocalDiscriminator(src_local_discr);
+            const auto * src_variant = src.variants[src_local_discr];
             size_t src_offset = src_offsets[i];
             if (!ranges.empty() && ranges.back().column == src_variant && ranges.back().start + ranges.back().length == src_offset)
                 ++ranges.back().length;
@@ -1098,13 +1138,23 @@ struct ColumnObject::SharedDataSerializationState
     }
 
 private:
+    /// The local discriminators of each of the paths, which do not change while the state is used.
+    VectorWithMemoryTracking<const UInt8 *> paths_discriminators;
+
     void scan(const DynamicPathsForSharedData & paths, size_t begin, size_t end)
     {
+        if (paths_discriminators.size() != paths.size())
+        {
+            paths_discriminators.resize(paths.size());
+            for (size_t index = 0; index != paths.size(); ++index)
+                paths_discriminators[index] = paths[index].second->getVariantColumn().getLocalDiscriminators().data();
+        }
+
         const size_t num = end - begin;
         row_offsets.assign(num + 1, 0U);
-        for (const auto & [_, column] : paths)
+        for (const UInt8 * path_discriminators : paths_discriminators)
         {
-            const UInt8 * discriminators = column->getVariantColumn().getLocalDiscriminators().data() + begin;
+            const UInt8 * discriminators = path_discriminators + begin;
             for (size_t i = 0; i != num; ++i)
                 row_offsets[i + 1] += discriminators[i] != ColumnVariant::NULL_DISCRIMINATOR;
         }
@@ -1115,7 +1165,7 @@ private:
         positions.assign(row_offsets.begin(), row_offsets.end() - 1);
         for (size_t index = 0; index != paths.size(); ++index)
         {
-            const UInt8 * discriminators = paths[index].second->getVariantColumn().getLocalDiscriminators().data() + begin;
+            const UInt8 * discriminators = paths_discriminators[index] + begin;
             for (size_t i = 0; i != num; ++i)
             {
                 if (discriminators[i] != ColumnVariant::NULL_DISCRIMINATOR)
@@ -1130,6 +1180,8 @@ private:
 /// How rows of one source column are inserted into this column, see `gather`.
 struct ColumnObject::GatherSourcePlan
 {
+    /// The source column. Holding it keeps another column from taking its address while the plan is kept.
+    ColumnPtr source;
     bool is_built = false;
     /// The plan stays valid while these two do not change: inserting from other sources can add dynamic paths
     /// to this column or lower its limit on dynamic paths.
@@ -1144,6 +1196,8 @@ struct ColumnObject::GatherSourcePlan
         const ColumnDynamic * src_column;
         std::string_view path;
         ColumnDynamic::InsertFromCache cache;
+        /// The Variant column of the source, used while `cache` says its rows go into our Variant column as they are.
+        VariantRowsSource variant_rows_source;
     };
     VectorWithMemoryTracking<DynamicPath> dynamic_paths;
     /// For each of GatherState::dynamic_columns, its index in dynamic_paths, or -1 if the source has no such dynamic path.
@@ -1155,13 +1209,25 @@ struct ColumnObject::GatherSourcePlan
     bool insert_shared_data_directly = false;
 };
 
-/// The source columns of a gather stay alive and unchanged until it returns, so the per-source plans and the
-/// cached value types, which point into them, can be kept for its duration.
+/// The state of `gather` while it fills one block. The per-source plans hold their source columns, which do not
+/// change while they are shared, so a plan stays valid for its source across the calls of `gather` for the block.
+/// The cached value types point into the sources without holding them, so they are kept for one call only.
 struct ColumnObject::GatherState
 {
     UnorderedMapWithMemoryTracking<const ColumnObject *, GatherSourcePlan> plans;
     const ColumnObject * last_source = nullptr;
     GatherSourcePlan * last_plan = nullptr;
+
+    /// Called at the start of each call of `gather`. Between calls the gatherer replaces sources by their next
+    /// blocks, so the plans of the sources that only the plans still hold are not needed anymore.
+    void startGatherCall()
+    {
+        std::erase_if(plans, [](const auto & entry) { return entry.second.source->use_count() == 1; });
+        last_source = nullptr;
+        last_plan = nullptr;
+        type_caches.assign(type_caches.size(), SharedDataValueTypeCache{});
+        type_cache_num_variants.assign(type_cache_num_variants.size(), 0);
+    }
 
     /// Our dynamic paths in a flat list, for the lookup of paths from source shared data and default filling.
     size_t num_dynamic_paths = std::numeric_limits<size_t>::max();
@@ -1236,11 +1302,23 @@ struct ColumnObject::GatherState
     }
 };
 
+void ColumnObject::GatherStateDeleter::operator()(GatherState * state) const
+{
+    delete state;
+}
+
 void ColumnObject::gather(ColumnGathererStream & gatherer)
 {
-    GatherState state;
-    gather_state = &state;
-    SCOPE_EXIT({ gather_state = nullptr; });
+    if (!gather_state_holder)
+        gather_state_holder.reset(new GatherState);
+    gather_state_holder->startGatherCall();
+    gather_state = gather_state_holder.get();
+    SCOPE_EXIT({
+        gather_state = nullptr;
+        /// Unless the gatherer continues this block after the next block of a source, release the sources.
+        if (!gatherer.waitsForSourceBlock())
+            gather_state_holder.reset();
+    });
 
     /// When no dynamic paths can be added, as in merges, where the structure of the result is chosen in advance,
     /// rows from all sources can be inserted path by path: each path column still gets the same values in the
@@ -1261,6 +1339,8 @@ ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnO
     }
 
     auto & plan = *state.last_plan;
+    if (!plan.source)
+        plan.source = src.getPtr();
     if (plan.is_built && plan.num_dynamic_paths == dynamic_paths.size() && plan.max_dynamic_paths == max_dynamic_paths)
         return plan;
 
@@ -1283,9 +1363,9 @@ ColumnObject::GatherSourcePlan & ColumnObject::getGatherSourcePlan(const ColumnO
     {
         const auto * src_dynamic_column = assert_cast<const ColumnDynamic *>(column.get());
         if (auto it = dynamic_paths_ptrs.find(path); it != dynamic_paths_ptrs.end())
-            plan.dynamic_paths.push_back({it->second, src_dynamic_column, path, {}});
+            plan.dynamic_paths.push_back({it->second, src_dynamic_column, path, {}, {}});
         else if (auto * dynamic_path_column = tryToAddNewDynamicPath(path))
-            plan.dynamic_paths.push_back({dynamic_path_column, src_dynamic_column, path, {}});
+            plan.dynamic_paths.push_back({dynamic_path_column, src_dynamic_column, path, {}, {}});
         else
             plan.dynamic_paths_for_shared_data.emplace_back(path, src_dynamic_column);
     }
@@ -1419,7 +1499,8 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
                 insert_defaults_up_to(row);
                 if (column.insertsVariantDirectly(*dynamic_path.src_column, dynamic_path.cache))
                 {
-                    pending_rows.push_back({&dynamic_path.src_column->getVariantColumn(), range.start, range.length});
+                    dynamic_path.variant_rows_source.update(dynamic_path.src_column->getVariantColumn(), column.getVariantColumn());
+                    pending_rows.push_back({&dynamic_path.variant_rows_source, range.start, range.length});
                     column_size += range.length;
                 }
                 else
@@ -1804,38 +1885,73 @@ void ColumnObject::serializePathAndValueIntoSharedData(ColumnString * shared_dat
     if (!cache.is_initialized)
     {
         cache.shared_variant_discriminator = column.getSharedVariantDiscriminator();
+        cache.max_string_size = getFormatSettings().binary.max_binary_string_size;
         cache.encoded_types.resize(column.getVariantInfo().variant_names.size());
         cache.serializations.resize(column.getVariantInfo().variant_names.size());
+        cache.value_formats.resize(column.getVariantInfo().variant_names.size());
         cache.is_initialized = true;
     }
 
     shared_data_paths->insertData(path.data(), path.size());
     auto & shared_data_values_chars = shared_data_values->getChars();
     const auto & variant = variant_column.getVariantByGlobalDiscriminator(global_discr);
+    const size_t variant_row = variant_column.offsetAt(n);
     /// The same bytes as SerializationDynamic::serializeBinary writes: a value of the shared variant is already
     /// a binary-encoded type and value, other values are written as the encoded variant type and the value.
     if (global_discr == cache.shared_variant_discriminator)
     {
-        auto value = assert_cast<const ColumnString &>(variant).getDataAt(variant_column.offsetAt(n));
+        auto value = assert_cast<const ColumnString &>(variant).getDataAt(variant_row);
         shared_data_values_chars.insert(value.data(), value.data() + value.size());
     }
     else
     {
+        using ValueFormat = SharedDataValueSerializationCache::ValueFormat;
         auto & serialization = cache.serializations[global_discr];
         if (!serialization)
         {
             const auto & variant_info = column.getVariantInfo();
+            const auto & variant_type = assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariant(global_discr);
             WriteBufferFromString type_buf(cache.encoded_types[global_discr]);
-            encodeDataType(assert_cast<const DataTypeVariant &>(*variant_info.variant_type).getVariant(global_discr), type_buf);
+            encodeDataType(variant_type, type_buf);
             type_buf.finalize();
             serialization = getDataTypesCache().getSerialization(variant_info.variant_names[global_discr]);
+
+            /// SerializationString::serializeBinary and SerializationNumber::serializeBinary (little-endian) write these.
+            if (typeid_cast<const SerializationString *>(serialization.get()))
+                cache.value_formats[global_discr] = ValueFormat::String;
+            else if (std::endian::native == std::endian::little && WhichDataType(variant_type).isNativeNumber())
+                cache.value_formats[global_discr] = ValueFormat::FixedSize;
+            else
+                cache.value_formats[global_discr] = ValueFormat::Serialization;
         }
 
         const auto & encoded_type = cache.encoded_types[global_discr];
         shared_data_values_chars.insert(encoded_type.data(), encoded_type.data() + encoded_type.size());
-        WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag());
-        serialization->serializeBinary(variant, variant_column.offsetAt(n), value_buf, getFormatSettings());
-        value_buf.finalize();
+        auto value_format = cache.value_formats[global_discr];
+        std::string_view value;
+        if (value_format != ValueFormat::Serialization)
+        {
+            value = variant.getDataAt(variant_row);
+            if (value_format == ValueFormat::String && cache.max_string_size && value.size() > cache.max_string_size)
+                value_format = ValueFormat::Serialization;
+        }
+
+        if (value_format == ValueFormat::Serialization)
+        {
+            WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag());
+            serialization->serializeBinary(variant, variant_row, value_buf, getFormatSettings());
+            value_buf.finalize();
+        }
+        else
+        {
+            if (value_format == ValueFormat::String)
+            {
+                char size_buf[16];
+                const char * size_end = writeVarUInt(value.size(), size_buf);
+                shared_data_values_chars.insert(size_buf, size_end);
+            }
+            shared_data_values_chars.insert(value.data(), value.data() + value.size());
+        }
     }
     shared_data_values->getOffsets().push_back(shared_data_values_chars.size());
 }
