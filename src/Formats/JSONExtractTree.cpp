@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <deque>
 #include <Formats/JSONExtractTree.h>
 #include <Formats/SchemaInferenceUtils.h>
 
@@ -1962,6 +1963,7 @@ public:
         typed_path_infos.reserve(sorted_typed_paths.size());
         for (size_t i = 0; i != sorted_typed_paths.size(); ++i)
             typed_path_infos.emplace(sorted_typed_paths[i], TypedPathInfo{typed_path_nodes.at(sorted_typed_paths[i]).get(), i});
+        typed_path_insert_stamps.resize(sorted_typed_paths.size());
     }
 
     bool insertResultToColumn(IColumn & column, const typename JSONParser::Element & element, const JSONExtractInsertSettings & insert_settings, const FormatSettings & format_settings, String & error) const override
@@ -1999,13 +2001,14 @@ public:
         /// Paths in shared data should be sorted, so we cannot insert paths there during traverse.
         /// Instead we collect all paths and values that should go to shared data, sort them and insert later.
         /// It's not optimal, but it's a price we pay for faster reading of subcolumns.
-        /// Shared data paths are copied into one buffer, so collecting them does not allocate per path.
+        /// Shared data paths are referenced in the path tree, so collecting them does not copy them.
         SharedDataPathsAndValues paths_and_values_for_shared_data;
-        /// The path of the element being visited. Each object level appends its key and truncates back, so
-        /// building child paths does not allocate per key.
-        String path_buffer;
-        size_t path_cache_position = 0;
-        if (!traverseAndInsert(column_object, element, path_buffer, insert_settings, format_settings, paths_and_values_for_shared_data, path_cache_position, prev_size, error, true))
+        PathNode & root = getPathTreeRoot(insert_settings);
+        ++object_insert_stamp;
+        num_typed_paths_inserted = 0;
+        skipped_invalid_typed_path = false;
+        syncDynamicPathSlots(column_object);
+        if (!traverseAndInsert(column_object, element, root, insert_settings, format_settings, paths_and_values_for_shared_data, prev_size, error, true))
         {
             /// If there was an error, restore previous state.
             SerializationObject::restoreColumnObject(column_object, prev_size);
@@ -2014,13 +2017,12 @@ public:
 
         /// Fill shared data.
         auto & shared_data_entries = paths_and_values_for_shared_data.entries;
-        const String & shared_data_paths_buffer = paths_and_values_for_shared_data.paths_buffer;
-        auto get_entry_path = [&](const auto & entry) { return std::string_view(shared_data_paths_buffer).substr(entry.path_offset, entry.path_size); };
+        auto get_entry_path = [](const auto & entry) -> std::string_view { return *entry.path; };
         std::sort(shared_data_entries.begin(), shared_data_entries.end(), [&](const auto & left, const auto & right){ return get_entry_path(left) < get_entry_path(right); });
 
         size_t new_paths_total_size = 0;
         for (const auto & entry : shared_data_entries)
-            new_paths_total_size += entry.path_size;
+            new_paths_total_size += entry.path->size();
 
         auto [shared_data_paths, shared_data_values] = column_object.getSharedDataPathsAndValues();
         reserveCharsWithGrowthCap(shared_data_paths->getChars(), shared_data_paths->getChars().size() + new_paths_total_size, format_settings.json_max_string_column_growth_step);
@@ -2063,10 +2065,23 @@ public:
         /// Fill remaining typed and dynamic paths.
         if (all_typed_paths_have_trivial_defaults)
         {
-            for (auto * col : column_object.getSortedTypedPathColumns())
+            const auto & sorted_typed_path_columns = column_object.getSortedTypedPathColumns();
+            if (skipped_invalid_typed_path)
             {
-                if (col->size() == prev_size)
-                    col->insertDefault();
+                for (auto * col : sorted_typed_path_columns)
+                {
+                    if (col->size() == prev_size)
+                        col->insertDefault();
+                }
+            }
+            else if (num_typed_paths_inserted != sorted_typed_path_columns.size())
+            {
+                /// A typed path column has a value of this object exactly when an insert into it succeeded.
+                for (size_t i = 0; i != sorted_typed_path_columns.size(); ++i)
+                {
+                    if (typed_path_insert_stamps[i] != object_insert_stamp)
+                        sorted_typed_path_columns[i]->insertDefault();
+                }
             }
         }
         else
@@ -2078,10 +2093,22 @@ public:
             }
         }
 
-        for (auto & [_, dynamic_column] : column_object.getDynamicPathsPtrs())
+        /// The traversal adds dynamic paths to the slots as it adds them to the column.
+        if (dynamic_path_slots_version == column_object.getDynamicPathsVersion())
         {
-            if (dynamic_column->size() == prev_size)
-                dynamic_column->insertDefault();
+            for (size_t slot = 0; slot != dynamic_path_slot_columns.size(); ++slot)
+            {
+                if (dynamic_path_slot_stamps[slot] != object_insert_stamp)
+                    dynamic_path_slot_columns[slot]->insertDefault();
+            }
+        }
+        else
+        {
+            for (auto & [_, dynamic_column] : column_object.getDynamicPathsPtrs())
+            {
+                if (dynamic_column->size() == prev_size)
+                    dynamic_column->insertDefault();
+            }
         }
 
         return true;
@@ -2103,48 +2130,76 @@ private:
 
     struct SharedDataEntry
     {
-        size_t path_offset;
-        size_t path_size;
+        /// The path of a node of the path tree, which is not changed while an object is inserted.
+        const String * path;
         typename JSONParser::Element value;
     };
 
     struct SharedDataPathsAndValues
     {
-        String paths_buffer;
         std::vector<SharedDataEntry> entries;
 
         void add(const String & path, const typename JSONParser::Element & value)
         {
-            entries.push_back({paths_buffer.size(), path.size(), value});
-            paths_buffer.append(path);
+            entries.push_back({&path, value});
         }
     };
 
-    /// `current_path` holds the path of `element` on entry and on successful return; it is used as a scratch
-    /// buffer for child paths in between.
+    struct TypedPathInfo;
+
+    /// A node of the tree of the paths of the inserted objects, with a child for each key of the object at its path.
+    /// Finding the child of a key is cheaper than building the path of the key and looking it up in the typed and
+    /// dynamic paths, so the nodes remember where their paths go.
+    struct PathNode
+    {
+        /// The key of the node in the object of its parent, as in the JSON text.
+        String key;
+        /// The full path, built from the keys as `appendChildPath` builds it.
+        String path;
+        /// std::hash of the path, to look it up in the dynamic paths without hashing it again.
+        size_t path_hash = 0;
+        /// Whether the path is skipped. Depends only on the path.
+        bool skip = false;
+        /// The typed path, or nullptr. Depends only on the path.
+        const TypedPathInfo * typed_path = nullptr;
+        /// The dynamic path column, or nullptr if the path goes to shared data. Valid only while the dynamic
+        /// paths version of the column equals dynamic_paths_version (versions start from 1).
+        ColumnDynamic * dynamic_column = nullptr;
+        UInt64 dynamic_paths_version = 0;
+        /// The slot of dynamic_column, see dynamic_path_slot_columns.
+        size_t dynamic_path_slot = 0;
+        /// Position of the node in the children of its parent.
+        size_t index_in_parent = 0;
+        /// Children in the order they were added.
+        std::vector<PathNode *> children;
+        /// Children by key, used when there are many children.
+        std::unordered_map<std::string_view, PathNode *, StringViewHash> children_by_key;
+    };
+
+    /// `node` is the node of the path of `element` in the path tree.
     bool traverseAndInsert(
         ColumnObject & column_object,
         const typename JSONParser::Element & element,
-        String & current_path,
+        PathNode & node,
         const JSONExtractInsertSettings & insert_settings,
         const FormatSettings & format_settings,
         SharedDataPathsAndValues & paths_and_values_for_shared_data,
-        size_t & path_cache_position,
         size_t current_size,
         String & error,
         bool is_root,
         bool skip_typed_path_check = false) const
     {
-        if (shouldSkipPath(current_path, insert_settings))
+        if (node.skip)
             return true;
 
-        PathCacheEntry & path_info = getPathCacheEntry(current_path, path_cache_position);
-        const TypedPathInfo * typed_path = path_info.typed_path;
+        const String & current_path = node.path;
+        const TypedPathInfo * typed_path = node.typed_path;
 
         if (element.isObject() && (skip_typed_path_check || !typed_path || (format_settings.json.type_json_allow_duplicated_key_with_literal_and_nested_object && hasTypedPathWithPrefix(current_path + "."))))
         {
             const auto object = element.getObject();
-            const size_t current_path_size = current_path.size();
+            /// The position in the children of `node` after the child of the previous key.
+            size_t next_child = 0;
 
             /// Objects almost never repeat a key. When all keys are distinct, the per-key bookkeeping below
             /// admits every key once with its own element type and never skips typed path checks, so the
@@ -2153,13 +2208,19 @@ private:
             {
                 for (auto [key, value] : object)
                 {
-                    current_path.resize(current_path_size);
-                    appendChildPath(current_path, key, insert_settings, is_root);
-                    if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, path_cache_position, current_size, error, false))
+                    PathNode & child = getChildNode(node, key, next_child, insert_settings, is_root);
+                    /// A value that is not an object is inserted without a recursive call.
+                    if (!value.isObject())
+                    {
+                        if (!child.skip && !insertValue(column_object, value, child, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error))
+                            return false;
+                    }
+                    else if (!traverseAndInsert(column_object, value, child, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false))
+                    {
                         return false;
+                    }
                 }
 
-                current_path.resize(current_path_size);
                 return true;
             }
 
@@ -2223,9 +2284,6 @@ private:
             /// so here we only need to skip already-processed (key, type) combinations.
             for (auto [key, value] : object)
             {
-                current_path.resize(current_path_size);
-                appendChildPath(current_path, key, insert_settings, is_root);
-                const String & path = current_path;
                 auto value_element_type = getJSONElementType(value);
                 auto & types = key_element_types[key];
                 if (!types.emittedEmpty())
@@ -2251,18 +2309,35 @@ private:
                 /// inserted into the typed path. Instead, pass skip_typed_path_check=true so the
                 /// recursive call enters object traversal and sends the object's children to
                 /// dynamic/shared data. The literal value will fill the typed path via normal recursion.
+                PathNode & child = getChildNode(node, key, next_child, insert_settings, is_root);
                 bool skip_typed = types.acceptedMoreThanOne()
                     && value_element_type == JSONElementType::OBJECT
-                    && typed_path_nodes.contains(path)
-                    && !canParseObjectValue(typed_paths_types.at(path));
+                    && child.typed_path
+                    && !canParseObjectValue(typed_paths_types.at(child.path));
 
-                if (!traverseAndInsert(column_object, value, current_path, insert_settings, format_settings, paths_and_values_for_shared_data, path_cache_position, current_size, error, false, skip_typed))
+                if (!traverseAndInsert(column_object, value, child, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false, skip_typed))
                     return false;
             }
 
-            current_path.resize(current_path_size);
             return true;
         }
+
+        return insertValue(column_object, element, node, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error);
+    }
+
+    /// Inserts a value that is not traversed as an object: into its typed path, its dynamic path or shared data.
+    bool insertValue(
+        ColumnObject & column_object,
+        const typename JSONParser::Element & element,
+        PathNode & node,
+        const JSONExtractInsertSettings & insert_settings,
+        const FormatSettings & format_settings,
+        SharedDataPathsAndValues & paths_and_values_for_shared_data,
+        size_t current_size,
+        String & error) const
+    {
+        const String & current_path = node.path;
+        const TypedPathInfo * typed_path = node.typed_path;
 
         /// The column is created from the same type as this node, so it has exactly the node's typed paths.
         chassert(column_object.getSortedTypedPathColumns().size() == typed_path_infos.size());
@@ -2270,8 +2345,9 @@ private:
         if (typed_path)
         {
             IColumn & typed_column = *column_object.getSortedTypedPathColumns()[typed_path->sorted_index];
-            /// Check if we already had this path.
-            if (typed_column.size() > current_size)
+            UInt64 & typed_path_stamp = typed_path_insert_stamps[typed_path->sorted_index];
+            /// Check if we already had this path. A failed insert of a skipped invalid value may leave a value in the column.
+            if (typed_path_stamp == object_insert_stamp || (skipped_invalid_typed_path && typed_column.size() > current_size))
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2287,6 +2363,12 @@ private:
                     return false;
                 }
                 /// Otherwise skip this field and continue
+                skipped_invalid_typed_path = true;
+            }
+            else
+            {
+                typed_path_stamp = object_insert_stamp;
+                ++num_typed_paths_inserted;
             }
         }
         /// Don't create new dynamic paths for null and don't insert null values into shared data.
@@ -2300,10 +2382,11 @@ private:
             paths_and_values_for_shared_data.add(current_path, element);
         }
         /// Check if we have this path in dynamic paths, or try to add a new dynamic path.
-        else if (ColumnDynamic * dynamic_column = getDynamicPathColumn(column_object, current_path, path_info))
+        else if (ColumnDynamic * dynamic_column = getDynamicPathColumn(column_object, node))
         {
-            /// Check if we already had this path. A new dynamic path column has exactly current_size rows.
-            if (dynamic_column->size() > current_size)
+            /// Check if we already had this path.
+            UInt64 & dynamic_path_stamp = dynamic_path_slot_stamps[node.dynamic_path_slot];
+            if (dynamic_path_stamp == object_insert_stamp)
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2315,6 +2398,10 @@ private:
             {
                 error += fmt::format(" (while reading path {})", current_path);
                 return false;
+            }
+            else
+            {
+                dynamic_path_stamp = object_insert_stamp;
             }
         }
         /// Otherwise this path should go to the shared data.
@@ -2767,91 +2854,172 @@ private:
     };
     std::unordered_map<String, TypedPathInfo, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> typed_path_infos;
 
-    /// Where a path was found the last time, remembered by the position of the path in the order of traversal.
-    struct PathCacheEntry
-    {
-        String path;
-        /// std::hash of the path, to look it up in the dynamic paths without hashing it again.
-        size_t path_hash = 0;
-        /// The typed path, or nullptr. Depends only on the path.
-        const TypedPathInfo * typed_path = nullptr;
-        /// The dynamic path column, or nullptr if the path goes to shared data. Valid only while the dynamic
-        /// paths version of the column equals dynamic_paths_version (versions start from 1).
-        ColumnDynamic * dynamic_column = nullptr;
-        UInt64 dynamic_paths_version = 0;
-    };
+    /// The objects inserted by insertResultToColumn are numbered; a typed or dynamic path column has a value of the object
+    /// being inserted when its stamp is the number of the object, which is cheaper to check than the size of the column.
+    mutable UInt64 object_insert_stamp = 0;
+    /// By the index of the typed path in ColumnObject::getSortedTypedPathColumns().
+    mutable std::vector<UInt64> typed_path_insert_stamps;
+    mutable size_t num_typed_paths_inserted = 0;
+    mutable bool skipped_invalid_typed_path = false;
 
-    /// Objects inserted one after another usually have the same keys in the same order, so the path at a position
-    /// of the traversal is usually the same as in the previous object. Comparing it with the remembered path is
-    /// cheaper than hashing it and looking it up in the typed and dynamic paths.
-    /// Returns the entry of the path and moves `position` past it.
-    PathCacheEntry & getPathCacheEntry(const String & path, size_t & position) const
+    /// Returns the root of the path tree, built anew when the settings that the paths depend on change or the tree has
+    /// grown too large.
+    PathNode & getPathTreeRoot(const JSONExtractInsertSettings & insert_settings) const
+    {
+        if (path_nodes.empty() || path_nodes.size() > max_path_nodes
+            || path_tree_escape_dots_in_json_keys != insert_settings.escape_dots_in_json_keys
+            || path_tree_use_partial_match_to_skip_paths_by_regexp != insert_settings.use_partial_match_to_skip_paths_by_regexp)
+        {
+            path_nodes.clear();
+            path_tree_escape_dots_in_json_keys = insert_settings.escape_dots_in_json_keys;
+            path_tree_use_partial_match_to_skip_paths_by_regexp = insert_settings.use_partial_match_to_skip_paths_by_regexp;
+            initPathNode(path_nodes.emplace_back(), insert_settings);
+        }
+        return path_nodes.front();
+    }
+
+    /// Returns the child of `node` for `key` and moves `next_child` past it. Objects inserted one after another usually
+    /// have the same keys in the same order, so the child is usually at `next_child` or a few positions after it.
+    PathNode & getChildNode(PathNode & node, std::string_view key, size_t & next_child, const JSONExtractInsertSettings & insert_settings, bool is_root) const
     {
         /// Also check a few positions ahead, so an object that lacks some keys of the previous one stays in step.
-        static constexpr size_t max_positions_to_look_ahead = 4;
-        const size_t look_ahead_end = std::min(path_cache.size(), position + max_positions_to_look_ahead);
-        for (size_t i = position; i < look_ahead_end; ++i)
+        static constexpr size_t max_children_to_look_ahead = 4;
+        const size_t look_ahead_end = std::min(node.children.size(), next_child + max_children_to_look_ahead);
+        for (size_t i = next_child; i < look_ahead_end; ++i)
         {
-            if (path_cache[i].path == path)
+            if (node.children[i]->key == key)
             {
-                position = i + 1;
-                return path_cache[i];
+                next_child = i + 1;
+                return *node.children[i];
             }
         }
 
-        return addPathCacheEntry(path, position);
+        PathNode & child = findOrAddChildNode(node, key, insert_settings, is_root);
+        next_child = child.index_in_parent + 1;
+        return child;
     }
 
-    /// Looks up the typed path and remembers the path at `position`, in place of the path that was there.
-    /// When the cache is full, returns an entry that is valid only until the next call.
-    NO_INLINE PathCacheEntry & addPathCacheEntry(const String & path, size_t & position) const
+    NO_INLINE PathNode & findOrAddChildNode(PathNode & node, std::string_view key, const JSONExtractInsertSettings & insert_settings, bool is_root) const
     {
-        PathCacheEntry * entry = &uncached_path_info;
-        if (position < path_cache.size())
-            entry = &path_cache[position];
-        else if (position < max_path_cache_size)
-            entry = &path_cache.emplace_back();
-
-        if (entry != &uncached_path_info)
+        if (node.children_by_key.empty())
         {
-            entry->path.assign(path);
-            ++position;
+            for (PathNode * child : node.children)
+            {
+                if (child->key == key)
+                    return *child;
+            }
+        }
+        else if (auto it = node.children_by_key.find(key); it != node.children_by_key.end())
+        {
+            return *it->second;
         }
 
-        const PrehashedStringView prehashed_path(path);
-        entry->path_hash = prehashed_path.hash;
+        PathNode & child = path_nodes.emplace_back();
+        child.key = key;
+        child.path = node.path;
+        appendChildPath(child.path, key, insert_settings, is_root);
+        initPathNode(child, insert_settings);
+        child.index_in_parent = node.children.size();
+        node.children.push_back(&child);
+
+        /// Many children are found by key in a hash table instead of comparing the key with each of them.
+        static constexpr size_t max_children_to_scan = 16;
+        if (!node.children_by_key.empty())
+        {
+            node.children_by_key.emplace(child.key, &child);
+        }
+        else if (node.children.size() > max_children_to_scan)
+        {
+            for (PathNode * c : node.children)
+                node.children_by_key.emplace(c->key, c);
+        }
+
+        return child;
+    }
+
+    void initPathNode(PathNode & node, const JSONExtractInsertSettings & insert_settings) const
+    {
+        node.skip = shouldSkipPath(node.path, insert_settings);
+        const PrehashedStringView prehashed_path(node.path);
+        node.path_hash = prehashed_path.hash;
         auto typed_path_it = typed_path_infos.find(prehashed_path);
-        entry->typed_path = typed_path_it == typed_path_infos.end() ? nullptr : &typed_path_it->second;
-        entry->dynamic_column = nullptr;
-        entry->dynamic_paths_version = 0;
-        return *entry;
+        node.typed_path = typed_path_it == typed_path_infos.end() ? nullptr : &typed_path_it->second;
     }
 
     /// Returns the dynamic path column of the path, adding a new dynamic path if the limit allows it.
     /// Returns nullptr if the path goes to shared data.
-    static ColumnDynamic * getDynamicPathColumn(ColumnObject & column_object, const String & path, PathCacheEntry & path_info)
+    /// The slot of the node is valid while it holds the dynamic path column of the node: the slots are rebuilt, possibly in
+    /// another order, when objects are inserted into a column with other dynamic paths.
+    ColumnDynamic * getDynamicPathColumn(ColumnObject & column_object, PathNode & node) const
     {
         auto & dynamic_paths_ptrs = column_object.getDynamicPathsPtrs();
-        if (path_info.dynamic_paths_version == column_object.getDynamicPathsVersion())
+        if (node.dynamic_paths_version == column_object.getDynamicPathsVersion()
+            && (!node.dynamic_column
+                || (node.dynamic_path_slot < dynamic_path_slot_columns.size() && dynamic_path_slot_columns[node.dynamic_path_slot] == node.dynamic_column)))
         {
-            chassert(path_info.dynamic_column
-                ? dynamic_paths_ptrs.contains(path) && dynamic_paths_ptrs.at(path) == path_info.dynamic_column
-                : !dynamic_paths_ptrs.contains(path) && !column_object.canAddNewDynamicPath());
-            return path_info.dynamic_column;
+            chassert(node.dynamic_column
+                ? dynamic_paths_ptrs.contains(node.path) && dynamic_paths_ptrs.at(node.path) == node.dynamic_column
+                : !dynamic_paths_ptrs.contains(node.path) && !column_object.canAddNewDynamicPath());
+            return node.dynamic_column;
         }
 
-        if (auto dynamic_it = dynamic_paths_ptrs.find(PrehashedStringView(path, path_info.path_hash)); dynamic_it != dynamic_paths_ptrs.end())
-            path_info.dynamic_column = dynamic_it->second;
+        chassert(dynamic_path_slots_version == column_object.getDynamicPathsVersion());
+        if (auto dynamic_it = dynamic_paths_ptrs.find(PrehashedStringView(node.path, node.path_hash)); dynamic_it != dynamic_paths_ptrs.end())
+        {
+            node.dynamic_column = dynamic_it->second;
+            node.dynamic_path_slot = dynamic_path_slot_by_column.at(node.dynamic_column);
+        }
         else
-            path_info.dynamic_column = column_object.tryToAddNewDynamicPath(path);
-        path_info.dynamic_paths_version = column_object.getDynamicPathsVersion();
-        return path_info.dynamic_column;
+        {
+            node.dynamic_column = column_object.tryToAddNewDynamicPath(node.path);
+            if (node.dynamic_column)
+            {
+                node.dynamic_path_slot = addDynamicPathSlot(node.dynamic_column);
+                dynamic_path_slots_version = column_object.getDynamicPathsVersion();
+            }
+        }
+        node.dynamic_paths_version = column_object.getDynamicPathsVersion();
+        return node.dynamic_column;
     }
 
-    /// See getPathCacheEntry. Like the caches of DynamicNode, it belongs to one serialization, which one thread uses at a time.
-    mutable std::vector<PathCacheEntry> path_cache;
-    mutable PathCacheEntry uncached_path_info;
-    static constexpr size_t max_path_cache_size = 10000;
+    /// Makes the slots hold the dynamic path columns of `column_object`.
+    void syncDynamicPathSlots(const ColumnObject & column_object) const
+    {
+        if (dynamic_path_slots_version == column_object.getDynamicPathsVersion())
+            return;
+
+        dynamic_path_slot_columns.clear();
+        dynamic_path_slot_stamps.clear();
+        dynamic_path_slot_by_column.clear();
+        for (const auto & [_, dynamic_column] : column_object.getDynamicPathsPtrs())
+            addDynamicPathSlot(dynamic_column);
+        dynamic_path_slots_version = column_object.getDynamicPathsVersion();
+    }
+
+    size_t addDynamicPathSlot(ColumnDynamic * dynamic_column) const
+    {
+        size_t slot = dynamic_path_slot_columns.size();
+        dynamic_path_slot_columns.push_back(dynamic_column);
+        dynamic_path_slot_stamps.push_back(0);
+        dynamic_path_slot_by_column.emplace(dynamic_column, slot);
+        return slot;
+    }
+
+    /// The dynamic path columns of the column that objects are inserted into, one per slot, with the number of the last
+    /// object inserted into each (see object_insert_stamp). They are the dynamic paths of the column while
+    /// dynamic_path_slots_version equals its dynamic paths version, so missing paths are filled without the size of
+    /// every dynamic path column.
+    mutable UInt64 dynamic_path_slots_version = 0;
+    mutable std::vector<ColumnDynamic *> dynamic_path_slot_columns;
+    mutable std::vector<UInt64> dynamic_path_slot_stamps;
+    mutable std::unordered_map<const ColumnDynamic *, size_t> dynamic_path_slot_by_column;
+
+    /// The nodes of the path tree; the first one is the root. Like the caches of DynamicNode, the tree belongs to one
+    /// serialization, which one thread uses at a time. A deque does not move the nodes when it grows.
+    mutable std::deque<PathNode> path_nodes;
+    mutable bool path_tree_escape_dots_in_json_keys = false;
+    mutable bool path_tree_use_partial_match_to_skip_paths_by_regexp = false;
+    static constexpr size_t max_path_nodes = 10000;
     bool all_typed_paths_have_trivial_defaults = true;
     std::unordered_set<String> paths_to_skip;
     std::vector<String> sorted_paths_to_skip;
