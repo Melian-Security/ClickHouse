@@ -23,6 +23,7 @@
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <Common/Arena.h>
 #include <Common/StringHashForHeterogeneousLookup.h>
 #include <base/StringViewHash.h>
 #include <Columns/ColumnTuple.h>
@@ -2137,10 +2138,19 @@ private:
     /// A node of the tree of the paths of the inserted objects, with a child for each key of the object at its path.
     /// Finding the child of a key is cheaper than building the path of the key and looking it up in the typed and
     /// dynamic paths, so the nodes remember where their paths go.
+    struct PathNode;
+
+    struct PathChildNode
+    {
+        /// The key of the child, kept next to the keys of the other children, so finding a child does not read other nodes.
+        std::string_view key;
+        PathNode * node;
+    };
+
     struct PathNode
     {
-        /// The key of the node in the object of its parent, as in the JSON text.
-        String key;
+        /// The key of the node in the object of its parent, as in the JSON text. Stored in path_keys_arena.
+        std::string_view key;
         /// The full path, built from the keys as `appendChildPath` builds it.
         String path;
         /// std::hash of the path, to look it up in the dynamic paths without hashing it again.
@@ -2156,7 +2166,7 @@ private:
         /// Position of the node in the children of its parent.
         size_t index_in_parent = 0;
         /// Children in the order they were added.
-        std::vector<PathNode *> children;
+        std::vector<PathChildNode> children;
         /// Children by key, used when there are many children.
         std::unordered_map<std::string_view, PathNode *, StringViewHash> children_by_key;
     };
@@ -2826,6 +2836,7 @@ private:
             || path_tree_use_partial_match_to_skip_paths_by_regexp != insert_settings.use_partial_match_to_skip_paths_by_regexp)
         {
             path_nodes.clear();
+            path_keys_arena = std::make_unique<Arena>();
             path_tree_escape_dots_in_json_keys = insert_settings.escape_dots_in_json_keys;
             path_tree_use_partial_match_to_skip_paths_by_regexp = insert_settings.use_partial_match_to_skip_paths_by_regexp;
             initPathNode(path_nodes.emplace_back(), insert_settings);
@@ -2842,10 +2853,10 @@ private:
         const size_t look_ahead_end = std::min(node.children.size(), next_child + max_children_to_look_ahead);
         for (size_t i = next_child; i < look_ahead_end; ++i)
         {
-            if (node.children[i]->key == key)
+            if (node.children[i].key == key)
             {
                 next_child = i + 1;
-                return *node.children[i];
+                return *node.children[i].node;
             }
         }
 
@@ -2858,10 +2869,10 @@ private:
     {
         if (node.children_by_key.empty())
         {
-            for (PathNode * child : node.children)
+            for (const auto & child : node.children)
             {
-                if (child->key == key)
-                    return *child;
+                if (child.key == key)
+                    return *child.node;
             }
         }
         else if (auto it = node.children_by_key.find(key); it != node.children_by_key.end())
@@ -2870,12 +2881,13 @@ private:
         }
 
         PathNode & child = path_nodes.emplace_back();
-        child.key = key;
+        if (!key.empty())
+            child.key = std::string_view(path_keys_arena->insert(key.data(), key.size()), key.size());
         child.path = node.path;
         appendChildPath(child.path, key, insert_settings, is_root);
         initPathNode(child, insert_settings);
         child.index_in_parent = node.children.size();
-        node.children.push_back(&child);
+        node.children.push_back({child.key, &child});
 
         /// Many children are found by key in a hash table instead of comparing the key with each of them.
         static constexpr size_t max_children_to_scan = 16;
@@ -2885,8 +2897,8 @@ private:
         }
         else if (node.children.size() > max_children_to_scan)
         {
-            for (PathNode * c : node.children)
-                node.children_by_key.emplace(c->key, c);
+            for (const auto & c : node.children)
+                node.children_by_key.emplace(c.key, c.node);
         }
 
         return child;
@@ -2925,6 +2937,7 @@ private:
     /// The nodes of the path tree; the first one is the root. Like the caches of DynamicNode, the tree belongs to one
     /// serialization, which one thread uses at a time. A deque does not move the nodes when it grows.
     mutable std::deque<PathNode> path_nodes;
+    mutable std::unique_ptr<Arena> path_keys_arena;
     mutable bool path_tree_escape_dots_in_json_keys = false;
     mutable bool path_tree_use_partial_match_to_skip_paths_by_regexp = false;
     static constexpr size_t max_path_nodes = 10000;
