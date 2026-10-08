@@ -442,6 +442,10 @@ private:
 
     struct GatherSourcePlan;
     struct GatherState;
+    struct GatherStateDeleter
+    {
+        void operator()(GatherState * state) const;
+    };
 
     /// Returns how to insert rows of src into this column, resolving it again if our dynamic paths changed.
     GatherSourcePlan & getGatherSourcePlan(const ColumnObject & src);
@@ -508,6 +512,10 @@ private:
 
     /// Set only while `gather` runs. Not copied with the column.
     GatherState * gather_state = nullptr;
+    /// The state of `gather`, kept between the calls that fill one block, so that each block of a source
+    /// is resolved once and not again every time `gather` returns for the next block of another source.
+    /// Not copied with the column.
+    std::unique_ptr<GatherState, GatherStateDeleter> gather_state_holder;
 
     static UInt64 getNextDynamicPathsVersion();
     void updateDynamicPathsVersion() { dynamic_paths_version = getNextDynamicPathsVersion(); }
