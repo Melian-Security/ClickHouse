@@ -669,11 +669,11 @@ void SerializationVariant::deserializeBinaryBulkWithMultipleStreams(
             settings, variant_state->variant_states[i], cache);
         settings.path.pop_back();
 
-        /// Verify that we deserialized the expected number of rows for this variant.
-        if (col.getVariantByLocalDiscriminator(i).size() < variant_offsets[i] + variant_limits[i])
+        /// Verify that we deserialized exactly the expected number of rows for this variant.
+        if (col.getVariantByLocalDiscriminator(i).size() != variant_offsets[i] + variant_limits[i])
             throw Exception(
                 settings.native_format ? ErrorCodes::INCORRECT_DATA : ErrorCodes::LOGICAL_ERROR,
-                "Size of variant {} is expected to be not less than {} according to discriminators, but it is {}",
+                "Size of variant {} is expected to be {} according to discriminators, but it is {}",
                 variant_names[i],
                 variant_offsets[i] + variant_limits[i],
                 col.getVariantByLocalDiscriminator(i).size());
@@ -682,36 +682,58 @@ void SerializationVariant::deserializeBinaryBulkWithMultipleStreams(
 
     /// Fill offsets column. Offsets index this reader's own variant sub-columns, so they are always
     /// recomputed here and never taken from the substreams cache.
-    auto & discriminators_data = col.getLocalDiscriminators();
+    const auto & discriminators_data = col.getLocalDiscriminators();
     auto & offsets = col.getOffsets();
-    size_t num_new_offsets = discriminators_data.size() - offsets.size();
-    offsets.reserve(offsets.size() + num_new_offsets);
+    if (offsets.size() != discriminators_offset)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Size of discriminators and offsets should be equal, but {} and {} were given",
+            discriminators_offset,
+            offsets.size());
+
+    size_t num_new_offsets = discriminators_data.size() - discriminators_offset;
+    offsets.resize(discriminators_data.size());
+    const auto * new_discriminators = discriminators_data.data() + discriminators_offset;
+    auto * new_offsets = offsets.data() + discriminators_offset;
     /// If only NULLs were read, fill offsets with 0.
     if (num_non_empty_variants == 0)
     {
-        offsets.resize_fill(discriminators_data.size(), 0);
+        std::fill(new_offsets, new_offsets + num_new_offsets, 0);
     }
     /// If there is only 1 variant and no NULLs were read, fill offsets with sequential offsets of this variant.
     else if (num_non_empty_variants == 1 && variant_limits[last_non_empty_discr] == num_new_offsets)
     {
         size_t first_offset = variant_offsets[last_non_empty_discr];
         for (size_t i = 0; i != num_new_offsets; ++i)
-            offsets.push_back(first_offset + i);
+            new_offsets[i] = first_offset + i;
+    }
+    /// If there is only 1 variant and NULLs, the offset of a row is the number of non-NULL rows before it (or 0 for NULL).
+    else if (num_non_empty_variants == 1)
+    {
+        size_t next_offset = variant_offsets[last_non_empty_discr];
+        for (size_t i = 0; i != num_new_offsets; ++i)
+        {
+            const bool is_null = new_discriminators[i] == ColumnVariant::NULL_DISCRIMINATOR;
+            new_offsets[i] = is_null ? 0 : next_offset;
+            next_offset += !is_null;
+        }
     }
     /// Otherwise iterate through discriminators and fill offsets accordingly.
     else
     {
-        for (size_t i = offsets.size(); i != discriminators_data.size(); ++i)
+        for (size_t i = 0; i != num_new_offsets; ++i)
         {
-            ColumnVariant::Discriminator discr = discriminators_data[i];
-            if (discr == ColumnVariant::NULL_DISCRIMINATOR)
-                offsets.emplace_back();
-            else
-                offsets.push_back(variant_offsets[discr]++);
+            ColumnVariant::Discriminator discr = new_discriminators[i];
+            new_offsets[i] = discr == ColumnVariant::NULL_DISCRIMINATOR ? 0 : variant_offsets[discr]++;
         }
     }
 
-    col.validateState(/*allow_logical_error=*/ !settings.native_format);
+    /// The new rows are valid by construction, so there is no need to check the whole column with
+    /// `ColumnVariant::validateState` after every read: every new discriminator was checked to be
+    /// NULL_DISCRIMINATOR or a valid variant while the limits were counted, each variant got exactly as many
+    /// new rows as there are new discriminators for it (checked above), and the offsets of the new rows were
+    /// assigned consecutively from the previous size of each variant. The rows that were in the column
+    /// before were checked when they were read.
 }
 
 std::vector<size_t> SerializationVariant::deserializeCompactDiscriminators(

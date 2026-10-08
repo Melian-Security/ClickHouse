@@ -63,6 +63,7 @@ private:
         const NameAndTypePair & name_and_type,
         const SerializationPtr & serialization);
 
+    /// `cache` may be null when no substreams cache is used.
     ReadBuffer * getStream(
         bool seek_to_start,
         const ISerialization::SubstreamPath & substream_path,
@@ -70,10 +71,21 @@ private:
         const NameAndTypePair & name_and_type,
         size_t from_mark,
         bool seek_to_mark,
-        ISerialization::SubstreamsCache & cache);
+        const ISerialization::SubstreamsCache * cache);
+
+    /// The same, with the name of the stream already resolved by `IMergeTreeDataPart::getStreamNameForColumn`.
+    ReadBuffer * getStream(
+        const std::optional<String> & stream_name,
+        bool seek_to_start,
+        const ISerialization::SubstreamPath & substream_path,
+        const NameAndTypePair & name_and_type,
+        size_t from_mark,
+        bool seek_to_mark,
+        const ISerialization::SubstreamsCache * cache);
 
     FileStreams::iterator addStream(const ISerialization::SubstreamPath & substream_path, const String & stream_name);
 
+    /// `cache` is null if no other column read by this reader has the same column in storage.
     void readData(
         const NameAndTypePair & name_and_type,
         const SerializationPtr & serialization,
@@ -81,7 +93,7 @@ private:
         size_t from_mark,
         bool continue_reading,
         size_t max_rows_to_read,
-        ISerialization::SubstreamsCache & cache,
+        ISerialization::SubstreamsCache * cache,
         ISerialization::SubstreamsDeserializeStatesCache & deserialize_states_cache);
 
     /// Make next readData more simple by calling 'prefetch' of all related ReadBuffers (column streams).
@@ -98,7 +110,7 @@ private:
         const NameAndTypePair & name_and_type,
         size_t from_mark,
         DeserializeBinaryBulkStateMap & deserialize_state_map,
-        ISerialization::SubstreamsCache & cache,
+        const ISerialization::SubstreamsCache * cache,
         ISerialization::SubstreamsDeserializeStatesCache & deserialize_states_cache,
         ISerialization::StreamCallback prefixes_prefetch_callback);
 
@@ -110,6 +122,9 @@ private:
 
     std::unordered_map<String, ISerialization::SubstreamsCache> caches;
     std::unordered_map<String, ISerialization::SubstreamsDeserializeStatesCache> deserialize_states_caches;
+    /// For each column to read, whether another column to read has the same column in storage
+    /// (e.g. a column and its subcolumns). Only such columns can share substreams through the substreams cache.
+    std::vector<bool> column_shares_storage_column;
     DeserializationPrefixesCache * deserialization_prefixes_cache;
     std::unordered_set<std::string> prefetched_streams;
     ssize_t prefetched_from_mark = -1;
