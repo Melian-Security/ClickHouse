@@ -313,7 +313,10 @@ SharedDataBucketsSplitter::BucketPaths SharedDataBucketsSplitter::getBucketPaths
 MutableColumnPtr SharedDataBucketsSplitter::flattenPath(const BucketPaths & bucket_paths, size_t path_index, const DataTypePtr & dynamic_type) const
 {
     const auto * shared_data_values = &getValuesColumn();
+    size_t num_rows = end - start;
     auto column = dynamic_type->createColumn();
+    /// Every row gets a value or a default, so the discriminators and offsets of all rows are allocated at once.
+    column->reserve(num_rows);
     auto & dynamic_column = assert_cast<ColumnDynamic &>(*column);
     /// Most paths keep one type across rows, so the column remembers the type of its last value.
     ColumnObject::SharedDataValueTypeCache type_cache;
@@ -335,7 +338,6 @@ MutableColumnPtr SharedDataBucketsSplitter::flattenPath(const BucketPaths & buck
     }
 
     /// Backfill defaults for the trailing rows where the path was absent.
-    size_t num_rows = end - start;
     if (column->size() < num_rows)
         column->insertManyDefaults(num_rows - column->size());
     return column;
