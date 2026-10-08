@@ -17,6 +17,7 @@
 #include <optional>
 #include <Common/HashTable/Hash.h>
 #include <Common/HashTable/HashMap.h>
+#include <Common/HashTable/HashSet.h>
 #include <Common/PODArray.h>
 #include <Common/SipHash.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
@@ -1460,6 +1461,8 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
     /// Defaults and ranges of values that go into the Variant column as they are wait in pending_rows, and are
     /// inserted together before any other insert into the column, which can change its variants.
     auto & pending_rows = state.pending_variant_rows;
+    static constexpr size_t offsets_prefetch_distance = 16;
+    static constexpr size_t values_prefetch_distance = 8;
     for (size_t i = 0; i != state.dynamic_columns.size(); ++i)
     {
         ColumnDynamic & column = *state.dynamic_columns[i];
@@ -1517,6 +1520,20 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
             {
                 for (; value_it != values.end() && value_it->row < range_end_row; ++value_it)
                 {
+                    /// The values of one path are spread over the shared data of the source, so the offsets and then
+                    /// the bytes of the values a few iterations ahead are prefetched.
+                    size_t values_left = static_cast<size_t>(values.end() - value_it);
+                    if (values_left > offsets_prefetch_distance)
+                    {
+                        const auto & ahead = value_it[offsets_prefetch_distance];
+                        __builtin_prefetch(&ahead.src_shared_data_values->getOffsets()[static_cast<ssize_t>(ahead.n) - 1]);
+                    }
+                    if (values_left > values_prefetch_distance)
+                    {
+                        const auto & ahead = value_it[values_prefetch_distance];
+                        __builtin_prefetch(ahead.src_shared_data_values->getChars().data() + ahead.src_shared_data_values->getOffsets()[static_cast<ssize_t>(ahead.n) - 1]);
+                    }
+
                     insert_defaults_up_to(value_it->row);
                     insert_pending_rows();
                     state.deserializeValue(value_it->src_shared_data_values, value_it->n, i);
@@ -1969,11 +1986,44 @@ void ColumnObject::deserializeValueFromSharedData(const ColumnString * shared_da
     auto & variant_column = column.getVariantColumn();
     /// The binary type encoding is read byte by byte without lookahead, so equal leading bytes decode to
     /// the same type: this is what the full path below would do for this value.
-    if (cache.serialization && value_data.starts_with(cache.encoded_type))
+    /// Most types are encoded by one byte, which is compared without a call to memcmp.
+    const auto & encoded_type = cache.encoded_type;
+    if (cache.serialization && value_data.size() >= encoded_type.size() && value_data.front() == encoded_type.front()
+        && (encoded_type.size() == 1 || memcmp(value_data.data() + 1, encoded_type.data() + 1, encoded_type.size() - 1) == 0))
     {
         auto & variant = variant_column.getVariantByGlobalDiscriminator(cache.global_discriminator);
-        ReadBufferFromMemory buf(value_data.substr(cache.encoded_type.size()));
-        cache.serialization->deserializeBinary(variant, buf, getFormatSettings());
+        auto value = value_data.substr(encoded_type.size());
+        /// The same as SerializationString::deserializeBinary and SerializationNumber::deserializeBinary (little-endian)
+        /// read. Values they would reject are left to them, so they throw the same exceptions.
+        using ValueFormat = SharedDataValueSerializationCache::ValueFormat;
+        bool inserted = false;
+        if (cache.value_format == ValueFormat::String)
+        {
+            UInt64 size = 0;
+            const char * data = readVarUInt(size, value.data(), value.size());
+            const UInt64 max_size = getFormatSettings().binary.max_binary_string_size;
+            if (size <= static_cast<UInt64>(value.data() + value.size() - data) && size <= SerializationString::MAX_STRING_SIZE
+                && (!max_size || size <= max_size))
+            {
+                variant.insertData(data, size);
+                inserted = true;
+            }
+        }
+        else if (cache.value_format == ValueFormat::FixedSize)
+        {
+            const size_t size = variant.sizeOfValueIfFixed();
+            if (value.size() >= size)
+            {
+                variant.insertData(value.data(), size);
+                inserted = true;
+            }
+        }
+
+        if (!inserted)
+        {
+            ReadBufferFromMemory buf(value);
+            cache.serialization->deserializeBinary(variant, buf, getFormatSettings());
+        }
         variant_column.getLocalDiscriminators().push_back(variant_column.localDiscriminatorByGlobal(cache.global_discriminator));
         variant_column.getOffsets().push_back(variant.size() - 1);
         return;
@@ -1993,6 +2043,10 @@ void ColumnObject::deserializeValueFromSharedData(const ColumnString * shared_da
     cache.encoded_type = value_data.substr(0, buf.position() - value_data.data());
     cache.global_discriminator = global_discriminator;
     cache.serialization = column.getVariantSerialization(type);
+    if (typeid_cast<const SerializationString *>(cache.serialization.get()))
+        cache.value_format = SharedDataValueSerializationCache::ValueFormat::String;
+    else if (std::endian::native == std::endian::little && WhichDataType(type).isNativeNumber())
+        cache.value_format = SharedDataValueSerializationCache::ValueFormat::FixedSize;
 }
 
 void ColumnObject::insertDefault()
@@ -3583,22 +3637,18 @@ void ColumnObject::repairDuplicatesInDynamicPathsAndSharedData(size_t offset)
     /// Remember the first row with duplicates if any. We will start repair from this row.
     std::optional<size_t> first_row_with_duplicates = std::nullopt;
     size_t size = shared_data_offsets.size();
-    for (size_t i = offset; i < size; ++i)
+    /// Every path in shared data is looked up, usually without a match, so dynamic paths are put in a flat hash set.
+    HashSetWithSavedHash<std::string_view> dynamic_paths_set;
+    for (const auto & [path, _] : dynamic_paths)
+        dynamic_paths_set.insert(std::string_view(path));
+    for (size_t j = shared_data_offsets[static_cast<ssize_t>(offset) - 1]; j < shared_data_offsets[static_cast<ssize_t>(size) - 1]; ++j)
     {
-        size_t shared_data_start = shared_data_offsets[i - 1];
-        size_t shared_data_end = shared_data_offsets[i];
-        for (size_t j = shared_data_start; j < shared_data_end; ++j)
+        if (dynamic_paths_set.has(shared_data_paths->getDataAt(j)))
         {
-            if (dynamic_paths.contains(shared_data_paths->getDataAt(j)))
-            {
-                /// Duplicate is found, no need to iterate further, we need to start repair.
-                first_row_with_duplicates = i;
-                break;
-            }
-        }
-
-        if (first_row_with_duplicates)
+            /// Duplicate is found, no need to iterate further, we need to start repair from its row.
+            first_row_with_duplicates = std::upper_bound(shared_data_offsets.begin() + offset, shared_data_offsets.end(), j) - shared_data_offsets.begin();
             break;
+        }
     }
 
     if (!first_row_with_duplicates)
