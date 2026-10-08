@@ -1,0 +1,45 @@
+<test>
+    <!-- Vertical merge of Compact parts with a JSON column whose shared data is stored in buckets. In every part
+         the paths c0..c23 are in shared data, and in the merged part the most frequent of them are dynamic paths,
+         so their values are read from shared data into dynamic paths (strings, integers, floats and booleans). -->
+    <create_query>
+        CREATE TABLE t_json_merge_shared_data_into_dynamic_paths (id UInt64, json JSON(max_dynamic_paths = 8))
+        ENGINE = MergeTree ORDER BY id
+        SETTINGS min_bytes_for_wide_part = '100G', min_rows_for_wide_part = 0,
+            vertical_merge_algorithm_min_rows_to_activate = 1, vertical_merge_algorithm_min_columns_to_activate = 1,
+            object_serialization_version = 'v3',
+            object_shared_data_serialization_version = 'advanced',
+            object_shared_data_serialization_version_for_zero_level_parts = 'map_with_buckets'
+    </create_query>
+
+    <fill_query>SYSTEM STOP MERGES t_json_merge_shared_data_into_dynamic_paths</fill_query>
+
+    <fill_query>
+        INSERT INTO t_json_merge_shared_data_into_dynamic_paths
+        SELECT number, ('{' || arrayStringConcat(arrayMap(i -> '"p' || toString(intDiv(number, 100000) * 8 + i) || '":' || toString(number + i), range(8)), ',') || ','
+            || arrayStringConcat(arrayMap(i -> '"c' || toString(i) || '":'
+            || multiIf(i % 4 = 0, '"s' || toString(number + i) || '"', i % 4 = 1, toString(number + i), i % 4 = 2, toString((number + i) / 4), if((number + i) % 2 = 0, 'true', 'false')), range(24)), ',')
+            || '}')::JSON
+        FROM numbers(0, 100000)
+    </fill_query>
+    <fill_query>
+        INSERT INTO t_json_merge_shared_data_into_dynamic_paths
+        SELECT number, ('{' || arrayStringConcat(arrayMap(i -> '"p' || toString(intDiv(number, 100000) * 8 + i) || '":' || toString(number + i), range(8)), ',') || ','
+            || arrayStringConcat(arrayMap(i -> '"c' || toString(i) || '":'
+            || multiIf(i % 4 = 0, '"s' || toString(number + i) || '"', i % 4 = 1, toString(number + i), i % 4 = 2, toString((number + i) / 4), if((number + i) % 2 = 0, 'true', 'false')), range(24)), ',')
+            || '}')::JSON
+        FROM numbers(100000, 100000)
+    </fill_query>
+    <fill_query>
+        INSERT INTO t_json_merge_shared_data_into_dynamic_paths
+        SELECT number, ('{' || arrayStringConcat(arrayMap(i -> '"p' || toString(intDiv(number, 100000) * 8 + i) || '":' || toString(number + i), range(8)), ',') || ','
+            || arrayStringConcat(arrayMap(i -> '"c' || toString(i) || '":'
+            || multiIf(i % 4 = 0, '"s' || toString(number + i) || '"', i % 4 = 1, toString(number + i), i % 4 = 2, toString((number + i) / 4), if((number + i) % 2 = 0, 'true', 'false')), range(24)), ',')
+            || '}')::JSON
+        FROM numbers(200000, 100000)
+    </fill_query>
+
+    <query>OPTIMIZE TABLE t_json_merge_shared_data_into_dynamic_paths DRY RUN PARTS 'all_1_1_0', 'all_2_2_0', 'all_3_3_0'</query>
+
+    <drop_query>DROP TABLE IF EXISTS t_json_merge_shared_data_into_dynamic_paths</drop_query>
+</test>
