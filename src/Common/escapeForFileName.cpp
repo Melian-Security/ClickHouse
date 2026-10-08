@@ -5,28 +5,34 @@
 namespace DB
 {
 
-std::string escapeForFileName(const std::string & s)
+void appendEscapedForFileName(std::string & to, std::string_view s)
 {
-    std::string res;
     const char * pos = s.data();
     const char * end = pos + s.size();
 
     while (pos != end)
     {
-        unsigned char c = *pos;
+        /// Most names have no characters to escape, so append whole runs of word characters at once.
+        const char * run_end = pos;
+        while (run_end != end && isWordCharASCII(*run_end))
+            ++run_end;
 
-        if (isWordCharASCII(c))
-            res += c;
-        else
-        {
-            res += '%';
-            res += hexDigitUppercase(c / 16);
-            res += hexDigitUppercase(c % 16);
-        }
+        to.append(pos, run_end);
+        if (run_end == end)
+            break;
 
-        ++pos;
+        unsigned char c = *run_end;
+        const char escaped[3] = {'%', hexDigitUppercase(c / 16), hexDigitUppercase(c % 16)};
+        to.append(escaped, 3);
+        pos = run_end + 1;
     }
+}
 
+std::string escapeForFileName(const std::string & s)
+{
+    std::string res;
+    res.reserve(s.size());
+    appendEscapedForFileName(res, s);
     return res;
 }
 

@@ -5,6 +5,9 @@
 #include <Storages/MergeTree/MergeTreeIOSettings.h>
 #include <Storages/MergeTree/MergeTreeMarksLoader.h>
 
+#include <array>
+#include <limits>
+
 
 namespace DB
 {
@@ -144,6 +147,25 @@ protected:
     size_t getRightOffsetOneColumn(size_t right_mark_non_included, size_t column_position);
     std::pair<size_t, size_t> estimateMarkRangeBytesOneColumn(const MarkRanges & mark_ranges, size_t column_position);
     MarkInCompressedFile getStartOfNextStripeMark(size_t row_index, size_t column_position);
+
+private:
+    /// Returns the same mark as marks_getter->getMark, but keeps the marks read recently.
+    /// The functions above read the same few marks of neighbouring rows and columns many times for every stripe,
+    /// and the marks of one column are far apart in a file with many columns (marks are stored row by row),
+    /// so without the cache estimating the bytes of all columns of a part costs several reads of every mark.
+    MarkInCompressedFile getMark(size_t row_index, size_t column_position);
+
+    struct CachedMark
+    {
+        size_t row_index = std::numeric_limits<size_t>::max();
+        size_t column_position = std::numeric_limits<size_t>::max();
+        MarkInCompressedFile mark;
+    };
+
+    /// Direct-mapped by (row_index * 7 + column_position) % size: the marks (r, c), (r, c + 1), (r - 1, c), (r - 1, c + 1)
+    /// and (r - 2, c + 1) that are used together for a stripe never share a slot.
+    static constexpr size_t MARKS_CACHE_SIZE = 16;
+    std::array<CachedMark, MARKS_CACHE_SIZE> marks_cache;
 };
 
 /// Class for reading a single column from file that contains multiple columns
@@ -171,15 +193,21 @@ private:
 class MergeTreeReaderStreamAllOfMultipleColumns : public MergeTreeReaderStreamMultipleColumns
 {
 public:
+    /// columns_to_read_ are the positions (in marks) of the columns that are read from the file, sorted;
+    /// only their stripes are taken into account to estimate the size of the read buffer. Empty means all columns.
     template <typename... Args>
-    explicit MergeTreeReaderStreamAllOfMultipleColumns(Args &&... args)
+    explicit MergeTreeReaderStreamAllOfMultipleColumns(std::vector<size_t> columns_to_read_, Args &&... args)
         : MergeTreeReaderStreamMultipleColumns{std::forward<Args>(args)...}
+        , columns_to_read(std::move(columns_to_read_))
     {
     }
 
     size_t getRightOffset(size_t right_mark_non_included) override;
     std::pair<size_t, size_t> estimateMarkRangeBytes(const MarkRanges & mark_ranges) override;
     void seekToMark(size_t row_index) override { seekToMarkAndColumn(row_index, 0); }
+
+private:
+    const std::vector<size_t> columns_to_read;
 };
 
 }

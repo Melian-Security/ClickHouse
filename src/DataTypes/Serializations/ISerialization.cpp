@@ -316,7 +316,10 @@ String getNameForSubstreamPath(
         if (it->type == Substream::NullMap || it->type == Substream::SparseNullMap || it->type == Substream::NullMapHidden)
             stream_name += ".null";
         else if (it->type == Substream::ArraySizes)
-            stream_name += ".size" + toString(array_level);
+        {
+            stream_name += ".size";
+            stream_name += toString(array_level);
+        }
         else if (it->type == Substream::ArrayElements)
             ++array_level;
         else if (it->type == Substream::StringSizes || it->type == Substream::InlinedStringSizes)
@@ -335,16 +338,20 @@ String getNameForSubstreamPath(
             stream_name += ".repl.idx";
         else if (Substream::named_types.contains(it->type))
         {
-            auto substream_name = "." + it->name_of_substream;
-
             /// For compatibility reasons, we use %2E (escaped dot) instead of dot.
             /// Because nested data may be represented not by Array of Tuple,
             /// but by separate Array columns with names in a form of a.b,
             /// and name is encoded as a whole.
             if (it->type == Substream::TupleElement && escape_for_file_name)
-                stream_name += escapeForFileName(substream_name);
+            {
+                stream_name += "%2E";
+                appendEscapedForFileName(stream_name, it->name_of_substream);
+            }
             else
-                stream_name += substream_name;
+            {
+                stream_name += '.';
+                stream_name += it->name_of_substream;
+            }
         }
         else if (it->type == Substream::VariantDiscriminators)
             stream_name += ".variant_discr";
@@ -354,17 +361,20 @@ String getNameForSubstreamPath(
             stream_name += ".variant_offsets";
         else if (it->type == Substream::VariantElement)
         {
+            stream_name += '.';
             if (escape_for_file_name && escape_variant_substreams)
-                stream_name += "." + escapeForFileName(it->variant_element_name);
+                appendEscapedForFileName(stream_name, it->variant_element_name);
             else
-                stream_name += "." + it->variant_element_name;
+                stream_name += it->variant_element_name;
         }
         else if (it->type == Substream::VariantElementNullMap)
         {
+            stream_name += '.';
             if (escape_for_file_name && escape_variant_substreams)
-                stream_name += "." + escapeForFileName(it->variant_element_name) + ".null";
+                appendEscapedForFileName(stream_name, it->variant_element_name);
             else
-                stream_name += "." + it->variant_element_name + ".null";
+                stream_name += it->variant_element_name;
+            stream_name += ".null";
         }
         else if (it->type == SubstreamType::DynamicStructure)
             stream_name += ".dynamic_structure";
@@ -373,7 +383,10 @@ String getNameForSubstreamPath(
         else if (it->type == SubstreamType::ObjectSharedData)
             stream_name += ".object_shared_data";
         else if (it->type == SubstreamType::Bucket)
-            stream_name += "." + std::to_string(it->bucket);
+        {
+            stream_name += '.';
+            stream_name += std::to_string(it->bucket);
+        }
         else if (it->type == SubstreamType::MapBucketsInfo)
             stream_name += ".buckets_info";
         else if (it->type == SubstreamType::MapBucketIndexes)
@@ -405,7 +418,13 @@ String getNameForSubstreamPath(
         else if (it->type == SubstreamType::ObjectSharedDataCopyValues)
             stream_name += ".values";
         else if (it->type == SubstreamType::ObjectTypedPath || it->type == SubstreamType::ObjectDynamicPath)
-            stream_name += "." + (escape_for_file_name ? escapeForFileName(it->object_path_name) : it->object_path_name);
+        {
+            stream_name += '.';
+            if (escape_for_file_name)
+                appendEscapedForFileName(stream_name, it->object_path_name);
+            else
+                stream_name += it->object_path_name;
+        }
     }
 
     return stream_name;
@@ -438,23 +457,34 @@ static bool isPossibleOffsetsOfNested(const ISerialization::SubstreamPath & path
     return false;
 }
 
+namespace
+{
+
+void makeFileNameForStream(const String & name_in_storage, const ISerialization::SubstreamPath & path, const ISerialization::StreamFileNameSettings & settings, String & stream_name)
+{
+    stream_name.clear();
+
+    /// Offsets of Nested columns are shared by all columns of the Nested.
+    if (settings.share_nested_offsets && isPossibleOffsetsOfNested(path))
+        appendEscapedForFileName(stream_name, Nested::extractTableName(name_in_storage));
+    else
+        appendEscapedForFileName(stream_name, name_in_storage);
+
+    stream_name = getNameForSubstreamPath(std::move(stream_name), path.begin(), path.end(), true, false, settings.escape_variant_substreams);
+}
+
+}
+
 String ISerialization::getFileNameForStream(const String & name_in_storage, const SubstreamPath & path, const StreamFileNameSettings & settings)
 {
     String stream_name;
-    if (settings.share_nested_offsets)
-    {
-        auto nested_storage_name = Nested::extractTableName(name_in_storage);
-        if (name_in_storage != nested_storage_name && isPossibleOffsetsOfNested(path))
-            stream_name = escapeForFileName(nested_storage_name);
-        else
-            stream_name = escapeForFileName(name_in_storage);
-    }
-    else
-    {
-        stream_name = escapeForFileName(name_in_storage);
-    }
+    makeFileNameForStream(name_in_storage, path, settings, stream_name);
+    return stream_name;
+}
 
-    return getNameForSubstreamPath(std::move(stream_name), path.begin(), path.end(), true, false, settings.escape_variant_substreams);
+void ISerialization::getFileNameForStream(const NameAndTypePair & column, const SubstreamPath & path, const StreamFileNameSettings & settings, String & stream_name)
+{
+    makeFileNameForStream(column.getNameInStorage(), path, settings, stream_name);
 }
 
 String ISerialization::getFileNameForRenamedColumnStream(const String & name_from, const String & name_to, const String & file_name)

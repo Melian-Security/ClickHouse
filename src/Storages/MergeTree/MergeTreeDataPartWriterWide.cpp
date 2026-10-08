@@ -287,7 +287,9 @@ const MergeTreeDataPartWriterWide::StreamEntry * MergeTreeDataPartWriterWide::ge
     const NameAndTypePair & column,
     const ISerialization::SubstreamPath & substream_path) const
 {
-    auto full_stream_name = ISerialization::getFileNameForStream(column, substream_path, ISerialization::StreamFileNameSettings(*storage_settings));
+    /// The name is made for every substream of every granule, so it is made in a buffer that keeps its memory.
+    auto & full_stream_name = stream_name_buffer;
+    ISerialization::getFileNameForStream(column, substream_path, ISerialization::StreamFileNameSettings(*storage_settings), full_stream_name);
     bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
 
     auto it = full_name_to_stream.find(full_stream_name);
