@@ -15,6 +15,7 @@
 #include <Formats/FormatSettings.h>
 #include <Formats/JSONUtils.h>
 #include <Formats/ParseError.h>
+#include <base/unaligned.h>
 
 #include <algorithm>
 
@@ -181,12 +182,11 @@ namespace
         offset_values.resize(initial_size + limit);
 
         size_t i = initial_size;
+        const size_t end = initial_size + limit;
         ColumnArray::Offset current_offset = initial_size ? offset_values[initial_size - 1] : 0;
-        while (i < initial_size + limit && !istr.eof())
-        {
-            ColumnArray::Offset current_size = 0;
-            readBinaryLittleEndian(current_size, istr);
 
+        auto add_size = [&](ColumnArray::Offset current_size)
+        {
             if (unlikely(current_size > MAX_ARRAY_SIZE))
                 throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE, "Array size at index {} is too large: {}", i, current_size);
             if (unlikely(__builtin_add_overflow(current_offset, current_size, &current_offset)))
@@ -194,6 +194,25 @@ namespace
 
             offset_values[i] = current_offset;
             ++i;
+        };
+
+        while (i < end && !istr.eof())
+        {
+            /// Decode the sizes that are whole in the buffer directly from it, without a bounds check per size.
+            const size_t sizes_in_buffer = std::min(end - i, istr.available() / sizeof(ColumnArray::Offset));
+            if (sizes_in_buffer == 0)
+            {
+                /// A size split between two buffers.
+                ColumnArray::Offset current_size = 0;
+                readBinaryLittleEndian(current_size, istr);
+                add_size(current_size);
+                continue;
+            }
+
+            const char * pos = istr.position();
+            for (size_t j = 0; j != sizes_in_buffer; ++j)
+                add_size(unalignedLoadLittleEndian<ColumnArray::Offset>(pos + j * sizeof(ColumnArray::Offset)));
+            istr.position() += sizes_in_buffer * sizeof(ColumnArray::Offset);
         }
 
         offset_values.resize(i);
