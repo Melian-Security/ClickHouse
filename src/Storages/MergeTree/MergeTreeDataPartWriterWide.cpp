@@ -312,6 +312,32 @@ const MergeTreeDataPartWriterWide::StreamEntry * MergeTreeDataPartWriterWide::ge
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Stream {} not found", full_stream_name);
 }
 
+MergeTreeDataPartWriterWide::StreamsBySubstreamPath & MergeTreeDataPartWriterWide::getStreamsBySubstreamPath(const NameAndTypePair & column) const
+{
+    return streams_by_substream_path[column.name];
+}
+
+const MergeTreeDataPartWriterWide::StreamEntry * MergeTreeDataPartWriterWide::getStream(
+    const NameAndTypePair & column,
+    const ISerialization::SubstreamPath & substream_path,
+    StreamsBySubstreamPath & streams) const
+{
+    if (const auto * found = streams.find(substream_path))
+    {
+        const auto * stream = *found;
+        /// The same check as in getStream: offsets streams that have been written before are not written again.
+        bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
+        if (is_offsets && written_offset_substreams && written_offset_substreams->contains(*stream->stream_name))
+            return nullptr;
+        return stream;
+    }
+
+    const auto * stream = getStream(column, substream_path);
+    if (stream)
+        streams.insert(substream_path, stream);
+    return stream;
+}
+
 const MergeTreeDataPartWriterWide::ColumnSubstreams & MergeTreeDataPartWriterWide::getColumnSubstreams(const NameAndTypePair & name_and_type)
 {
     auto [it, inserted] = column_substreams_cache.try_emplace(name_and_type.name);
@@ -370,13 +396,14 @@ const String & MergeTreeDataPartWriterWide::getStreamName(
 ISerialization::OutputStreamGetter MergeTreeDataPartWriterWide::createStreamGetter(const NameAndTypePair & column,
     const WrittenOffsetSubstreams & offset_substreams) const
 {
-    return [&, this] (const ISerialization::SubstreamPath & substream_path) -> WriteBuffer *
+    auto * streams = &getStreamsBySubstreamPath(column);
+    return [&, this, streams] (const ISerialization::SubstreamPath & substream_path) -> WriteBuffer *
     {
         /// Skip ephemeral subcolumns that don't store any real data.
         if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
             return nullptr;
 
-        const auto * stream = getStream(column, substream_path);
+        const auto * stream = getStream(column, substream_path, *streams);
         if (!stream)
             return nullptr;
 
@@ -646,9 +673,10 @@ void MergeTreeDataPartWriterWide::writeColumn(
     auto serialize_settings = getSerializationSettings();
     serialize_settings.getter = createStreamGetter(name_and_type, offset_substreams);
     serialize_settings.min_compress_block_size = getEffectiveMinCompressBlockSize(name_and_type);
+    auto & streams = getStreamsBySubstreamPath(name_and_type);
     serialize_settings.stream_mark_getter = [&](const ISerialization::SubstreamPath & substream_path) -> MarkInCompressedFile
     {
-        const auto * stream_entry = getStream(name_and_type, substream_path);
+        const auto * stream_entry = getStream(name_and_type, substream_path, streams);
         if (!stream_entry)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Stream {} has been written before", ISerialization::getFileNameForStream(name_and_type, substream_path, ISerialization::StreamFileNameSettings(*storage_settings)));
         const auto & stream = *stream_entry->stream;
