@@ -1461,6 +1461,8 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
     /// Defaults and ranges of values that go into the Variant column as they are wait in pending_rows, and are
     /// inserted together before any other insert into the column, which can change its variants.
     auto & pending_rows = state.pending_variant_rows;
+    static constexpr size_t offsets_prefetch_distance = 16;
+    static constexpr size_t values_prefetch_distance = 8;
     for (size_t i = 0; i != state.dynamic_columns.size(); ++i)
     {
         ColumnDynamic & column = *state.dynamic_columns[i];
@@ -1518,6 +1520,20 @@ void ColumnObject::insertGatheredRanges(const Ranges & ranges)
             {
                 for (; value_it != values.end() && value_it->row < range_end_row; ++value_it)
                 {
+                    /// The values of one path are spread over the shared data of the source, so the offsets and then
+                    /// the bytes of the values a few iterations ahead are prefetched.
+                    size_t values_left = static_cast<size_t>(values.end() - value_it);
+                    if (values_left > offsets_prefetch_distance)
+                    {
+                        const auto & ahead = value_it[offsets_prefetch_distance];
+                        __builtin_prefetch(&ahead.src_shared_data_values->getOffsets()[static_cast<ssize_t>(ahead.n) - 1]);
+                    }
+                    if (values_left > values_prefetch_distance)
+                    {
+                        const auto & ahead = value_it[values_prefetch_distance];
+                        __builtin_prefetch(ahead.src_shared_data_values->getChars().data() + ahead.src_shared_data_values->getOffsets()[static_cast<ssize_t>(ahead.n) - 1]);
+                    }
+
                     insert_defaults_up_to(value_it->row);
                     insert_pending_rows();
                     state.deserializeValue(value_it->src_shared_data_values, value_it->n, i);

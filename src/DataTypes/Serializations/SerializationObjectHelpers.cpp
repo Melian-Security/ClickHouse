@@ -7,6 +7,9 @@
 #include <Common/HashTable/HashMap.h>
 #include <IO/ReadHelpers.h>
 
+#include <numeric>
+#include <span>
+
 
 namespace DB
 {
@@ -368,35 +371,54 @@ void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn &
                 num_rows);
     }
 
-    /// Reused across rows to avoid an allocation per row.
-    using PathInBucket = std::tuple<std::string_view, size_t, size_t>;
-    std::vector<PathInBucket> all_paths;
-    std::vector<PathInBucket> merged_paths;
-    /// The end of the paths of each bucket that has paths in the row, in all_paths.
-    std::vector<size_t> runs_ends;
-    std::vector<size_t> merged_runs_ends;
+    /// Paths are compared as strings once per distinct path instead of in every row: each occurrence of a path
+    /// gets the id of the path, the distinct paths are sorted once, and the paths of each row are sorted by
+    /// the rank of their path, then by bucket and index, which is the order of sorting (path, bucket, index).
+    HashMapWithSavedHash<std::string_view, UInt32> path_to_id;
+    std::vector<std::string_view> distinct_paths;
+    /// For each occurrence in the order of rows: the id of its path (replaced by the rank later), its bucket and index.
+    struct PathInBucket
+    {
+        UInt32 path;
+        UInt32 bucket;
+        size_t index;
+
+        bool operator<(const PathInBucket & rhs) const { return std::tie(path, bucket, index) < std::tie(rhs.path, rhs.bucket, rhs.index); }
+    };
+    std::vector<PathInBucket> occurrences;
+    if (!paths_prefix)
+    {
+        size_t num_occurrences = 0;
+        for (const auto * offsets : shared_data_offsets_buckets)
+            num_occurrences += offsets->back();
+        occurrences.reserve(num_occurrences);
+    }
+    std::vector<size_t> rows_ends(num_rows);
+    auto add_occurrence = [&](std::string_view path, size_t bucket, size_t index)
+    {
+        HashMapWithSavedHash<std::string_view, UInt32>::LookupResult it;
+        bool inserted;
+        path_to_id.emplace(path, it, inserted);
+        if (inserted)
+        {
+            it->getMapped() = static_cast<UInt32>(distinct_paths.size());
+            distinct_paths.push_back(path);
+        }
+        occurrences.push_back({it->getMapped(), static_cast<UInt32>(bucket), index});
+    };
+
     for (size_t i = 0; i != num_rows; ++i)
     {
-        /// Shared data contains paths in sorted order in each row.
-        /// Collect all paths from all buckets in this row and sort them.
-        /// Save each path bucket and index to be able find corresponding value later.
-        all_paths.clear();
-        runs_ends.clear();
-        bool runs_are_sorted = true;
         for (size_t bucket = 0; bucket != shared_data_buckets.size(); ++bucket)
         {
             size_t offset_start = (*shared_data_offsets_buckets[bucket])[ssize_t(i) - 1];
             size_t offset_end = (*shared_data_offsets_buckets[bucket])[ssize_t(i)];
-            size_t run_begin = all_paths.size();
 
             /// If no paths prefix specified, collect all paths.
             if (!paths_prefix)
             {
                 for (size_t j = offset_start; j != offset_end; ++j)
-                {
-                    auto path = shared_data_paths_buckets[bucket]->getDataAt(j);
-                    all_paths.emplace_back(path, bucket, j);
-                }
+                    add_occurrence(shared_data_paths_buckets[bucket]->getDataAt(j), bucket, j);
             }
             /// Otherwise collect only paths that match the prefix.
             else
@@ -407,54 +429,37 @@ void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn &
                     auto path = shared_data_paths_buckets[bucket]->getDataAt(lower_bound_index);
                     if (!path.starts_with(*paths_prefix))
                         break;
-                    auto sub_path = path.substr(paths_prefix->size());
-                    all_paths.emplace_back(sub_path, bucket, lower_bound_index);
+                    add_occurrence(path.substr(paths_prefix->size()), bucket, lower_bound_index);
                 }
             }
+        }
+        rows_ends[i] = occurrences.size();
+    }
 
-            if (all_paths.size() != run_begin)
-            {
-                for (size_t j = run_begin + 1; j < all_paths.size() && runs_are_sorted; ++j)
-                    runs_are_sorted = std::get<0>(all_paths[j - 1]) < std::get<0>(all_paths[j]);
-                runs_ends.push_back(all_paths.size());
-            }
-        }
+    std::vector<UInt32> sorted_ids(distinct_paths.size());
+    std::iota(sorted_ids.begin(), sorted_ids.end(), 0U);
+    std::sort(sorted_ids.begin(), sorted_ids.end(), [&](UInt32 lhs, UInt32 rhs) { return distinct_paths[lhs] < distinct_paths[rhs]; });
+    std::vector<UInt32> rank_by_id(distinct_paths.size());
+    for (size_t rank = 0; rank != sorted_ids.size(); ++rank)
+        rank_by_id[sorted_ids[rank]] = static_cast<UInt32>(rank);
+    for (auto & occurrence : occurrences)
+        occurrence.path = rank_by_id[occurrence.path];
 
-        /// The paths of each bucket are sorted, so the sorted runs of the buckets are merged pairwise,
-        /// which takes fewer comparisons of paths than sorting them all.
-        if (!runs_are_sorted)
+    size_t row_begin = 0;
+    for (size_t i = 0; i != num_rows; ++i)
+    {
+        /// Shared data contains paths in sorted order in each row.
+        auto row_occurrences = std::span(occurrences).subspan(row_begin, rows_ends[i] - row_begin);
+        std::sort(row_occurrences.begin(), row_occurrences.end());
+        for (const auto & occurrence : row_occurrences)
         {
-            std::sort(all_paths.begin(), all_paths.end());
-        }
-        else
-        {
-            while (runs_ends.size() > 1)
-            {
-                merged_paths.resize(all_paths.size());
-                merged_runs_ends.clear();
-                size_t run_begin = 0;
-                for (size_t run = 0; run < runs_ends.size(); run += 2)
-                {
-                    size_t middle = runs_ends[run];
-                    size_t run_end = run + 1 < runs_ends.size() ? runs_ends[run + 1] : middle;
-                    std::merge(
-                        all_paths.begin() + run_begin, all_paths.begin() + middle,
-                        all_paths.begin() + middle, all_paths.begin() + run_end,
-                        merged_paths.begin() + run_begin);
-                    merged_runs_ends.push_back(run_end);
-                    run_begin = run_end;
-                }
-                all_paths.swap(merged_paths);
-                runs_ends.swap(merged_runs_ends);
-            }
-        }
-        for (const auto [path, bucket, offset] : all_paths)
-        {
+            auto path = distinct_paths[sorted_ids[occurrence.path]];
             shared_data_paths->insertData(path.data(), path.size());
-            shared_data_values->insertFrom(*shared_data_values_buckets[bucket], offset);
+            shared_data_values->insertFrom(*shared_data_values_buckets[occurrence.bucket], occurrence.index);
         }
 
         shared_data_offsets->push_back(shared_data_paths->size());
+        row_begin = rows_ends[i];
     }
 }
 
