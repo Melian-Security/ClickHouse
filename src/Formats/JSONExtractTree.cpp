@@ -2219,8 +2219,16 @@ private:
                 for (auto [key, value] : object)
                 {
                     PathNode & child = getChildNode(node, key, next_child, insert_settings, is_root);
-                    if (!traverseAndInsert(column_object, value, child, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false))
+                    /// A value that is not an object is inserted without a recursive call.
+                    if (!value.isObject())
+                    {
+                        if (!child.skip && !insertValue(column_object, value, child, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error))
+                            return false;
+                    }
+                    else if (!traverseAndInsert(column_object, value, child, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error, false))
+                    {
                         return false;
+                    }
                 }
 
                 return true;
@@ -2323,6 +2331,23 @@ private:
 
             return true;
         }
+
+        return insertValue(column_object, element, node, insert_settings, format_settings, paths_and_values_for_shared_data, current_size, error);
+    }
+
+    /// Inserts a value that is not traversed as an object: into its typed path, its dynamic path or shared data.
+    bool insertValue(
+        ColumnObject & column_object,
+        const typename JSONParser::Element & element,
+        PathNode & node,
+        const JSONExtractInsertSettings & insert_settings,
+        const FormatSettings & format_settings,
+        SharedDataPathsAndValues & paths_and_values_for_shared_data,
+        size_t current_size,
+        String & error) const
+    {
+        const String & current_path = node.path;
+        const TypedPathInfo * typed_path = node.typed_path;
 
         /// The column is created from the same type as this node, so it has exactly the node's typed paths.
         chassert(column_object.getSortedTypedPathColumns().size() == typed_path_infos.size());
