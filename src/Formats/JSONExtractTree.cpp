@@ -2948,8 +2948,8 @@ private:
 
     /// Returns the dynamic path column of the path, adding a new dynamic path if the limit allows it.
     /// Returns nullptr if the path goes to shared data.
-    /// The slot of the node is valid with its dynamic path column: the slots are rebuilt in another order only after the
-    /// dynamic paths of a column with another version were used.
+    /// The slot of the node is valid while it holds the dynamic path column of the node: the slots are rebuilt, possibly in
+    /// another order, when objects are inserted into a column with other dynamic paths.
     ColumnDynamic * getDynamicPathColumn(ColumnObject & column_object, PathNode & node) const
     {
         auto & dynamic_paths_ptrs = column_object.getDynamicPathsPtrs();
