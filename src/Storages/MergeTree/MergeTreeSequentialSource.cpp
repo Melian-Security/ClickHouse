@@ -292,6 +292,12 @@ try
             result_column = std::move(mutable_column);
         }
 
+        /// `shrinkToFit` moves the column's data to smaller allocations, which copies all of it. Do it only when it
+        /// releases at least half of the memory of the column: the capacity left by geometric growth of the buffers
+        /// is smaller than that, and copying every block read by a merge again to release it costs more than it saves.
+        if (result_column->allocatedBytes() < 2 * result_column->byteSize())
+            continue;
+
         /// `shrinkToFit` reallocates the column's data. Go through `IColumn::mutate` so a shared
         /// column is cloned first: mutating a column still referenced elsewhere is a use-after-free hazard.
         auto mutable_column = IColumn::mutate(std::move(result_column));

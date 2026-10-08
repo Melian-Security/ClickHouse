@@ -368,6 +368,26 @@ void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn &
                 num_rows);
     }
 
+    /// Without a prefix every path and value of every bucket is collected, so the result sizes are known in advance.
+    if (!paths_prefix)
+    {
+        size_t num_values = shared_data_paths->size();
+        size_t paths_bytes = shared_data_paths->getChars().size();
+        size_t values_bytes = shared_data_values->getChars().size();
+        for (size_t bucket = 0; bucket != shared_data_buckets.size(); ++bucket)
+        {
+            num_values += shared_data_paths_buckets[bucket]->size();
+            paths_bytes += shared_data_paths_buckets[bucket]->getChars().size();
+            values_bytes += shared_data_values_buckets[bucket]->getChars().size();
+        }
+
+        shared_data_paths->reserve(num_values);
+        shared_data_paths->getChars().reserve_exact(paths_bytes);
+        shared_data_values->reserve(num_values);
+        shared_data_values->getChars().reserve_exact(values_bytes);
+        shared_data_offsets->reserve_exact(shared_data_offsets->size() + num_rows);
+    }
+
     /// Reused across rows to avoid an allocation per row.
     std::vector<std::tuple<std::string_view, size_t, size_t>> all_paths;
     for (size_t i = 0; i != num_rows; ++i)
