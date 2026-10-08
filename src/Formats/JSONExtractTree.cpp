@@ -1963,6 +1963,7 @@ public:
         typed_path_infos.reserve(sorted_typed_paths.size());
         for (size_t i = 0; i != sorted_typed_paths.size(); ++i)
             typed_path_infos.emplace(sorted_typed_paths[i], TypedPathInfo{typed_path_nodes.at(sorted_typed_paths[i]).get(), i});
+        typed_path_insert_stamps.resize(sorted_typed_paths.size());
     }
 
     bool insertResultToColumn(IColumn & column, const typename JSONParser::Element & element, const JSONExtractInsertSettings & insert_settings, const FormatSettings & format_settings, String & error) const override
@@ -2003,6 +2004,9 @@ public:
         /// Shared data paths are referenced in the path tree, so collecting them does not copy them.
         SharedDataPathsAndValues paths_and_values_for_shared_data;
         PathNode & root = getPathTreeRoot(insert_settings);
+        ++typed_paths_insert_stamp;
+        num_typed_paths_inserted = 0;
+        skipped_invalid_typed_path = false;
         if (!traverseAndInsert(column_object, element, root, insert_settings, format_settings, paths_and_values_for_shared_data, prev_size, error, true))
         {
             /// If there was an error, restore previous state.
@@ -2060,10 +2064,23 @@ public:
         /// Fill remaining typed and dynamic paths.
         if (all_typed_paths_have_trivial_defaults)
         {
-            for (auto * col : column_object.getSortedTypedPathColumns())
+            const auto & sorted_typed_path_columns = column_object.getSortedTypedPathColumns();
+            if (skipped_invalid_typed_path)
             {
-                if (col->size() == prev_size)
-                    col->insertDefault();
+                for (auto * col : sorted_typed_path_columns)
+                {
+                    if (col->size() == prev_size)
+                        col->insertDefault();
+                }
+            }
+            else if (num_typed_paths_inserted != sorted_typed_path_columns.size())
+            {
+                /// A typed path column has a value of this object exactly when an insert into it succeeded.
+                for (size_t i = 0; i != sorted_typed_path_columns.size(); ++i)
+                {
+                    if (typed_path_insert_stamps[i] != typed_paths_insert_stamp)
+                        sorted_typed_path_columns[i]->insertDefault();
+                }
             }
         }
         else
@@ -2288,8 +2305,9 @@ private:
         if (typed_path)
         {
             IColumn & typed_column = *column_object.getSortedTypedPathColumns()[typed_path->sorted_index];
-            /// Check if we already had this path.
-            if (typed_column.size() > current_size)
+            UInt64 & insert_stamp = typed_path_insert_stamps[typed_path->sorted_index];
+            /// Check if we already had this path. A failed insert of a skipped invalid value may leave a value in the column.
+            if (insert_stamp == typed_paths_insert_stamp || (skipped_invalid_typed_path && typed_column.size() > current_size))
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2305,6 +2323,12 @@ private:
                     return false;
                 }
                 /// Otherwise skip this field and continue
+                skipped_invalid_typed_path = true;
+            }
+            else
+            {
+                insert_stamp = typed_paths_insert_stamp;
+                ++num_typed_paths_inserted;
             }
         }
         /// Don't create new dynamic paths for null and don't insert null values into shared data.
@@ -2784,6 +2808,14 @@ private:
         size_t sorted_index;
     };
     std::unordered_map<String, TypedPathInfo, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> typed_path_infos;
+
+    /// The objects inserted by insertResultToColumn are numbered; a typed path column has a value of the object being
+    /// inserted when its stamp is the number of the object, which is cheaper to check than the size of the column.
+    mutable UInt64 typed_paths_insert_stamp = 0;
+    /// By the index of the typed path in ColumnObject::getSortedTypedPathColumns().
+    mutable std::vector<UInt64> typed_path_insert_stamps;
+    mutable size_t num_typed_paths_inserted = 0;
+    mutable bool skipped_invalid_typed_path = false;
 
     /// Returns the root of the path tree, built anew when the settings that the paths depend on change or the tree has
     /// grown too large.
