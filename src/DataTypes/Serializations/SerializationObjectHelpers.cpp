@@ -316,7 +316,10 @@ SharedDataBucketsSplitter::BucketPaths SharedDataBucketsSplitter::getBucketPaths
 MutableColumnPtr SharedDataBucketsSplitter::flattenPath(const BucketPaths & bucket_paths, size_t path_index, const DataTypePtr & dynamic_type) const
 {
     const auto * shared_data_values = &getValuesColumn();
+    size_t num_rows = end - start;
     auto column = dynamic_type->createColumn();
+    /// Every row gets a value or a default, so the discriminators and offsets of all rows are allocated at once.
+    column->reserve(num_rows);
     auto & dynamic_column = assert_cast<ColumnDynamic &>(*column);
     /// Most paths keep one type across rows, so the column remembers the type of its last value.
     ColumnObject::SharedDataValueTypeCache type_cache;
@@ -338,7 +341,6 @@ MutableColumnPtr SharedDataBucketsSplitter::flattenPath(const BucketPaths & buck
     }
 
     /// Backfill defaults for the trailing rows where the path was absent.
-    size_t num_rows = end - start;
     if (column->size() < num_rows)
         column->insertManyDefaults(num_rows - column->size());
     return column;
@@ -369,6 +371,26 @@ void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn &
                 bucket,
                 shared_data_buckets[bucket]->size(),
                 num_rows);
+    }
+
+    /// Without a prefix every path and value of every bucket is collected, so the result sizes are known in advance.
+    if (!paths_prefix)
+    {
+        size_t num_values = shared_data_paths->size();
+        size_t paths_bytes = shared_data_paths->getChars().size();
+        size_t values_bytes = shared_data_values->getChars().size();
+        for (size_t bucket = 0; bucket != shared_data_buckets.size(); ++bucket)
+        {
+            num_values += shared_data_paths_buckets[bucket]->size();
+            paths_bytes += shared_data_paths_buckets[bucket]->getChars().size();
+            values_bytes += shared_data_values_buckets[bucket]->getChars().size();
+        }
+
+        shared_data_paths->reserve(num_values);
+        shared_data_paths->getChars().reserve_exact(paths_bytes);
+        shared_data_values->reserve(num_values);
+        shared_data_values->getChars().reserve_exact(values_bytes);
+        shared_data_offsets->reserve_exact(shared_data_offsets->size() + num_rows);
     }
 
     /// Paths are compared as strings once per distinct path instead of in every row: each occurrence of a path
