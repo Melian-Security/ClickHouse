@@ -2005,9 +2005,10 @@ public:
         /// Shared data paths are referenced in the path tree, so collecting them does not copy them.
         SharedDataPathsAndValues paths_and_values_for_shared_data;
         PathNode & root = getPathTreeRoot(insert_settings);
-        ++typed_paths_insert_stamp;
+        ++object_insert_stamp;
         num_typed_paths_inserted = 0;
         skipped_invalid_typed_path = false;
+        syncDynamicPathSlots(column_object);
         if (!traverseAndInsert(column_object, element, root, insert_settings, format_settings, paths_and_values_for_shared_data, prev_size, error, true))
         {
             /// If there was an error, restore previous state.
@@ -2079,7 +2080,7 @@ public:
                 /// A typed path column has a value of this object exactly when an insert into it succeeded.
                 for (size_t i = 0; i != sorted_typed_path_columns.size(); ++i)
                 {
-                    if (typed_path_insert_stamps[i] != typed_paths_insert_stamp)
+                    if (typed_path_insert_stamps[i] != object_insert_stamp)
                         sorted_typed_path_columns[i]->insertDefault();
                 }
             }
@@ -2093,10 +2094,22 @@ public:
             }
         }
 
-        for (auto & [_, dynamic_column] : column_object.getDynamicPathsPtrs())
+        /// The traversal adds dynamic paths to the slots as it adds them to the column.
+        if (dynamic_path_slots_version == column_object.getDynamicPathsVersion())
         {
-            if (dynamic_column->size() == prev_size)
-                dynamic_column->insertDefault();
+            for (size_t slot = 0; slot != dynamic_path_slot_columns.size(); ++slot)
+            {
+                if (dynamic_path_slot_stamps[slot] != object_insert_stamp)
+                    dynamic_path_slot_columns[slot]->insertDefault();
+            }
+        }
+        else
+        {
+            for (auto & [_, dynamic_column] : column_object.getDynamicPathsPtrs())
+            {
+                if (dynamic_column->size() == prev_size)
+                    dynamic_column->insertDefault();
+            }
         }
 
         return true;
@@ -2163,6 +2176,8 @@ private:
         /// paths version of the column equals dynamic_paths_version (versions start from 1).
         ColumnDynamic * dynamic_column = nullptr;
         UInt64 dynamic_paths_version = 0;
+        /// The slot of dynamic_column, see dynamic_path_slot_columns.
+        size_t dynamic_path_slot = 0;
         /// Position of the node in the children of its parent.
         size_t index_in_parent = 0;
         /// Children in the order they were added.
@@ -2315,9 +2330,9 @@ private:
         if (typed_path)
         {
             IColumn & typed_column = *column_object.getSortedTypedPathColumns()[typed_path->sorted_index];
-            UInt64 & insert_stamp = typed_path_insert_stamps[typed_path->sorted_index];
+            UInt64 & typed_path_stamp = typed_path_insert_stamps[typed_path->sorted_index];
             /// Check if we already had this path. A failed insert of a skipped invalid value may leave a value in the column.
-            if (insert_stamp == typed_paths_insert_stamp || (skipped_invalid_typed_path && typed_column.size() > current_size))
+            if (typed_path_stamp == object_insert_stamp || (skipped_invalid_typed_path && typed_column.size() > current_size))
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2337,7 +2352,7 @@ private:
             }
             else
             {
-                insert_stamp = typed_paths_insert_stamp;
+                typed_path_stamp = object_insert_stamp;
                 ++num_typed_paths_inserted;
             }
         }
@@ -2354,8 +2369,9 @@ private:
         /// Check if we have this path in dynamic paths, or try to add a new dynamic path.
         else if (ColumnDynamic * dynamic_column = getDynamicPathColumn(column_object, node))
         {
-            /// Check if we already had this path. A new dynamic path column has exactly current_size rows.
-            if (dynamic_column->size() > current_size)
+            /// Check if we already had this path.
+            UInt64 & dynamic_path_stamp = dynamic_path_slot_stamps[node.dynamic_path_slot];
+            if (dynamic_path_stamp == object_insert_stamp)
             {
                 if (!format_settings.json.type_json_skip_duplicated_paths)
                 {
@@ -2367,6 +2383,10 @@ private:
             {
                 error += fmt::format(" (while reading path {})", current_path);
                 return false;
+            }
+            else
+            {
+                dynamic_path_stamp = object_insert_stamp;
             }
         }
         /// Otherwise this path should go to the shared data.
@@ -2819,9 +2839,9 @@ private:
     };
     std::unordered_map<String, TypedPathInfo, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal> typed_path_infos;
 
-    /// The objects inserted by insertResultToColumn are numbered; a typed path column has a value of the object being
-    /// inserted when its stamp is the number of the object, which is cheaper to check than the size of the column.
-    mutable UInt64 typed_paths_insert_stamp = 0;
+    /// The objects inserted by insertResultToColumn are numbered; a typed or dynamic path column has a value of the object
+    /// being inserted when its stamp is the number of the object, which is cheaper to check than the size of the column.
+    mutable UInt64 object_insert_stamp = 0;
     /// By the index of the typed path in ColumnObject::getSortedTypedPathColumns().
     mutable std::vector<UInt64> typed_path_insert_stamps;
     mutable size_t num_typed_paths_inserted = 0;
@@ -2915,10 +2935,14 @@ private:
 
     /// Returns the dynamic path column of the path, adding a new dynamic path if the limit allows it.
     /// Returns nullptr if the path goes to shared data.
-    static ColumnDynamic * getDynamicPathColumn(ColumnObject & column_object, PathNode & node)
+    /// The slot of the node is valid with its dynamic path column: the slots are rebuilt in another order only after the
+    /// dynamic paths of a column with another version were used.
+    ColumnDynamic * getDynamicPathColumn(ColumnObject & column_object, PathNode & node) const
     {
         auto & dynamic_paths_ptrs = column_object.getDynamicPathsPtrs();
-        if (node.dynamic_paths_version == column_object.getDynamicPathsVersion())
+        if (node.dynamic_paths_version == column_object.getDynamicPathsVersion()
+            && (!node.dynamic_column
+                || (node.dynamic_path_slot < dynamic_path_slot_columns.size() && dynamic_path_slot_columns[node.dynamic_path_slot] == node.dynamic_column)))
         {
             chassert(node.dynamic_column
                 ? dynamic_paths_ptrs.contains(node.path) && dynamic_paths_ptrs.at(node.path) == node.dynamic_column
@@ -2926,13 +2950,56 @@ private:
             return node.dynamic_column;
         }
 
+        chassert(dynamic_path_slots_version == column_object.getDynamicPathsVersion());
         if (auto dynamic_it = dynamic_paths_ptrs.find(PrehashedStringView(node.path, node.path_hash)); dynamic_it != dynamic_paths_ptrs.end())
+        {
             node.dynamic_column = dynamic_it->second;
+            node.dynamic_path_slot = dynamic_path_slot_by_column.at(node.dynamic_column);
+        }
         else
+        {
             node.dynamic_column = column_object.tryToAddNewDynamicPath(node.path);
+            if (node.dynamic_column)
+            {
+                node.dynamic_path_slot = addDynamicPathSlot(node.dynamic_column);
+                dynamic_path_slots_version = column_object.getDynamicPathsVersion();
+            }
+        }
         node.dynamic_paths_version = column_object.getDynamicPathsVersion();
         return node.dynamic_column;
     }
+
+    /// Makes the slots hold the dynamic path columns of `column_object`.
+    void syncDynamicPathSlots(const ColumnObject & column_object) const
+    {
+        if (dynamic_path_slots_version == column_object.getDynamicPathsVersion())
+            return;
+
+        dynamic_path_slot_columns.clear();
+        dynamic_path_slot_stamps.clear();
+        dynamic_path_slot_by_column.clear();
+        for (const auto & [_, dynamic_column] : column_object.getDynamicPathsPtrs())
+            addDynamicPathSlot(dynamic_column);
+        dynamic_path_slots_version = column_object.getDynamicPathsVersion();
+    }
+
+    size_t addDynamicPathSlot(ColumnDynamic * dynamic_column) const
+    {
+        size_t slot = dynamic_path_slot_columns.size();
+        dynamic_path_slot_columns.push_back(dynamic_column);
+        dynamic_path_slot_stamps.push_back(0);
+        dynamic_path_slot_by_column.emplace(dynamic_column, slot);
+        return slot;
+    }
+
+    /// The dynamic path columns of the column that objects are inserted into, one per slot, with the number of the last
+    /// object inserted into each (see object_insert_stamp). They are the dynamic paths of the column while
+    /// dynamic_path_slots_version equals its dynamic paths version, so missing paths are filled without the size of
+    /// every dynamic path column.
+    mutable UInt64 dynamic_path_slots_version = 0;
+    mutable std::vector<ColumnDynamic *> dynamic_path_slot_columns;
+    mutable std::vector<UInt64> dynamic_path_slot_stamps;
+    mutable std::unordered_map<const ColumnDynamic *, size_t> dynamic_path_slot_by_column;
 
     /// The nodes of the path tree; the first one is the root. Like the caches of DynamicNode, the tree belongs to one
     /// serialization, which one thread uses at a time. A deque does not move the nodes when it grows.
