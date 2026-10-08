@@ -22,7 +22,9 @@
 #include <IO/ReadHelpers.h>
 #include <IO/ReadBufferFromString.h>
 #include <Columns/IColumn.h>
+#include <array>
 #include <bitset>
+#include <limits>
 
 namespace DB
 {
@@ -44,6 +46,49 @@ static void checkDiscriminatorValue(ColumnVariant::Discriminator discr, size_t n
             native_format ? ErrorCodes::INCORRECT_DATA : ErrorCodes::LOGICAL_ERROR,
             "Invalid discriminator value {} (num_variants = {})",
             static_cast<UInt32>(discr), num_variants);
+}
+
+/// Adds the number of discriminators of each variant in [begin, end) to variant_limits (NULL_DISCRIMINATOR is not
+/// counted) and checks every discriminator with checkDiscriminatorValue.
+static void addVariantLimits(
+    const ColumnVariant::Discriminator * begin,
+    const ColumnVariant::Discriminator * end,
+    std::vector<size_t> & variant_limits,
+    bool native_format)
+{
+    /// Counts in several independent tables, so that a run of equal discriminators does not make every increment
+    /// wait for the previous one.
+    static constexpr size_t num_tables = 4;
+    static constexpr size_t num_values = std::numeric_limits<ColumnVariant::Discriminator>::max() + 1;
+    std::array<std::array<UInt32, num_values>, num_tables> counts{};
+
+    const size_t size = end - begin;
+    size_t i = 0;
+    /// The counters are 32-bit, so count in chunks that cannot overflow them.
+    static constexpr size_t max_chunk_size = num_tables * std::numeric_limits<UInt32>::max();
+    while (i != size)
+    {
+        const size_t chunk_end = i + std::min(size - i, max_chunk_size);
+        for (; i + num_tables <= chunk_end; i += num_tables)
+            for (size_t table = 0; table != num_tables; ++table)
+                ++counts[table][begin[i + table]];
+        for (; i != chunk_end; ++i)
+            ++counts[0][begin[i]];
+
+        for (size_t discr = 0; discr != ColumnVariant::NULL_DISCRIMINATOR; ++discr)
+        {
+            size_t count = 0;
+            for (size_t table = 0; table != num_tables; ++table)
+                count += counts[table][discr];
+
+            if (count && discr >= variant_limits.size())
+                checkDiscriminatorValue(static_cast<ColumnVariant::Discriminator>(discr), variant_limits.size(), native_format);
+            else if (count)
+                variant_limits[discr] += count;
+        }
+
+        counts = {};
+    }
 }
 
 /// Writes the global discriminators of rows [offset, offset + limit) of the column, a block of rows at a time.
@@ -632,17 +677,8 @@ void SerializationVariant::deserializeBinaryBulkWithMultipleStreams(
     if (variant_limits.empty())
     {
         variant_limits.resize(variant_serializations.size(), 0);
-        auto & discriminators_data = col.getLocalDiscriminators();
-
-        for (size_t i = discriminators_offset ; i != discriminators_data.size(); ++i)
-        {
-            ColumnVariant::Discriminator discr = discriminators_data[i];
-            if (discr != ColumnVariant::NULL_DISCRIMINATOR)
-            {
-                checkDiscriminatorValue(discr, variant_limits.size(), settings.native_format);
-                ++variant_limits[discr];
-            }
-        }
+        const auto & discriminators_data = col.getLocalDiscriminators();
+        addVariantLimits(discriminators_data.data() + discriminators_offset, discriminators_data.data() + discriminators_data.size(), variant_limits, settings.native_format);
     }
 
     /// Current variant sizes are the start offsets for the values read in the current range.
@@ -781,15 +817,7 @@ std::vector<size_t> SerializationVariant::deserializeCompactDiscriminators(
                 throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA,
                     "Cannot read all discriminators in Variant granule. Expected: {}, got: {}", limit_in_granule, num_read);
 
-            for (size_t i = start; i != discriminators_data.size(); ++i)
-            {
-                ColumnVariant::Discriminator discr = discriminators_data[i];
-                if (discr != ColumnVariant::NULL_DISCRIMINATOR)
-                {
-                    checkDiscriminatorValue(discr, variant_limits.size(), settings.native_format);
-                    ++variant_limits[discr];
-                }
-            }
+            addVariantLimits(discriminators_data.data() + start, discriminators_data.data() + discriminators_data.size(), variant_limits, settings.native_format);
         }
 
         state.remaining_rows_in_granule -= limit_in_granule;
