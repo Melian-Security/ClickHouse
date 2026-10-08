@@ -340,6 +340,8 @@ public:
         std::string_view encoded_type;
         UInt8 global_discriminator = 0;
         SerializationPtr serialization;
+        /// String values and native numbers are inserted from their bytes instead of being read by the serialization.
+        SharedDataValueSerializationCache::ValueFormat value_format = SharedDataValueSerializationCache::ValueFormat::Serialization;
     };
 
     /// Same result as the overload above. A value whose type is encoded by the same bytes as the cached

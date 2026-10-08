@@ -1,0 +1,65 @@
+before merge
+10		0	0	false	0	0	[0,1]	String	Int64	Int64	Bool	Int64	Int64
+11	x	1000000007	0.25	true	1	-1	[1,1]	String	Int64	Float64	Bool	String	Int64
+12	xx	2000000014	0.5	false	2	-2	[2,1]	String	Int64	Float64	Bool	String	Int64
+13	xxx	3000000021	0.75	true	3	-3	[3,1]	String	Int64	Float64	Bool	Int64	Int64
+14	xxxx	4000000028	1	false	4	-4	[4,1]	String	Int64	Int64	Bool	String	Int64
+15	xxxxx	5000000035	1.25	true	5	-5	[5,1]	String	Int64	Float64	Bool	String	Int64
+16	xxxxxx	6000000042	1.5	false	6	-6	[6,1]	String	Int64	Float64	Bool	Int64	Int64
+17	xxxxxxx	7000000049	1.75	true	7	-7	[7,1]	String	Int64	Float64	Bool	String	Int64
+18	xxxxxxxx	8000000056	2	false	8	-8	[8,1]	String	Int64	Int64	Bool	String	Int64
+19	xxxxxxxxx	9000000063	2.25	true	9	-9	[9,1]	String	Int64	Float64	Bool	Int64	Int64
+20	xxxxxxxxxx	10000000070	2.5	false	10	-10	[10,1]	String	Int64	Float64	Bool	String	Int64
+21	xxxxxxxxxxx	11000000077	2.75	true	11	-11	[11,1]	String	Int64	Float64	Bool	String	Int64
+22	xxxxxxxxxxxx	12000000084	3	false	12	-12	[12,1]	String	Int64	Int64	Bool	Int64	Int64
+23	xxxxxxxxxxxxx	13000000091	3.25	true	13	-13	[13,1]	String	Int64	Float64	Bool	String	Int64
+24	xxxxxxxxxxxxxx	14000000098	3.5	false	14	-14	[14,1]	String	Int64	Float64	Bool	String	Int64
+25	xxxxxxxxxxxxxxx	15000000105	3.75	true	15	-15	[15,1]	String	Int64	Float64	Bool	Int64	Int64
+26	xxxxxxxxxxxxxxxx	16000000112	4	false	16	-16	[16,1]	String	Int64	Int64	Bool	String	Int64
+27	xxxxxxxxxxxxxxxxx	17000000119	4.25	true	17	-17	[17,1]	String	Int64	Float64	Bool	String	Int64
+28	xxxxxxxxxxxxxxxxxx	18000000126	4.5	false	18	-18	[18,1]	String	Int64	Float64	Bool	Int64	Int64
+29	xxxxxxxxxxxxxxxxxxx	19000000133	4.75	true	19	-19	[19,1]	String	Int64	Float64	Bool	String	Int64
+30	xxxxxxxxxxxxxxxxxxxx	20000000140	5	false	20	-20	[20,1]	String	Int64	Int64	Bool	String	Int64
+31	xxxxxxxxxxxxxxxxxxxxx	21000000147	5.25	true	21	-21	[21,1]	String	Int64	Float64	Bool	Int64	Int64
+32	xxxxxxxxxxxxxxxxxxxxxx	22000000154	5.5	false	22	-22	[22,1]	String	Int64	Float64	Bool	String	Int64
+33	xxxxxxxxxxxxxxxxxxxxxxx	23000000161	5.75	true	23	-23	[23,1]	String	Int64	Float64	Bool	String	Int64
+34	xxxxxxxxxxxxxxxxxxxxxxxx	24000000168	6	false	24	-24	[24,1]	String	Int64	Int64	Bool	Int64	Int64
+35	xxxxxxxxxxxxxxxxxxxxxxxxx	25000000175	6.25	true	25	-25	[25,1]	String	Int64	Float64	Bool	String	Int64
+36	xxxxxxxxxxxxxxxxxxxxxxxxxx	26000000182	6.5	false	26	-26	[26,1]	String	Int64	Float64	Bool	String	Int64
+37	xxxxxxxxxxxxxxxxxxxxxxxxxxx	27000000189	6.75	true	27	-27	[27,1]	String	Int64	Float64	Bool	Int64	Int64
+38	xxxxxxxxxxxxxxxxxxxxxxxxxxxx	28000000196	7	false	28	-28	[28,1]	String	Int64	Int64	Bool	String	Int64
+39	xxxxxxxxxxxxxxxxxxxxxxxxxxxxx	29000000203	7.25	true	29	-29	[29,1]	String	Int64	Float64	Bool	String	Int64
+after merge
+1
+['i','m','s','t']
+10		0	0	false	0	0	[0,1]	String	Int64	Int64	Bool	Int64	Int64
+11	x	1000000007	0.25	true	1	-1	[1,1]	String	Int64	Float64	Bool	String	Int64
+12	xx	2000000014	0.5	false	2	-2	[2,1]	String	Int64	Float64	Bool	String	Int64
+13	xxx	3000000021	0.75	true	3	-3	[3,1]	String	Int64	Float64	Bool	Int64	Int64
+14	xxxx	4000000028	1	false	4	-4	[4,1]	String	Int64	Int64	Bool	String	Int64
+15	xxxxx	5000000035	1.25	true	5	-5	[5,1]	String	Int64	Float64	Bool	String	Int64
+16	xxxxxx	6000000042	1.5	false	6	-6	[6,1]	String	Int64	Float64	Bool	Int64	Int64
+17	xxxxxxx	7000000049	1.75	true	7	-7	[7,1]	String	Int64	Float64	Bool	String	Int64
+18	xxxxxxxx	8000000056	2	false	8	-8	[8,1]	String	Int64	Int64	Bool	String	Int64
+19	xxxxxxxxx	9000000063	2.25	true	9	-9	[9,1]	String	Int64	Float64	Bool	Int64	Int64
+20	xxxxxxxxxx	10000000070	2.5	false	10	-10	[10,1]	String	Int64	Float64	Bool	String	Int64
+21	xxxxxxxxxxx	11000000077	2.75	true	11	-11	[11,1]	String	Int64	Float64	Bool	String	Int64
+22	xxxxxxxxxxxx	12000000084	3	false	12	-12	[12,1]	String	Int64	Int64	Bool	Int64	Int64
+23	xxxxxxxxxxxxx	13000000091	3.25	true	13	-13	[13,1]	String	Int64	Float64	Bool	String	Int64
+24	xxxxxxxxxxxxxx	14000000098	3.5	false	14	-14	[14,1]	String	Int64	Float64	Bool	String	Int64
+25	xxxxxxxxxxxxxxx	15000000105	3.75	true	15	-15	[15,1]	String	Int64	Float64	Bool	Int64	Int64
+26	xxxxxxxxxxxxxxxx	16000000112	4	false	16	-16	[16,1]	String	Int64	Int64	Bool	String	Int64
+27	xxxxxxxxxxxxxxxxx	17000000119	4.25	true	17	-17	[17,1]	String	Int64	Float64	Bool	String	Int64
+28	xxxxxxxxxxxxxxxxxx	18000000126	4.5	false	18	-18	[18,1]	String	Int64	Float64	Bool	Int64	Int64
+29	xxxxxxxxxxxxxxxxxxx	19000000133	4.75	true	19	-19	[19,1]	String	Int64	Float64	Bool	String	Int64
+30	xxxxxxxxxxxxxxxxxxxx	20000000140	5	false	20	-20	[20,1]	String	Int64	Int64	Bool	String	Int64
+31	xxxxxxxxxxxxxxxxxxxxx	21000000147	5.25	true	21	-21	[21,1]	String	Int64	Float64	Bool	Int64	Int64
+32	xxxxxxxxxxxxxxxxxxxxxx	22000000154	5.5	false	22	-22	[22,1]	String	Int64	Float64	Bool	String	Int64
+33	xxxxxxxxxxxxxxxxxxxxxxx	23000000161	5.75	true	23	-23	[23,1]	String	Int64	Float64	Bool	String	Int64
+34	xxxxxxxxxxxxxxxxxxxxxxxx	24000000168	6	false	24	-24	[24,1]	String	Int64	Int64	Bool	Int64	Int64
+35	xxxxxxxxxxxxxxxxxxxxxxxxx	25000000175	6.25	true	25	-25	[25,1]	String	Int64	Float64	Bool	String	Int64
+36	xxxxxxxxxxxxxxxxxxxxxxxxxx	26000000182	6.5	false	26	-26	[26,1]	String	Int64	Float64	Bool	String	Int64
+37	xxxxxxxxxxxxxxxxxxxxxxxxxxx	27000000189	6.75	true	27	-27	[27,1]	String	Int64	Float64	Bool	Int64	Int64
+38	xxxxxxxxxxxxxxxxxxxxxxxxxxxx	28000000196	7	false	28	-28	[28,1]	String	Int64	Int64	Bool	String	Int64
+39	xxxxxxxxxxxxxxxxxxxxxxxxxxxxx	29000000203	7.25	true	29	-29	[29,1]	String	Int64	Float64	Bool	String	Int64
+3325	435000502545	515	125185

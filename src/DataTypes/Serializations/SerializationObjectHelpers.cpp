@@ -369,17 +369,25 @@ void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn &
     }
 
     /// Reused across rows to avoid an allocation per row.
-    std::vector<std::tuple<std::string_view, size_t, size_t>> all_paths;
+    using PathInBucket = std::tuple<std::string_view, size_t, size_t>;
+    std::vector<PathInBucket> all_paths;
+    std::vector<PathInBucket> merged_paths;
+    /// The end of the paths of each bucket that has paths in the row, in all_paths.
+    std::vector<size_t> runs_ends;
+    std::vector<size_t> merged_runs_ends;
     for (size_t i = 0; i != num_rows; ++i)
     {
         /// Shared data contains paths in sorted order in each row.
         /// Collect all paths from all buckets in this row and sort them.
         /// Save each path bucket and index to be able find corresponding value later.
         all_paths.clear();
+        runs_ends.clear();
+        bool runs_are_sorted = true;
         for (size_t bucket = 0; bucket != shared_data_buckets.size(); ++bucket)
         {
             size_t offset_start = (*shared_data_offsets_buckets[bucket])[ssize_t(i) - 1];
             size_t offset_end = (*shared_data_offsets_buckets[bucket])[ssize_t(i)];
+            size_t run_begin = all_paths.size();
 
             /// If no paths prefix specified, collect all paths.
             if (!paths_prefix)
@@ -403,9 +411,43 @@ void collectSharedDataFromBuckets(const Columns & shared_data_buckets, IColumn &
                     all_paths.emplace_back(sub_path, bucket, lower_bound_index);
                 }
             }
+
+            if (all_paths.size() != run_begin)
+            {
+                for (size_t j = run_begin + 1; j < all_paths.size() && runs_are_sorted; ++j)
+                    runs_are_sorted = std::get<0>(all_paths[j - 1]) < std::get<0>(all_paths[j]);
+                runs_ends.push_back(all_paths.size());
+            }
         }
 
-        std::sort(all_paths.begin(), all_paths.end());
+        /// The paths of each bucket are sorted, so the sorted runs of the buckets are merged pairwise,
+        /// which takes fewer comparisons of paths than sorting them all.
+        if (!runs_are_sorted)
+        {
+            std::sort(all_paths.begin(), all_paths.end());
+        }
+        else
+        {
+            while (runs_ends.size() > 1)
+            {
+                merged_paths.resize(all_paths.size());
+                merged_runs_ends.clear();
+                size_t run_begin = 0;
+                for (size_t run = 0; run < runs_ends.size(); run += 2)
+                {
+                    size_t middle = runs_ends[run];
+                    size_t run_end = run + 1 < runs_ends.size() ? runs_ends[run + 1] : middle;
+                    std::merge(
+                        all_paths.begin() + run_begin, all_paths.begin() + middle,
+                        all_paths.begin() + middle, all_paths.begin() + run_end,
+                        merged_paths.begin() + run_begin);
+                    merged_runs_ends.push_back(run_end);
+                    run_begin = run_end;
+                }
+                all_paths.swap(merged_paths);
+                runs_ends.swap(merged_runs_ends);
+            }
+        }
         for (const auto [path, bucket, offset] : all_paths)
         {
             shared_data_paths->insertData(path.data(), path.size());
