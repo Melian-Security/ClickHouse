@@ -1985,12 +1985,79 @@ void ColumnVariant::fixDynamicStructure()
         variant->fixDynamicStructure();
 }
 
+bool ColumnVariant::isStateConsistent() const
+{
+    const auto & local_discriminators_data = getLocalDiscriminators();
+    const auto & offsets_data = getOffsets();
+    const size_t num_rows = local_discriminators_data.size();
+
+    /// The offset of a row must be less than the size of its variant. A NULL row passes for any offset,
+    /// and a discriminator that does not refer to a variant fails for any offset.
+    std::array<UInt64, NULL_DISCRIMINATOR + 1> variant_sizes{};
+    for (size_t i = 0; i != variants.size(); ++i)
+        variant_sizes[i] = variants[i]->size();
+    variant_sizes[NULL_DISCRIMINATOR] = std::numeric_limits<UInt64>::max();
+
+    /// Rows are counted in several sets of counters, so that consecutive rows of the same variant
+    /// don't wait for each other's increment. Every set gets at most `max_rows_per_pass / num_counter_sets` rows per pass.
+    static constexpr size_t num_counter_sets = 4;
+    static constexpr size_t max_rows_per_pass = std::numeric_limits<UInt32>::max();
+    UInt32 counters[num_counter_sets][NULL_DISCRIMINATOR + 1];
+    std::array<UInt64, NULL_DISCRIMINATOR + 1> rows_per_variant{};
+    UInt8 offset_out_of_range = 0;
+
+    const Discriminator * discriminators = local_discriminators_data.data();
+    const Offset * offsets_ptr = offsets_data.data();
+    for (size_t pass_begin = 0; pass_begin < num_rows; pass_begin += max_rows_per_pass)
+    {
+        memset(counters, 0, sizeof(counters));
+        const size_t pass_end = std::min(num_rows, pass_begin + max_rows_per_pass);
+        size_t i = pass_begin;
+        for (; i + num_counter_sets <= pass_end; i += num_counter_sets)
+        {
+            for (size_t j = 0; j != num_counter_sets; ++j)
+            {
+                const Discriminator discr = discriminators[i + j];
+                ++counters[j][discr];
+                offset_out_of_range |= offsets_ptr[i + j] >= variant_sizes[discr];
+            }
+        }
+        for (; i != pass_end; ++i)
+        {
+            const Discriminator discr = discriminators[i];
+            ++counters[0][discr];
+            offset_out_of_range |= offsets_ptr[i] >= variant_sizes[discr];
+        }
+
+        for (size_t discr = 0; discr != variants.size(); ++discr)
+            for (size_t j = 0; j != num_counter_sets; ++j)
+                rows_per_variant[discr] += counters[j][discr];
+    }
+
+    if (offset_out_of_range)
+        return false;
+
+    for (size_t i = 0; i != variants.size(); ++i)
+    {
+        if (rows_per_variant[i] != variant_sizes[i])
+            return false;
+    }
+
+    return true;
+}
+
 void ColumnVariant::validateState(bool allow_logical_error) const
 {
     const auto & local_discriminators_data = getLocalDiscriminators();
     const auto & offsets_data = getOffsets();
     if (local_discriminators_data.size() != offsets_data.size())
         throw Exception(allow_logical_error ? ErrorCodes::LOGICAL_ERROR : ErrorCodes::INCORRECT_DATA, "Size of discriminators and offsets should be equal, but {} and {} were given", local_discriminators_data.size(), offsets_data.size());
+
+    /// The state is validated for every serialized and deserialized column, so the common case of a valid state
+    /// is checked in one pass without branches per row. Only if that pass finds a problem, the rows are checked
+    /// one by one below to report the first inconsistency.
+    if (isStateConsistent())
+        return;
 
     VectorWithMemoryTracking<size_t> actual_variant_sizes(variants.size());
     for (size_t i = 0; i != variants.size(); ++i)

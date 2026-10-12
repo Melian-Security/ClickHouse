@@ -696,3 +696,113 @@ TEST(ColumnVariant, ScatterGeneral)
     ASSERT_TRUE((*columns[2])[0].isNull());
     ASSERT_TRUE((*columns[2])[1].isNull());
 }
+
+namespace DB::ErrorCodes
+{
+extern const int INCORRECT_DATA;
+}
+
+/// Rows cycle through both variants and NULL in runs of different lengths.
+static ColumnVariant::MutablePtr createColumnForValidation(size_t num_rows)
+{
+    auto discriminators = ColumnVariant::ColumnDiscriminators::create();
+    auto offsets = ColumnVariant::ColumnOffsets::create();
+    MutableColumns variants;
+    variants.push_back(ColumnUInt64::create());
+    variants.push_back(ColumnString::create());
+    for (size_t i = 0; i != num_rows; ++i)
+    {
+        size_t kind = (i / 3 + i / 7) % 3;
+        if (kind == 2)
+        {
+            discriminators->insertValue(ColumnVariant::NULL_DISCRIMINATOR);
+            offsets->insertValue(0);
+        }
+        else
+        {
+            discriminators->insertValue(static_cast<ColumnVariant::Discriminator>(kind));
+            offsets->insertValue(variants[kind]->size());
+            variants[kind]->insertDefault();
+        }
+    }
+    return ColumnVariant::create(std::move(discriminators), std::move(offsets), std::move(variants));
+}
+
+static void checkValidateStateError(const ColumnVariant & column, const String & expected_message)
+{
+    try
+    {
+        column.validateState(/*allow_logical_error=*/ false);
+        FAIL() << "Expected an exception: " << expected_message;
+    }
+    catch (const Exception & e)
+    {
+        ASSERT_EQ(e.code(), ErrorCodes::INCORRECT_DATA);
+        ASSERT_EQ(String(e.message()), expected_message);
+    }
+}
+
+TEST(ColumnVariant, ValidateState)
+{
+    for (size_t num_rows : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 1000, 10001})
+    {
+        auto column = createColumnForValidation(num_rows);
+        ASSERT_NO_THROW(column->validateState(/*allow_logical_error=*/ false)) << num_rows;
+    }
+
+    const size_t num_rows = 10001;
+    auto reference = createColumnForValidation(num_rows);
+    const auto & discriminators = reference->getLocalDiscriminators();
+    size_t first_uint64_row = 0;
+    size_t last_string_row = num_rows - 1;
+    size_t last_null_row = num_rows - 1;
+    while (discriminators[first_uint64_row] != 0)
+        ++first_uint64_row;
+    while (discriminators[last_string_row] != 1)
+        --last_string_row;
+    while (discriminators[last_null_row] != ColumnVariant::NULL_DISCRIMINATOR)
+        --last_null_row;
+
+    {
+        /// The offset of a NULL row is not used.
+        auto column = createColumnForValidation(num_rows);
+        column->getOffsets()[last_null_row] = 1000000;
+        ASSERT_NO_THROW(column->validateState(/*allow_logical_error=*/ false));
+    }
+    {
+        auto column = createColumnForValidation(num_rows);
+        size_t variant_size = column->getVariantByLocalDiscriminator(1).size();
+        column->getOffsets()[last_string_row] = variant_size;
+        checkValidateStateError(*column, fmt::format("Offset at position {} is {}, but variant 1 (String) has size {}", last_string_row, variant_size, variant_size));
+    }
+    {
+        auto column = createColumnForValidation(num_rows);
+        column->getLocalDiscriminators()[last_null_row] = 2;
+        checkValidateStateError(*column, "Invalid discriminator value 2 (num_variants = 2)");
+    }
+    {
+        /// The first inconsistent row is reported.
+        auto column = createColumnForValidation(num_rows);
+        size_t variant_size = column->getVariantByLocalDiscriminator(0).size();
+        column->getOffsets()[first_uint64_row] = variant_size + 5;
+        column->getLocalDiscriminators()[last_string_row] = 7;
+        checkValidateStateError(*column, fmt::format("Offset at position {} is {}, but variant 0 (UInt64) has size {}", first_uint64_row, variant_size + 5, variant_size));
+    }
+    {
+        auto column = createColumnForValidation(num_rows);
+        size_t variant_size = column->getVariantByLocalDiscriminator(0).size();
+        column->getLocalDiscriminators()[first_uint64_row] = ColumnVariant::NULL_DISCRIMINATOR;
+        checkValidateStateError(*column, fmt::format("Variant 0 (UInt64) has size {}, but expected {}", variant_size, variant_size - 1));
+    }
+    {
+        auto column = createColumnForValidation(num_rows);
+        size_t variant_size = column->getVariantByLocalDiscriminator(1).size();
+        column->getVariantByLocalDiscriminator(1).insertDefault();
+        checkValidateStateError(*column, fmt::format("Variant 1 (String) has size {}, but expected {}", variant_size + 1, variant_size));
+    }
+    {
+        auto column = createColumnForValidation(num_rows);
+        column->getOffsets().push_back(0);
+        checkValidateStateError(*column, fmt::format("Size of discriminators and offsets should be equal, but {} and {} were given", num_rows, num_rows + 1));
+    }
+}
